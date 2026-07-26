@@ -230,6 +230,29 @@ test("link/push/pull: signed, chunk-verified sync through keel-server", async (t
   const h1 = execFileSync("git", ["rev-parse", "HEAD"], { cwd: dir, encoding: "utf8" }).trim();
   const h2 = execFileSync("git", ["rev-parse", "HEAD"], { cwd: join(cdir, "work"), encoding: "utf8" }).trim();
   assert.equal(h1, h2, "both sides converge through the server");
+
+  // ── identity chain from the CLI: init → mint → chain-attributed push ──
+  const idHome = mkdtempSync(join(tmpdir(), "keel-idhome-"));
+  const ID = { HOME: idHome };
+  const idInit = j(keel(dir, "id", "init", ID));
+  assert.match(idInit.machine, /^[0-9a-f]{16}$/u);
+  const mint = j(keel(dir, "id", "mint", "--ttl", "600", ID));
+  assert.ok(mint.chain.startsWith(`org:${idInit.org}/`), "mint reports the full chain");
+  writeFileSync(join(dir, "a.txt"), "one\ntwo\nthree\n");
+  keel(dir, "save", "chained work");
+  const chainedPush = j(keel(dir, "push", ID));
+  assert.equal(chainedPush.pushed, true);
+  assert.ok(chainedPush.by.includes(`session:${mint.session}`), "push attributed to the session tier");
+  assert.ok(chainedPush.by.startsWith(`org:${idInit.org}/account:`), "attribution carries the whole chain");
+
+  // scoped-out session: mint for another repo's refs, push must be refused
+  const narrow = j(keel(dir, "id", "mint", "--refs", "otherproj/*", ID));
+  assert.ok(narrow.session);
+  writeFileSync(join(dir, "a.txt"), "four\n");
+  keel(dir, "save", "more");
+  const refused = keel(dir, "push", ID);
+  assert.equal(j(refused).error, "E_SCOPE", "out-of-scope session credential must be refused");
+  assert.ok(j(refused).fix);
 });
 
 test("sync round-trip against a bare remote, and E_DIVERGED", () => {

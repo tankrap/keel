@@ -477,6 +477,72 @@ function refName(cfg) {
   return { branch, ref: `${cfg.repo}/${branch}` };
 }
 
+// ── identity chain (org → account → machine → session; server chain-v0) ────
+
+const canonicalJson = (v) => {
+  const s = (x) => Array.isArray(x) ? x.map(s)
+    : x && typeof x === "object" ? Object.fromEntries(Object.keys(x).sort().map((k) => [k, s(x[k])])) : x;
+  return JSON.stringify(s(v));
+};
+const keyId16 = (pub) => createHash("sha256").update(Buffer.from(pub, "base64")).digest("hex").slice(0, 16);
+const newKey = () => {
+  const { publicKey, privateKey } = generateKeyPairSync("ed25519");
+  return { pub: publicKey.export({ format: "der", type: "spki" }).toString("base64"), priv: privateKey.export({ format: "pem", type: "pkcs8" }).toString() };
+};
+const issueCert = (kind, subPub, caveats, parent, issuerPriv) => {
+  const body = { v: 1, kind, sub: subPub, id: keyId16(subPub), ...(caveats ? { caveats } : {}), ...(parent ? { parent } : {}) };
+  return { ...body, sig: edSign(null, Buffer.from(canonicalJson(body)), issuerPriv).toString("base64") };
+};
+const idDir = () => join(process.env.HOME ?? "/tmp", ".keel", "id");
+
+function cmdId() {
+  const sub = argv[1];
+  if (sub === "init") {
+    mkdirSync(idDir(), { recursive: true });
+    if (existsSync(join(idDir(), "chain.json")) && flag("--force") !== true) {
+      die("E_EXISTS", "an identity chain already exists here", "id init --force to replace it");
+    }
+    const org = newKey(); const account = newKey(); const machine = newKey();
+    const orgCert = issueCert("org", org.pub, undefined, undefined, org.priv);
+    const accountCert = issueCert("account", account.pub, undefined, orgCert, org.priv);
+    const machineCert = issueCert("machine", machine.pub, undefined, accountCert, account.priv);
+    writeFileSync(join(idDir(), "chain.json"), JSON.stringify({ orgCert, accountCert, machineCert, orgPriv: org.priv, machinePriv: machine.priv }), { mode: 0o600 });
+    emit({ org: orgCert.id, account: accountCert.id, machine: machineCert.id });
+  }
+  if (sub === "mint") {
+    requireRepo();
+    const cfgS = serverCfg();
+    const refs = (opt("--refs", cfgS ? `${cfgS.repo}/*` : "*")).split(",");
+    const ttl = Number(opt("--ttl", "28800")); // 8h default
+    let id;
+    try { id = JSON.parse(readFileSync(join(idDir(), "chain.json"), "utf8")); }
+    catch { die("E_NO_ID", "no identity chain on this machine", "id init first"); }
+    const session = newKey();
+    const cert = issueCert("session", session.pub, { refs, exp: Date.now() + ttl * 1000 }, id.machineCert, id.machinePriv);
+    writeFileSync(join(keelDir(), "session.json"), JSON.stringify({ cert, priv: session.priv }), { mode: 0o600 });
+    emit({ session: cert.id, refs, ttl_s: ttl, chain: `org:${id.orgCert.id}/account:${id.accountCert.id}/machine:${id.machineCert.id}/session:${cert.id}` });
+  }
+  if (sub === "revoke") {
+    const target = argv[2];
+    if (!target) die("E_USAGE", "id revoke <cert-id> (needs a linked server)", "id revoke abc123…");
+    const cfgS = serverCfg();
+    if (!cfgS) die("E_NO_SERVER", "no server linked", "link <url> <repo> first");
+    let id;
+    try { id = JSON.parse(readFileSync(join(idDir(), "chain.json"), "utf8")); }
+    catch { die("E_NO_ID", "no identity chain on this machine", "id init first"); }
+    const sig = edSign(null, Buffer.from(canonicalJson({ id: target })), id.orgPriv).toString("base64");
+    return api(cfgS, "POST", "/v0/revoke", { id: target, org: id.orgCert.sub, sig }).then((r) => {
+      if (!r.ok) die(r.error ?? "E_REVOKE", r.message ?? "");
+      emit({ revoked: target });
+    });
+  }
+  if (!["init", "mint", "revoke"].includes(sub)) die("E_USAGE", "id subcommands: init, mint, revoke");
+}
+
+function sessionCred() {
+  try { return JSON.parse(readFileSync(join(keelDir(), "session.json"), "utf8")); } catch { return null; }
+}
+
 async function doPush(cfg) {
   const head = git(["rev-parse", "HEAD"]).out;
   const { branch, ref } = refName(cfg);
@@ -491,7 +557,26 @@ async function doPush(cfg) {
   const chunk = createHash("sha256").update(bundle).digest("hex");
   const put = await fetch(`${cfg.url}/v0/chunk/${chunk}`, { method: "PUT", body: bundle });
   if (!(await put.json()).ok) die("E_CHUNK", "chunk upload failed");
-  const r = await api(cfg, "POST", "/v0/push", { ref, old, new: head, chunks: [chunk], idem: head, ingest: true, repo: cfg.repo }, true);
+  const pushBody = { ref, old, new: head, chunks: [chunk], idem: head, ingest: true, repo: cfg.repo };
+  // strongest credential available: session chain, else the flat machine key
+  const cred = sessionCred();
+  let r;
+  if (cred) {
+    let id = null;
+    try { id = JSON.parse(readFileSync(join(idDir(), "chain.json"), "utf8")); } catch { /* chain gone */ }
+    if (id) await api(cfg, "POST", "/v0/org", { cert: id.orgCert }); // idempotent TOFU registration
+    const raw = Buffer.from(JSON.stringify(pushBody));
+    const res = await fetch(`${cfg.url}/v0/push`, {
+      method: "POST", body: raw,
+      headers: {
+        "x-keel-chain": Buffer.from(JSON.stringify(cred.cert)).toString("base64"),
+        "x-keel-sig": edSign(null, raw, cred.priv).toString("base64")
+      }
+    });
+    r = await res.json();
+  } else {
+    r = await api(cfg, "POST", "/v0/push", pushBody, true);
+  }
   if (!r.ok) die(r.error ?? "E_PUSH", r.message ?? "", r.fix ?? (r.head ? "pull first, then push" : undefined));
   return { pushed: true, ref, head: head.slice(0, 8), by: r.by, size: bundle.length };
 }
@@ -611,9 +696,12 @@ Output is JSON when piped. Errors: {error,message,fix} + exit 1. Never interacti
   push / pull            signed, chunk-verified sync through the linked server
   clone <url> <repo> [dir]  init + link + pull in one step
                          (sync prefers a linked server; --git forces the git remote)
+  id init|mint|revoke    identity chain: org→account→machine, then per-repo
+                         session credentials (--refs a,b --ttl s); pushes use
+                         the strongest credential present
 `;
 
-const cmds = { st: cmdSt, d: cmdD, save: cmdSave, sync: cmdSync, fix: cmdFix, log: cmdLog, undo: cmdUndo, profile: cmdProfile, metrics: cmdMetrics, fleet: cmdFleet, link: cmdLink, push: cmdPush, pull: cmdPull, clone: cmdClone };
+const cmds = { st: cmdSt, d: cmdD, save: cmdSave, sync: cmdSync, fix: cmdFix, log: cmdLog, undo: cmdUndo, profile: cmdProfile, metrics: cmdMetrics, fleet: cmdFleet, link: cmdLink, push: cmdPush, pull: cmdPull, clone: cmdClone, id: cmdId };
 const cmd = argv[0];
 if (!cmd || cmd === "help" || cmd === "--help") { process.stdout.write(HELP); process.exit(0); }
 if (!cmds[cmd]) die("E_USAGE", `unknown command: ${cmd}`, "run: keel help");
