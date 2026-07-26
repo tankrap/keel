@@ -8,8 +8,11 @@ import { join } from "node:path";
 const KEEL = new URL("../src/keel.mjs", import.meta.url).pathname;
 
 function keel(cwd, ...args) {
+  const env = { ...process.env };
+  let i;
+  while ((i = args.findIndex((a) => typeof a === "object")) !== -1) Object.assign(env, args.splice(i, 1)[0]);
   try {
-    const out = execFileSync(process.execPath, [KEEL, ...args], { cwd, encoding: "utf8" });
+    const out = execFileSync(process.execPath, [KEEL, ...args], { cwd, encoding: "utf8", env });
     return { code: 0, out: out.trim() };
   } catch (e) {
     return { code: e.status ?? 1, out: (e.stdout ?? "").trim() };
@@ -112,6 +115,37 @@ test("undo reverts the last save and refuses when stale", () => {
   g("commit", "-q", "-m", "hand-made");
   const r = keel(dir, "undo");
   assert.equal(j(r).error, "E_STALE");
+});
+
+test("profile: precedence and sources are visible", () => {
+  const { dir } = repo();
+  const base = j(keel(dir, "profile"));
+  assert.deepEqual(base.cols, ["k", "v", "src"]);
+  const get = (o, k) => o.profile.find((r) => r[0] === k);
+  assert.deepEqual(get(base, "budget"), ["budget", 2000, "default"]);
+
+  const preset = j(keel(dir, "profile", { KEEL_PROFILE: "agent" }));
+  assert.deepEqual(get(preset, "budget"), ["budget", 2000, "preset:agent"]);
+  assert.deepEqual(get(preset, "render"), ["render", "json", "preset:agent"]);
+
+  const env = j(keel(dir, "profile", { KEEL_PROFILE: "agent", KEEL_BUDGET: "500" }));
+  assert.deepEqual(get(env, "budget"), ["budget", 500, "env:KEEL_BUDGET"], "env must beat preset");
+});
+
+test("metrics: usage accumulates with displaced counterfactual", () => {
+  const { dir } = repo();
+  writeFileSync(join(dir, "a.js"), "function alpha() {\n  return 1;\n}\n");
+  keel(dir, "save", "base");
+  appendFileSync(join(dir, "a.js"), "function beta() {\n  return 2;\n}\n");
+  keel(dir, "st");
+  keel(dir, "d");
+  keel(dir, "d");
+  const m = j(keel(dir, "metrics"));
+  const verb = Object.fromEntries(m.verbs.map((r) => [r[0], r]));
+  assert.equal(verb.d[1], 2, "two d calls recorded");
+  assert.ok(verb.st, "st recorded");
+  assert.ok(m.totals.tokens_out > 0);
+  assert.ok(verb.d[3] >= 0, "displaced tracked for d");
 });
 
 test("sync without upstream: structured error", () => {

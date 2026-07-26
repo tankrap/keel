@@ -8,8 +8,44 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync, appendFileSync } fr
 import { join } from "node:path";
 import { createHash } from "node:crypto";
 
-const TTY = process.stdout.isTTY === true;
 const argv = process.argv.slice(2);
+
+// ── profile: per-machine consumption config (design §6) ─────────────────────
+// Precedence (weakest → strongest): defaults < preset < machine file < env < flags.
+// Every effective value remembers its source; `keel profile` prints the table.
+
+const PRESETS = {
+  agent: { budget: 2000, render: "json", cursor: true },
+  human: { budget: 8000, render: "human", cursor: true }
+};
+
+function loadProfile() {
+  const val = {};
+  const src = {};
+  const take = (obj, from) => {
+    for (const [k, v] of Object.entries(obj)) {
+      if (v !== undefined) { val[k] = v; src[k] = from; }
+    }
+  };
+  take({ budget: 2000, render: "auto", cursor: true, preset: "none" }, "default");
+  let machine = {};
+  const machinePath = join(process.env.HOME ?? "", ".keel", "profile.json");
+  try { machine = JSON.parse(readFileSync(machinePath, "utf8")); } catch { /* absent */ }
+  const preset = process.env.KEEL_PROFILE ?? machine.preset;
+  if (preset && PRESETS[preset]) {
+    take(PRESETS[preset], `preset:${preset}`);
+    take({ preset }, process.env.KEEL_PROFILE ? "env:KEEL_PROFILE" : "machine");
+  }
+  take({ budget: machine.budget, render: machine.render, cursor: machine.cursor }, "machine");
+  if (process.env.KEEL_BUDGET) take({ budget: Number(process.env.KEEL_BUDGET) }, "env:KEEL_BUDGET");
+  if (process.env.KEEL_RENDER) take({ render: process.env.KEEL_RENDER }, "env:KEEL_RENDER");
+  return { val, src };
+}
+
+const PROFILE = loadProfile();
+const TTY = PROFILE.val.render === "json" ? false
+  : PROFILE.val.render === "human" ? true
+  : process.stdout.isTTY === true;
 
 // ── plumbing ────────────────────────────────────────────────────────────────
 
@@ -30,9 +66,26 @@ function sortKeys(v) {
 
 const estTokens = (s) => Math.ceil(s.length / 4);
 
+// usage frames (design §10): every response records what it cost and what a
+// full dump would have cost, so `metrics` can report displaced tokens.
+let CMD = "";
+let FULL_EST = 0;
+
 function emit(obj, exit = 0) {
   const s = JSON.stringify(sortKeys(obj), null, TTY ? 1 : 0);
   process.stdout.write(s + "\n");
+  if (CMD && CMD !== "metrics" && CMD !== "profile") {
+    // no keelDir()/die() here: a recording failure must never break the command
+    const gd = git(["rev-parse", "--git-dir"]);
+    if (gd.code === 0) {
+      try {
+        const d = join(gd.out, "keel");
+        mkdirSync(d, { recursive: true });
+        const rec = { c: CMD, o: estTokens(s), ...(FULL_EST > estTokens(s) ? { f: FULL_EST } : {}) };
+        appendFileSync(join(d, "metrics.jsonl"), JSON.stringify(rec) + "\n");
+      } catch { /* best-effort */ }
+    }
+  }
   process.exit(exit);
 }
 
@@ -129,7 +182,7 @@ function cmdSt() {
   // cursor fast-path: identical situation since last look costs one byte
   const digest = createHash("sha256").update(JSON.stringify(out)).digest("hex");
   const cur = join(keelDir(), "cursor-st");
-  if (!flag("--no-cursor") && existsSync(cur) && readFileSync(cur, "utf8") === digest) {
+  if (PROFILE.val.cursor !== false && !flag("--no-cursor") && existsSync(cur) && readFileSync(cur, "utf8") === digest) {
     process.stdout.write("=\n");
     process.exit(0);
   }
@@ -145,7 +198,7 @@ function lineCount(p) {
 
 function cmdD() {
   requireRepo();
-  const budget = Number(opt("--budget", process.env.KEEL_BUDGET ?? "2000"));
+  const budget = Number(opt("--budget", String(PROFILE.val.budget)));
   const usage = flag("--usage");
   const full = flag("--full");
   const paths = argv.slice(1);
@@ -192,10 +245,9 @@ function cmdD() {
     out.elided = { count: rows.length - keep.length, expand: `d --budget ${budget * 4}` };
   }
 
-  if (usage) {
-    const fullDump = patch.length + untracked.map(lineCount).reduce((a, b) => a + b * 30, 0);
-    out.usage = { out_est: estTokens(JSON.stringify(out)), full_dump_est: estTokens("x".repeat(fullDump)) };
-  }
+  const fullDump = patch.length + untracked.map(lineCount).reduce((a, b) => a + b * 30, 0);
+  FULL_EST = Math.ceil(fullDump / 4);
+  if (usage) out.usage = { out_est: estTokens(JSON.stringify(out)), full_dump_est: FULL_EST };
   emit(out);
 }
 
@@ -307,6 +359,30 @@ function cmdLog() {
   emit({ cols: ["id", "s"], commits });
 }
 
+// ── profile / metrics ───────────────────────────────────────────────────────
+
+function cmdProfile() {
+  const rows = Object.keys(PROFILE.val).sort().map((k) => [k, PROFILE.val[k], PROFILE.src[k]]);
+  emit({ cols: ["k", "v", "src"], profile: rows });
+}
+
+function cmdMetrics() {
+  requireRepo();
+  let lines = [];
+  try { lines = readFileSync(join(keelDir(), "metrics.jsonl"), "utf8").trim().split("\n").filter(Boolean).map((l) => JSON.parse(l)); } catch { /* none yet */ }
+  const by = new Map();
+  for (const r of lines) {
+    const e = by.get(r.c) ?? { calls: 0, out: 0, displaced: 0 };
+    e.calls += 1;
+    e.out += r.o;
+    if (r.f) e.displaced += r.f - r.o;
+    by.set(r.c, e);
+  }
+  const rows = [...by.keys()].sort().map((c) => { const e = by.get(c); return [c, e.calls, e.out, e.displaced]; });
+  const tot = rows.reduce((a, r) => [a[0] + r[1], a[1] + r[2], a[2] + r[3]], [0, 0, 0]);
+  emit({ cols: ["verb", "calls", "tokens_out", "displaced"], verbs: rows, totals: { calls: tot[0], tokens_out: tot[1], displaced: tot[2] } });
+}
+
 // ── help / dispatch ─────────────────────────────────────────────────────────
 
 const HELP = `keel — agent-first VCS porcelain (v0, git backend)
@@ -319,10 +395,13 @@ Output is JSON when piped. Errors: {error,message,fix} + exit 1. Never interacti
   fix [--continue|--abort]  list conflicts / resume / abort
   log [range] [-n N] [--grep P]   compact history
   undo                   revert the last keel operation
+  profile                effective config, each value with its source
+  metrics                this repo's usage: calls, tokens out, tokens displaced
 `;
 
-const cmds = { st: cmdSt, d: cmdD, save: cmdSave, sync: cmdSync, fix: cmdFix, log: cmdLog, undo: cmdUndo };
+const cmds = { st: cmdSt, d: cmdD, save: cmdSave, sync: cmdSync, fix: cmdFix, log: cmdLog, undo: cmdUndo, profile: cmdProfile, metrics: cmdMetrics };
 const cmd = argv[0];
 if (!cmd || cmd === "help" || cmd === "--help") { process.stdout.write(HELP); process.exit(0); }
 if (!cmds[cmd]) die("E_USAGE", `unknown command: ${cmd}`, "run: keel help");
+CMD = cmd;
 cmds[cmd]();
