@@ -179,6 +179,13 @@ function cmdSt() {
     cols: ["s", "p", "+", "-"],
     files: rows
   };
+  // cross-agent awareness: report the working set; surface overlaps (design §7)
+  if (rows.length) {
+    const rep = daemonCall({ op: "report", session: sessionKey(), repo: git(["rev-parse", "--show-toplevel"]).out, paths: rows.map((r) => r[1]) });
+    if (rep && rep.overlaps && rep.overlaps.length) {
+      out.overlap = rep.overlaps.map((o) => [o.path, o.session]).sort();
+    }
+  }
   // cursor fast-path: identical situation since last look costs one byte
   const digest = createHash("sha256").update(JSON.stringify(out)).digest("hex");
   const cur = join(keelDir(), "cursor-st");
@@ -201,6 +208,7 @@ function cmdD() {
   const budget = Number(opt("--budget", String(PROFILE.val.budget)));
   const usage = flag("--usage");
   const full = flag("--full");
+  const reshow = flag("--reshow") === true;
   const paths = argv.slice(1);
   const budgetChars = budget * 4;
 
@@ -208,37 +216,71 @@ function cmdD() {
   const untracked = git(["ls-files", "--others", "--exclude-standard", ...(paths.length ? ["--", ...paths] : [])])
     .out.split("\n").filter(Boolean);
 
-  // digest: per file — counts + changed function contexts from hunk headers
+  // digest: per file — counts, hunk contexts, and definition-level detection:
+  // a function seen only on + lines is :new, only on - is :gone, on both :sig
+  const FN_DEF = /^([+-])\s*(?:export\s+)?(?:default\s+)?(?:async\s+)?(?:function\s*\*?\s*([A-Za-z0-9_$]+)|def\s+([A-Za-z0-9_]+)|(?:pub\s+)?fn\s+([A-Za-z0-9_]+)|func\s+(?:\([^)]*\)\s*)?([A-Za-z0-9_]+))/u;
   const filesMap = new Map();
   let cur = null;
   for (const line of patch.split("\n")) {
     const f = line.match(/^diff --git a\/.* b\/(.*)$/u);
-    if (f) { cur = { fns: new Set() }; filesMap.set(f[1], cur); continue; }
-    const h = cur && line.match(/^@@ .* @@ (.*)$/u);
-    if (h && h[1]) cur.fns.add(h[1].trim().slice(0, 60));
+    if (f) { cur = { ctx: new Set(), defs: new Map() }; filesMap.set(f[1], cur); continue; }
+    if (!cur) continue;
+    const h = line.match(/^@@ .* @@ (.*)$/u);
+    if (h && h[1]) { cur.ctx.add(h[1].trim().slice(0, 60)); continue; }
+    const m = line.match(FN_DEF);
+    if (m) {
+      const name = m[2] ?? m[3] ?? m[4] ?? m[5];
+      const e = cur.defs.get(name) ?? { plus: false, minus: false };
+      if (m[1] === "+") e.plus = true; else e.minus = true;
+      cur.defs.set(name, e);
+    }
   }
+  const fnsOf = (entry) => {
+    const tagged = new Map();
+    for (const [name, e] of entry.defs) tagged.set(name, e.plus && e.minus ? `${name}:sig` : e.plus ? `${name}:new` : `${name}:gone`);
+    for (const c of entry.ctx) {
+      const name = (c.match(/([A-Za-z0-9_$]+)\s*\(/u) ?? [null, c])[1];
+      if (!tagged.has(name)) tagged.set(name, name);
+    }
+    return [...tagged.values()].sort().join(" ");
+  };
   const ns = numstat();
   const rows = [...filesMap.keys()].sort().map((p) => {
     const [a, d] = ns.get(p) ?? [0, 0];
-    return [p, a, d, [...filesMap.get(p).fns].sort().join(" ")];
+    return [p, a, d, fnsOf(filesMap.get(p))];
   });
   for (const p of untracked.sort()) rows.push([p, lineCount(p), 0, "(new)"]);
 
   const out = { cols: ["p", "+", "-", "fns"], files: rows };
+
+  // shown-cursor (#16): remember the exact content this session was already
+  // shown; re-requesting an unchanged file costs a marker, not a re-send.
+  const shownPath = join(keelDir(), "shown.json");
+  let shown = {};
+  try { shown = JSON.parse(readFileSync(shownPath, "utf8")); } catch { /* none */ }
+  const worktreeHash = (p) => { try { return createHash("sha256").update(readFileSync(p)).digest("hex").slice(0, 16); } catch { return ""; } };
 
   if (full || paths.length) {
     // hunks requested: spend the budget on patch text, elide explicitly past it
     const perFile = patch.length ? patch.split(/^(?=diff --git )/mu).filter((c) => c.startsWith("diff --git ")) : [];
     const patches = [];
     const elided = [];
+    const seen = [];
     let spent = JSON.stringify(out).length;
     for (const chunk of perFile) {
       const name = (chunk.match(/^diff --git a\/.* b\/(.*)$/mu) ?? [])[1] ?? "?";
-      if (spent + chunk.length <= budgetChars) { patches.push({ p: name, patch: chunk.trimEnd() }); spent += chunk.length; }
-      else elided.push(name);
+      const h = worktreeHash(name);
+      if (h && shown[name] === h && !reshow) { seen.push(name); continue; }
+      if (spent + chunk.length <= budgetChars) {
+        patches.push({ p: name, patch: chunk.trimEnd() });
+        spent += chunk.length;
+        if (h) shown[name] = h;
+      } else elided.push(name);
     }
     out.patches = patches;
+    if (seen.length) out.seen = { files: seen, note: "unchanged since last shown; --reshow to resend" };
     if (elided.length) out.elided = { files: elided, expand: `d ${elided[0]} --budget ${budget * 4}` };
+    try { writeFileSync(shownPath, JSON.stringify(shown)); } catch { /* best-effort */ }
   } else if (JSON.stringify(out).length > budgetChars && rows.length > 3) {
     const keep = rows.slice(0, Math.max(3, Math.floor(rows.length / 4)));
     out.files = keep;
@@ -359,6 +401,34 @@ function cmdLog() {
   emit({ cols: ["id", "s"], commits });
 }
 
+// ── daemon client (best-effort; the CLI never blocks on a missing daemon) ───
+
+function daemonCall(req, timeoutMs = 250) {
+  const socket = process.env.KEEL_DAEMON ?? join(process.env.HOME ?? "/tmp", ".keel", "keeld.sock");
+  if (!existsSync(socket)) return null;
+  const r = spawnSync(process.execPath, ["-e", `
+    const n=require("node:net");const s=n.connect(${JSON.stringify(socket)});
+    let b="";const t=setTimeout(()=>process.exit(1),${timeoutMs});
+    s.on("connect",()=>s.write(${JSON.stringify(JSON.stringify(req))}+"\\n"));
+    s.on("data",(d)=>{b+=d;if(b.includes("\\n")){clearTimeout(t);process.stdout.write(b.split("\\n")[0]);process.exit(0);}});
+    s.on("error",()=>process.exit(1));
+  `], { encoding: "utf8", timeout: timeoutMs + 250 });
+  if (r.status !== 0 || !r.stdout) return null;
+  try { return JSON.parse(r.stdout); } catch { return null; }
+}
+
+function sessionKey() {
+  const root = git(["rev-parse", "--show-toplevel"]).out;
+  const branch = git(["rev-parse", "--abbrev-ref", "HEAD"]).out;
+  return `${root}#${branch}`;
+}
+
+function cmdFleet() {
+  const res = daemonCall({ op: "fleet" }, 500);
+  if (!res) die("E_NO_DAEMON", "keeld is not running on this machine", "start it: node src/keeld.mjs");
+  emit({ cols: ["session", "repo", "paths"], workspaces: (res.workspaces ?? []).map((w) => [w.session, w.repo, w.paths]) });
+}
+
 // ── profile / metrics ───────────────────────────────────────────────────────
 
 function cmdProfile() {
@@ -397,9 +467,10 @@ Output is JSON when piped. Errors: {error,message,fix} + exit 1. Never interacti
   undo                   revert the last keel operation
   profile                effective config, each value with its source
   metrics                this repo's usage: calls, tokens out, tokens displaced
+  fleet                  all sessions on this machine (needs keeld)
 `;
 
-const cmds = { st: cmdSt, d: cmdD, save: cmdSave, sync: cmdSync, fix: cmdFix, log: cmdLog, undo: cmdUndo, profile: cmdProfile, metrics: cmdMetrics };
+const cmds = { st: cmdSt, d: cmdD, save: cmdSave, sync: cmdSync, fix: cmdFix, log: cmdLog, undo: cmdUndo, profile: cmdProfile, metrics: cmdMetrics, fleet: cmdFleet };
 const cmd = argv[0];
 if (!cmd || cmd === "help" || cmd === "--help") { process.stdout.write(HELP); process.exit(0); }
 if (!cmds[cmd]) die("E_USAGE", `unknown command: ${cmd}`, "run: keel help");

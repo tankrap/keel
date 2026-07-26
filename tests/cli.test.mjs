@@ -77,11 +77,19 @@ test("d: digest, hunks on request, explicit elision under budget", () => {
   assert.ok(paths.includes("a.js") && paths.includes("b.js"));
   assert.ok(!d.patches, "digest by default, no hunks");
 
-  const full = j(keel(dir, "d", "--full", "--budget", "5000"));
-  assert.ok(full.patches.some((p) => p.patch.includes("function beta")));
-
   const tiny = j(keel(dir, "d", "--full", "--budget", "20"));
   assert.ok(tiny.elided && tiny.elided.expand, "over-budget elision must be explicit and expandable");
+
+  const full = j(keel(dir, "d", "--full", "--budget", "5000"));
+  assert.ok(full.patches.some((p) => p.patch.includes("function beta")));
+  assert.ok(full.files.some((f) => f[3].includes("beta:new")), "semantic digest must tag new functions");
+
+  // shown-cursor: re-requesting unchanged content returns a marker, not a re-send
+  const again = j(keel(dir, "d", "--full", "--budget", "5000"));
+  assert.ok(again.seen && again.seen.files.includes("a.js"), "unchanged-since-shown must not re-send");
+  assert.equal(again.patches.length, 0);
+  const reshow = j(keel(dir, "d", "--full", "--budget", "5000", "--reshow"));
+  assert.ok(reshow.patches.some((p) => p.p === "a.js"), "--reshow must resend");
 
   const usage = j(keel(dir, "d", "--usage"));
   assert.ok(usage.usage.out_est > 0 && usage.usage.full_dump_est >= usage.usage.out_est);

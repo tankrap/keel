@@ -1,0 +1,79 @@
+import { test, after } from "node:test";
+import assert from "node:assert/strict";
+import { spawn, execFileSync } from "node:child_process";
+import { mkdtempSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { connect } from "node:net";
+
+const KEELD = new URL("../src/keeld.mjs", import.meta.url).pathname;
+const KEEL = new URL("../src/keel.mjs", import.meta.url).pathname;
+
+const dir = mkdtempSync(join(tmpdir(), "keeld-test-"));
+const SOCKET = join(dir, "keeld.sock");
+const kids = [];
+after(() => kids.forEach((k) => { try { process.kill(k.pid, "SIGKILL"); } catch { /* gone */ } }));
+
+function startDaemon() {
+  return new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, [KEELD, "--socket", SOCKET], { stdio: ["ignore", "pipe", "inherit"] });
+    kids.push(child);
+    child.stdout.once("data", (d) => resolve({ child, boot: JSON.parse(String(d)) }));
+    child.once("exit", (c) => reject(new Error(`keeld exited ${c}`)));
+    setTimeout(() => reject(new Error("keeld boot timeout")), 5000);
+  });
+}
+
+function call(req) {
+  return new Promise((resolve, reject) => {
+    const s = connect(SOCKET);
+    let buf = "";
+    s.on("connect", () => s.write(JSON.stringify(req) + "\n"));
+    s.on("data", (d) => {
+      buf += d;
+      if (buf.includes("\n")) { s.end(); resolve(JSON.parse(buf.split("\n")[0])); }
+    });
+    s.on("error", reject);
+    setTimeout(() => reject(new Error("call timeout")), 3000);
+  });
+}
+
+test("daemon: overlap detection, kill -9 recovery, CLI integration", async () => {
+  const { child } = await startDaemon();
+
+  assert.equal((await call({ op: "ping" })).ok, true);
+
+  const a = await call({ op: "report", session: "agent-A", repo: "r1", paths: ["src/x.js", "src/y.js"] });
+  assert.deepEqual(a.overlaps, [], "first reporter sees no overlap");
+
+  const b = await call({ op: "report", session: "agent-B", repo: "r1", paths: ["src/y.js", "src/z.js"] });
+  assert.equal(b.overlaps.length, 1);
+  assert.equal(b.overlaps[0].path, "src/y.js");
+  assert.equal(b.overlaps[0].session, "agent-A");
+
+  // crash-only: SIGKILL, restart, state must survive via the journal
+  process.kill(child.pid, "SIGKILL");
+  await new Promise((r) => child.once("exit", r));
+  await startDaemon();
+  const fleet = await call({ op: "fleet" });
+  assert.equal(fleet.workspaces.length, 2, "journal replay must restore both sessions");
+
+  await call({ op: "release", session: "agent-B" });
+  assert.equal((await call({ op: "fleet" })).workspaces.length, 1);
+
+  // CLI: st in a repo overlapping agent-A's paths surfaces the warning
+  const repo = mkdtempSync(join(tmpdir(), "keeld-repo-"));
+  const g = (...args) => execFileSync("git", args, { cwd: repo, encoding: "utf8" });
+  g("init", "-q", "-b", "main");
+  g("config", "user.email", "t@t.test");
+  g("config", "user.name", "t");
+  writeFileSync(join(repo, "base.txt"), "base\n");
+  g("add", "-A"); g("commit", "-q", "-m", "base");
+  writeFileSync(join(repo, "src.js"), "edit\n");
+  await call({ op: "report", session: "agent-C", repo: "other", paths: ["src.js"] });
+  const st = JSON.parse(execFileSync(process.execPath, [KEEL, "st"], { cwd: repo, encoding: "utf8", env: { ...process.env, KEEL_DAEMON: SOCKET } }));
+  assert.ok(st.overlap && st.overlap.some((o) => o[0] === "src.js" && o[1] === "agent-C"), "st must surface cross-session overlap");
+
+  const fl = JSON.parse(execFileSync(process.execPath, [KEEL, "fleet"], { cwd: repo, encoding: "utf8", env: { ...process.env, KEEL_DAEMON: SOCKET } }));
+  assert.ok(fl.workspaces.length >= 2, "fleet lists machine-wide sessions");
+});
