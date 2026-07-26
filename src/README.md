@@ -54,8 +54,10 @@ never interactive. Tests: `node --test tests/cli.test.mjs`.
 
 ## Design
 
-See [design.md](design.md) for the full design, and the issue tracker for the
-work breakdown. Nothing here is real until `keel-bench` says it is.
+**[docs/handbook.md](docs/handbook.md)** explains how everything works;
+[design.md](design.md) holds the founding design; `keel-bench:src/NUMBERS.md`
+is the evidence pack. Nothing here is real until `keel-bench` says it is —
+and it now says **60–75% fewer tokens per task, measured and attested**.
 
 > Note: seed docs live under `src/` because the default bsmnt agent grant is
 > path-scoped to `src/**, tests/**` — repo-root files are unpushable by agents
