@@ -669,8 +669,11 @@ async function doPush(cfg) {
   const state = await api(cfg, "GET", "/v0/state");
   const old = state.refs?.[ref] ?? null;
   if (old === head) return { pushed: false, current: true, head: head.slice(0, 8) };
+  // incremental: bundle only old..head when the server already has old (it's an
+  // ancestor here) — O(change), not O(repo). Full bundle on first push.
+  const incremental = old && git(["merge-base", "--is-ancestor", old, head]).code === 0;
   const bundlePath = join(tmpdir(), `keel-${head.slice(0, 12)}.bundle`);
-  const b = git(["bundle", "create", bundlePath, branch]);
+  const b = git(["bundle", "create", bundlePath, ...(incremental ? [`${old}..${branch}`] : [branch])]);
   if (b.code !== 0) die("E_BUNDLE", b.err.slice(0, 200));
   const bundle = readFileSync(bundlePath);
   rmSync(bundlePath, { force: true });
@@ -698,31 +701,33 @@ async function doPush(cfg) {
     r = await api(cfg, "POST", "/v0/push", pushBody, true);
   }
   if (!r.ok) die(r.error ?? "E_PUSH", r.message ?? "", r.fix ?? (r.head ? "pull first, then push" : undefined));
-  return { pushed: true, ref, head: head.slice(0, 8), by: r.by, size: bundle.length };
+  return { pushed: true, ref, head: head.slice(0, 8), by: r.by, size: bundle.length, incremental: !!incremental };
 }
 
-// fetch the bundle chunk behind a server ref — daemon cache first, verified either way
-async function fetchRefChunk(cfg, ref) {
-  const state = await api(cfg, "GET", "/v0/state");
-  const target = state.refs?.[ref];
-  if (!target) die("E_NO_REF", `server has no ${ref}`, "push from the originating repo first");
-  const ev = [...(state.events ?? [])].reverse().find((e) => e.ref === ref && e.new === target && e.chunks?.length);
-  if (!ev) die("E_NO_CHUNK", "no chunk recorded for the ref head", "originating side must push with chunks");
-  const cached = daemonCall({ op: "fetch", url: `${cfg.url}/v0/chunk/${ev.chunks[0]}`, hash: ev.chunks[0] }, 5000);
-  if (cached?.ok) return { target, bundlePath: cached.path, via: "daemon-cache" };
-  const res = await fetch(`${cfg.url}/v0/chunk/${ev.chunks[0]}`);
+// fetch an incremental bundle (from..to) from the server's accumulated repo —
+// O(change), not O(repo). Falls back to a full bundle if `from` isn't a base.
+async function fetchBundle(cfg, from, to) {
+  const q = `repo=${encodeURIComponent(cfg.repo)}&from=${from}&to=${to}`;
+  let res = await fetch(`${cfg.url}/v0/bundle?${q}`);
+  if (res.status === 409) res = await fetch(`${cfg.url}/v0/bundle?repo=${encodeURIComponent(cfg.repo)}&from=&to=${to}`); // no base → full
+  if (res.status === 204) return null; // nothing to transfer
+  if (!res.ok) die("E_BUNDLE", `server bundle ${res.status}`, "is the repo pushed?");
   const buf = Buffer.from(await res.arrayBuffer());
-  if (createHash("sha256").update(buf).digest("hex") !== ev.chunks[0]) die("E_HASH", "chunk failed verification — refusing");
-  const bundlePath = join(tmpdir(), `keel-pull-${ev.chunks[0].slice(0, 12)}.bundle`);
+  const bundlePath = join(tmpdir(), `keel-pull-${to.slice(0, 12)}.bundle`);
   writeFileSync(bundlePath, buf);
-  return { target, bundlePath, via: "direct" };
+  return { bundlePath, bytes: buf.length };
 }
 
 async function doPull(cfg, { rebase = false } = {}) {
   const { branch, ref } = refName(cfg);
   const head = git(["rev-parse", "HEAD"]).out;
-  const { target, bundlePath, via } = await fetchRefChunk(cfg, ref);
+  const state = await api(cfg, "GET", "/v0/state");
+  const target = state.refs?.[ref];
+  if (!target) die("E_NO_REF", `server has no ${ref}`, "push from the originating repo first");
   if (target === head) return { current: true, head: head.slice(0, 8) };
+  const got = await fetchBundle(cfg, head, target);
+  if (!got) return { current: true, head: head.slice(0, 8) };
+  const { bundlePath } = got;
   const f = git(["fetch", "--quiet", bundlePath, `${branch}:refs/keel/incoming`]);
   if (f.code !== 0) die("E_FETCH", f.err.slice(0, 200));
   const m = git(["merge", "--ff-only", "--quiet", "refs/keel/incoming"]);
@@ -735,7 +740,7 @@ async function doPull(cfg, { rebase = false } = {}) {
         "edit the files, then: fix --continue  (or: fix --abort)");
     }
   }
-  return { pulled: true, head: target.slice(0, 8), via };
+  return { pulled: true, head: target.slice(0, 8), bytes: got.bytes };
 }
 
 async function cmdPush() {
@@ -766,11 +771,15 @@ async function cmdClone() {
   if (!r.ok) die("E_LINK", `enroll failed: ${r.message ?? r.error ?? ""}`, "check the server URL");
   const cfg = { url, repo, machine: r.machine, privkey: privateKey.export({ format: "pem", type: "pkcs8" }) };
   writeFileSync(join(keelDir(), "server.json"), JSON.stringify(cfg), { mode: 0o600 });
-  const { target, bundlePath } = await fetchRefChunk(cfg, `${repo}/main`);
-  const f = git(["fetch", "--quiet", bundlePath, "main:refs/keel/incoming"]);
+  const state = await api(cfg, "GET", "/v0/state");
+  const target = state.refs?.[`${repo}/main`];
+  if (!target) die("E_NO_REF", `server has no ${repo}/main`, "push from the originating repo first");
+  const got = await fetchBundle(cfg, "", target); // full bundle
+  if (!got) die("E_EMPTY", "server returned an empty bundle");
+  const f = git(["fetch", "--quiet", got.bundlePath, "main:refs/keel/incoming"]);
   if (f.code !== 0) die("E_FETCH", f.err.slice(0, 200));
   git(["reset", "--hard", "-q", "refs/keel/incoming"]);
-  emit({ cloned: dir, head: target.slice(0, 8), machine: r.machine });
+  emit({ cloned: dir, head: target.slice(0, 8), machine: r.machine, bytes: got.bytes });
 }
 
 // ── profile / metrics ───────────────────────────────────────────────────────
