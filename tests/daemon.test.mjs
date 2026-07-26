@@ -1,7 +1,7 @@
 import { test, after } from "node:test";
 import assert from "node:assert/strict";
 import { spawn, execFileSync } from "node:child_process";
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { mkdtempSync, writeFileSync, readFileSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { connect } from "node:net";
@@ -95,4 +95,69 @@ test("daemon: overlap detection, kill -9 recovery, CLI integration", async () =>
   const bad = await call({ op: "fetch", url, hash: "0".repeat(64) });
   assert.equal(bad.ok, false, "hash mismatch must refuse to cache");
   upstream.close();
+});
+
+test("workspaces: shared store, minted credentials, isolation, crash recovery", async () => {
+  // machine identity for minting: run `keel id init` under an isolated HOME
+  // that the daemon ALSO uses (it reads ~/.keel/id at mint time)
+  const home = mkdtempSync(join(tmpdir(), "keeld-ws-home-"));
+  execFileSync(process.execPath, [KEEL, "id", "init"], { encoding: "utf8", env: { ...process.env, HOME: home } });
+
+  const SOCK2 = join(home, "keeld.sock");
+  const startD = () => new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, [KEELD, "--socket", SOCK2], { stdio: ["ignore", "pipe", "inherit"], env: { ...process.env, HOME: home } });
+    kids.push(child);
+    child.stdout.once("data", () => resolve(child));
+    setTimeout(() => reject(new Error("boot timeout")), 5000);
+  });
+  const call2 = (req) => new Promise((resolve, reject) => {
+    const s = connect(SOCK2);
+    let buf = "";
+    s.on("connect", () => s.write(JSON.stringify(req) + "\n"));
+    s.on("data", (d) => { buf += d; if (buf.includes("\n")) { s.end(); resolve(JSON.parse(buf.split("\n")[0])); } });
+    s.on("error", reject);
+    setTimeout(() => reject(new Error("call timeout")), 5000);
+  });
+  const child = await startD();
+
+  // base repo with one commit
+  const base = mkdtempSync(join(tmpdir(), "keeld-base-"));
+  const g = (...args) => execFileSync("git", args, { cwd: base, encoding: "utf8" });
+  g("init", "-q", "-b", "main");
+  g("config", "user.email", "t@t.test"); g("config", "user.name", "t");
+  writeFileSync(join(base, "shared.js"), "export const x = 1;\n");
+  g("add", "-A"); g("commit", "-q", "-m", "base");
+
+  const a = await call2({ op: "acquire", session: "agent-A", base, refs: ["proj/*"], ttl: 600 });
+  const b = await call2({ op: "acquire", session: "agent-B", base });
+  assert.equal(a.ok, true); assert.equal(b.ok, true);
+  assert.notEqual(a.workspace, b.workspace);
+  assert.match(a.session_cert, /^[0-9a-f]{16}$/u, "acquire mints a session credential");
+  assert.notEqual(a.session_cert, b.session_cert, "each workspace gets its own credential");
+
+  // shared object store: worktrees point at the base .git, no object copies
+  const gitFile = readFileSync(join(a.workspace, ".git"), "utf8");
+  assert.ok(gitFile.includes(base), "workspace shares the base repo's object store");
+  // isolation: A's edit is invisible in B
+  writeFileSync(join(a.workspace, "shared.js"), "export const x = 2;\n");
+  assert.equal(readFileSync(join(b.workspace, "shared.js"), "utf8"), "export const x = 1;\n");
+  // each workspace carries its minted credential where keel push will find it
+  const credPath = execFileSync("git", ["-C", a.workspace, "rev-parse", "--git-dir"], { encoding: "utf8" }).trim();
+  assert.ok(readFileSync(join(credPath, "keel", "session.json"), "utf8").includes('"session"'));
+
+  // idempotent re-acquire
+  const again = await call2({ op: "acquire", session: "agent-A", base });
+  assert.equal(again.existing, true);
+  assert.equal(again.workspace, a.workspace);
+
+  // crash-only: kill -9, restart, registry intact; release cleans up fully
+  process.kill(child.pid, "SIGKILL");
+  await new Promise((r) => child.once("exit", r));
+  await startD();
+  const fleet = await call2({ op: "fleet" });
+  assert.equal(fleet.workspaces.filter((w) => w.workspace).length, 2, "workspaces survive kill -9 via journal");
+  const rel = await call2({ op: "release", session: "agent-A" });
+  assert.equal(rel.ok, true);
+  assert.equal(existsSync(join(a.workspace, "shared.js")), false, "release removes the worktree");
+  assert.equal((await call2({ op: "fleet" })).workspaces.filter((w) => w.workspace).length, 1);
 });
