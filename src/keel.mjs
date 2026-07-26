@@ -328,9 +328,19 @@ function cmdUndo() {
 
 // ── sync / fix ──────────────────────────────────────────────────────────────
 
-function cmdSync() {
+async function cmdSync() {
   requireRepo();
   const rebase = flag("--rebase");
+  // a linked keel-server takes precedence over the git remote (--git overrides)
+  const cfg = serverCfg();
+  if (cfg && flag("--git") !== true) {
+    if (git(["diff", "--quiet"]).code !== 0 || git(["diff", "--cached", "--quiet"]).code !== 0) {
+      die("E_DIRTY", "working tree has unsaved changes; syncing would clobber them", 'save "wip" first, then: sync');
+    }
+    const pu = await doPull(cfg, { rebase: rebase === true });
+    const ph = await doPush(cfg);
+    emit({ synced: true, via: "server", pulled: pu.pulled ? 1 : 0, pushed: ph.pushed ? 1 : 0 });
+  }
   const up = git(["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"]);
   if (up.code !== 0) {
     die("E_NO_UPSTREAM", "this branch has no upstream to sync with",
@@ -467,15 +477,12 @@ function refName(cfg) {
   return { branch, ref: `${cfg.repo}/${branch}` };
 }
 
-async function cmdPush() {
-  requireRepo();
-  const cfg = serverCfg();
-  if (!cfg) die("E_NO_SERVER", "no server linked to this repo", "link <url> <repo> first");
+async function doPush(cfg) {
   const head = git(["rev-parse", "HEAD"]).out;
   const { branch, ref } = refName(cfg);
   const state = await api(cfg, "GET", "/v0/state");
   const old = state.refs?.[ref] ?? null;
-  if (old === head) emit({ pushed: false, current: true, head: head.slice(0, 8) });
+  if (old === head) return { pushed: false, current: true, head: head.slice(0, 8) };
   const bundlePath = join(tmpdir(), `keel-${head.slice(0, 12)}.bundle`);
   const b = git(["bundle", "create", bundlePath, branch]);
   if (b.code !== 0) die("E_BUNDLE", b.err.slice(0, 200));
@@ -486,37 +493,79 @@ async function cmdPush() {
   if (!(await put.json()).ok) die("E_CHUNK", "chunk upload failed");
   const r = await api(cfg, "POST", "/v0/push", { ref, old, new: head, chunks: [chunk], idem: head, ingest: true, repo: cfg.repo }, true);
   if (!r.ok) die(r.error ?? "E_PUSH", r.message ?? "", r.fix ?? (r.head ? "pull first, then push" : undefined));
-  emit({ pushed: true, ref, head: head.slice(0, 8), by: r.by, size: bundle.length });
+  return { pushed: true, ref, head: head.slice(0, 8), by: r.by, size: bundle.length };
+}
+
+// fetch the bundle chunk behind a server ref — daemon cache first, verified either way
+async function fetchRefChunk(cfg, ref) {
+  const state = await api(cfg, "GET", "/v0/state");
+  const target = state.refs?.[ref];
+  if (!target) die("E_NO_REF", `server has no ${ref}`, "push from the originating repo first");
+  const ev = [...(state.events ?? [])].reverse().find((e) => e.ref === ref && e.new === target && e.chunks?.length);
+  if (!ev) die("E_NO_CHUNK", "no chunk recorded for the ref head", "originating side must push with chunks");
+  const cached = daemonCall({ op: "fetch", url: `${cfg.url}/v0/chunk/${ev.chunks[0]}`, hash: ev.chunks[0] }, 5000);
+  if (cached?.ok) return { target, bundlePath: cached.path, via: "daemon-cache" };
+  const res = await fetch(`${cfg.url}/v0/chunk/${ev.chunks[0]}`);
+  const buf = Buffer.from(await res.arrayBuffer());
+  if (createHash("sha256").update(buf).digest("hex") !== ev.chunks[0]) die("E_HASH", "chunk failed verification — refusing");
+  const bundlePath = join(tmpdir(), `keel-pull-${ev.chunks[0].slice(0, 12)}.bundle`);
+  writeFileSync(bundlePath, buf);
+  return { target, bundlePath, via: "direct" };
+}
+
+async function doPull(cfg, { rebase = false } = {}) {
+  const { branch, ref } = refName(cfg);
+  const head = git(["rev-parse", "HEAD"]).out;
+  const { target, bundlePath, via } = await fetchRefChunk(cfg, ref);
+  if (target === head) return { current: true, head: head.slice(0, 8) };
+  const f = git(["fetch", "--quiet", bundlePath, `${branch}:refs/keel/incoming`]);
+  if (f.code !== 0) die("E_FETCH", f.err.slice(0, 200));
+  const m = git(["merge", "--ff-only", "--quiet", "refs/keel/incoming"]);
+  if (m.code !== 0) {
+    if (!rebase) die("E_DIVERGED", "local history diverged from the server ref", "sync --rebase (or rebase onto refs/keel/incoming)");
+    const r = git(["-c", "core.editor=true", "rebase", "refs/keel/incoming"]);
+    if (r.code !== 0) {
+      const files = git(["diff", "--name-only", "--diff-filter=U"]).out.split("\n").filter(Boolean).sort();
+      die("E_CONFLICT", `rebase onto server ref hit ${files.length} conflict(s): ${files.join(" ")}`,
+        "edit the files, then: fix --continue  (or: fix --abort)");
+    }
+  }
+  return { pulled: true, head: target.slice(0, 8), via };
+}
+
+async function cmdPush() {
+  requireRepo();
+  const cfg = serverCfg();
+  if (!cfg) die("E_NO_SERVER", "no server linked to this repo", "link <url> <repo> first");
+  emit(await doPush(cfg));
 }
 
 async function cmdPull() {
   requireRepo();
   const cfg = serverCfg();
   if (!cfg) die("E_NO_SERVER", "no server linked to this repo", "link <url> <repo> first");
-  const { branch, ref } = refName(cfg);
-  const state = await api(cfg, "GET", "/v0/state");
-  const target = state.refs?.[ref];
-  if (!target) die("E_NO_REF", `server has no ${ref}`, "push from the originating repo first");
-  const head = git(["rev-parse", "HEAD"]).out;
-  if (target === head) emit({ current: true, head: head.slice(0, 8) });
-  const ev = [...(state.events ?? [])].reverse().find((e) => e.ref === ref && e.new === target && e.chunks?.length);
-  if (!ev) die("E_NO_CHUNK", "no chunk recorded for the ref head", "originating side must push with chunks");
-  // prefer the daemon's shared verified cache; fall back to a direct fetch
-  let bundlePath;
-  const cached = daemonCall({ op: "fetch", url: `${cfg.url}/v0/chunk/${ev.chunks[0]}`, hash: ev.chunks[0] }, 5000);
-  if (cached?.ok) bundlePath = cached.path;
-  else {
-    const res = await fetch(`${cfg.url}/v0/chunk/${ev.chunks[0]}`);
-    const buf = Buffer.from(await res.arrayBuffer());
-    if (createHash("sha256").update(buf).digest("hex") !== ev.chunks[0]) die("E_HASH", "chunk failed verification — refusing");
-    bundlePath = join(tmpdir(), `keel-pull-${ev.chunks[0].slice(0, 12)}.bundle`);
-    writeFileSync(bundlePath, buf);
-  }
-  const f = git(["fetch", "--quiet", bundlePath, `${branch}:refs/keel/incoming`]);
+  emit(await doPull(cfg, { rebase: flag("--rebase") === true }));
+}
+
+async function cmdClone() {
+  const url = argv[1]; const repo = argv[2]; const dir = argv[3] ?? repo;
+  if (!url || !repo) die("E_USAGE", "clone needs a server and a repo name", "clone http://host:port myrepo [dir]");
+  if (existsSync(join(dir, ".git"))) die("E_EXISTS", `${dir} is already a repository`);
+  mkdirSync(dir, { recursive: true });
+  const init = spawnSync("git", ["init", "-q", "-b", "main", dir], { encoding: "utf8" });
+  if (init.status !== 0) die("E_INIT", (init.stderr ?? "").slice(0, 200));
+  process.chdir(dir);
+  const { publicKey, privateKey } = generateKeyPairSync("ed25519");
+  const pub = publicKey.export({ format: "der", type: "spki" }).toString("base64");
+  const r = await api({ url }, "POST", "/v0/enroll", { pubkey: pub });
+  if (!r.ok) die("E_LINK", `enroll failed: ${r.message ?? r.error ?? ""}`, "check the server URL");
+  const cfg = { url, repo, machine: r.machine, privkey: privateKey.export({ format: "pem", type: "pkcs8" }) };
+  writeFileSync(join(keelDir(), "server.json"), JSON.stringify(cfg), { mode: 0o600 });
+  const { target, bundlePath } = await fetchRefChunk(cfg, `${repo}/main`);
+  const f = git(["fetch", "--quiet", bundlePath, "main:refs/keel/incoming"]);
   if (f.code !== 0) die("E_FETCH", f.err.slice(0, 200));
-  const m = git(["merge", "--ff-only", "--quiet", "refs/keel/incoming"]);
-  if (m.code !== 0) die("E_DIVERGED", "local history diverged from the server ref", "save your work, then rebase onto refs/keel/incoming");
-  emit({ pulled: true, head: target.slice(0, 8), via: cached?.ok ? "daemon-cache" : "direct" });
+  git(["reset", "--hard", "-q", "refs/keel/incoming"]);
+  emit({ cloned: dir, head: target.slice(0, 8), machine: r.machine });
 }
 
 // ── profile / metrics ───────────────────────────────────────────────────────
@@ -560,9 +609,11 @@ Output is JSON when piped. Errors: {error,message,fix} + exit 1. Never interacti
   fleet                  all sessions on this machine (needs keeld)
   link <url> <repo>      enroll this machine with a keel-server
   push / pull            signed, chunk-verified sync through the linked server
+  clone <url> <repo> [dir]  init + link + pull in one step
+                         (sync prefers a linked server; --git forces the git remote)
 `;
 
-const cmds = { st: cmdSt, d: cmdD, save: cmdSave, sync: cmdSync, fix: cmdFix, log: cmdLog, undo: cmdUndo, profile: cmdProfile, metrics: cmdMetrics, fleet: cmdFleet, link: cmdLink, push: cmdPush, pull: cmdPull };
+const cmds = { st: cmdSt, d: cmdD, save: cmdSave, sync: cmdSync, fix: cmdFix, log: cmdLog, undo: cmdUndo, profile: cmdProfile, metrics: cmdMetrics, fleet: cmdFleet, link: cmdLink, push: cmdPush, pull: cmdPull, clone: cmdClone };
 const cmd = argv[0];
 if (!cmd || cmd === "help" || cmd === "--help") { process.stdout.write(HELP); process.exit(0); }
 if (!cmds[cmd]) die("E_USAGE", `unknown command: ${cmd}`, "run: keel help");

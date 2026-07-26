@@ -210,6 +210,26 @@ test("link/push/pull: signed, chunk-verified sync through keel-server", async (t
   const clonedHead = execFileSync("git", ["rev-parse", "HEAD"], { cwd: clone, encoding: "utf8" }).trim();
   const originHead = execFileSync("git", ["rev-parse", "HEAD"], { cwd: dir, encoding: "utf8" }).trim();
   assert.equal(clonedHead, originHead, "pull lands on the pushed commit");
+
+  // clone: init + link + pull in one step, from nothing
+  const cdir = mkdtempSync(join(tmpdir(), "keel-clone2-"));
+  const c2 = j(keel(cdir, "clone", url, "proj", "work"));
+  assert.equal(c2.cloned, "work");
+  const c2head = execFileSync("git", ["rev-parse", "HEAD"], { cwd: join(cdir, "work"), encoding: "utf8" }).trim();
+  assert.equal(c2head, originHead, "clone lands on the server head");
+  execFileSync("git", ["config", "user.email", "t@t.test"], { cwd: join(cdir, "work") });
+  execFileSync("git", ["config", "user.name", "t"], { cwd: join(cdir, "work") });
+
+  // sync via the linked server: pull side, then push side, seen from the origin
+  writeFileSync(join(cdir, "work", "b.txt"), "from clone\n");
+  keel(join(cdir, "work"), "save", "clone work");
+  const s1 = j(keel(join(cdir, "work"), "sync"));
+  assert.deepEqual([s1.via, s1.pushed], ["server", 1], "sync must push through the server");
+  const s2 = j(keel(dir, "sync"));
+  assert.deepEqual([s2.via, s2.pulled], ["server", 1], "origin sync must pull the clone's commit");
+  const h1 = execFileSync("git", ["rev-parse", "HEAD"], { cwd: dir, encoding: "utf8" }).trim();
+  const h2 = execFileSync("git", ["rev-parse", "HEAD"], { cwd: join(cdir, "work"), encoding: "utf8" }).trim();
+  assert.equal(h1, h2, "both sides converge through the server");
 });
 
 test("sync round-trip against a bare remote, and E_DIVERGED", () => {
