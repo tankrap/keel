@@ -459,6 +459,89 @@ fn cmd_why(args: &mut Vec<String>) -> ! {
     emit(&Ctx { cmd: "why".into(), full_est: 0 }, J::O(vec![("commit".into(), s(&commit[..commit.len().min(7)])), ("note".into(), s("no keel metadata; save with --task/--intent/--verified to record it")), ("subject".into(), s(&subj))]));
 }
 
+// ── review (#1, experiment): a STRUCTURAL summary of a change for reviewers —
+// renames, signature changes, symbols added/removed — grouped and symbol-
+// centric, instead of a line diff. The claim to test: a reviewer (human or
+// agent) can grasp the shape of a change in ~50 tokens instead of reading
+// hundreds of diff lines. Reuses d's function-tag parsing + git rename detection.
+fn cmd_review(_args: &mut [String]) -> ! {
+    let info = require_repo();
+    let base = diff_base(&info);
+    // rename detection (-M): R<score>\told\tnew
+    let (_, ns) = git(&["diff", "--name-status", "-M", base]);
+    let mut renames: Vec<(String, String)> = Vec::new();
+    let (mut added_files, mut removed_files) = (0i64, 0i64);
+    for line in ns.lines() {
+        let cols: Vec<&str> = line.split('\t').collect();
+        let tag = cols.first().copied().unwrap_or("");
+        if tag.starts_with('R') && cols.len() >= 3 {
+            renames.push((cols[1].to_string(), cols[2].to_string()));
+        } else if tag == "A" {
+            added_files += 1;
+        } else if tag == "D" {
+            removed_files += 1;
+        }
+    }
+    // symbol-level changes from the patch (same detection as d)
+    let (_, patch) = git(&["diff", "--no-color", "-M", base]);
+    let fn_def = Regex::new(r"^([+-])\s*(?:export\s+)?(?:default\s+)?(?:async\s+)?(?:function\s*\*?\s*([A-Za-z0-9_$]+)|def\s+([A-Za-z0-9_]+)|(?:pub\s+)?fn\s+([A-Za-z0-9_]+)|func\s+(?:\([^)]*\)\s*)?([A-Za-z0-9_]+))").unwrap();
+    let file_re = Regex::new(r"^diff --git a/.* b/(.*)$").unwrap();
+    let mut cur = String::new();
+    // name -> (file, plus, minus)
+    let mut defs: Vec<(String, String, bool, bool)> = Vec::new();
+    for line in patch.lines() {
+        if let Some(c) = file_re.captures(line) {
+            cur = c[1].to_string();
+            continue;
+        }
+        if let Some(m) = fn_def.captures(line) {
+            if let Some(nm) = m.get(2).or(m.get(3)).or(m.get(4)).or(m.get(5)).map(|x| x.as_str().to_string()) {
+                let plus = &m[1] == "+";
+                if let Some(e) = defs.iter_mut().find(|(n, f, _, _)| *n == nm && *f == cur) {
+                    if plus { e.2 = true } else { e.3 = true }
+                } else {
+                    defs.push((nm, cur.clone(), plus, !plus));
+                }
+            }
+        }
+    }
+    let mut new_syms: Vec<String> = Vec::new();
+    let mut gone_syms: Vec<String> = Vec::new();
+    let mut changed_syms: Vec<String> = Vec::new();
+    for (name, file, p, m) in &defs {
+        let tag = format!("{} ({})", name, file);
+        if *p && *m { changed_syms.push(tag) } else if *p { new_syms.push(tag) } else { gone_syms.push(tag) }
+    }
+    new_syms.sort();
+    gone_syms.sort();
+    changed_syms.sort();
+
+    // a one-line human summary a reviewer reads first
+    let mut bits: Vec<String> = Vec::new();
+    if !renames.is_empty() { bits.push(format!("{} rename(s)", renames.len())); }
+    if !new_syms.is_empty() { bits.push(format!("{} added", new_syms.len())); }
+    if !gone_syms.is_empty() { bits.push(format!("{} removed", gone_syms.len())); }
+    if !changed_syms.is_empty() { bits.push(format!("{} signature change(s)", changed_syms.len())); }
+    let summary = if bits.is_empty() { "no structural changes".to_string() } else { bits.join(", ") };
+
+    let mut o: Vec<(String, J)> = vec![("summary".into(), s(&summary))];
+    if !renames.is_empty() {
+        o.push(("renames".into(), J::A(renames.iter().map(|(a, b)| J::A(vec![s(a), s(b)])).collect())));
+    }
+    let syms = |v: &[String]| J::A(v.iter().map(|x| s(x)).collect());
+    o.push(("symbols".into(), J::O(vec![
+        ("added".into(), syms(&new_syms)),
+        ("changed".into(), syms(&changed_syms)),
+        ("removed".into(), syms(&gone_syms)),
+    ])));
+    if added_files != 0 || removed_files != 0 {
+        o.push(("files".into(), J::O(vec![("added".into(), n(added_files)), ("removed".into(), n(removed_files))])));
+    }
+    // full-est so metrics captures what a diff-dump would have cost a reviewer
+    let full_est = (patch.len() as f64 / 4.0).ceil() as i64;
+    emit(&Ctx { cmd: "review".into(), full_est }, J::O(o));
+}
+
 fn cmd_undo(_args: &mut [String]) -> ! {
     let info = require_repo();
     let content = fs::read_to_string(oplog(&info)).unwrap_or_default();
@@ -670,6 +753,7 @@ fn main() {
         Some("fix") => cmd_fix(&mut args),
         Some("sync") => cmd_sync(&mut args),
         Some("why") => cmd_why(&mut args),
+        Some("review") => cmd_review(&mut args),
         Some("profile") => cmd_profile(&mut args),
         Some("metrics") => cmd_metrics(&mut args),
         Some("version") | Some("--version") => println!("{{\"core\":\"keel-core\",\"keel\":\"0.2.0-rust\"}}"),
