@@ -1,0 +1,11 @@
+[package]
+name = "keel-cli"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "keel"
+path = "src/main.rs"
+
+[dependencies]
+keel-core = { path = "../keel-core" }
