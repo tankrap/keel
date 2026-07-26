@@ -76,4 +76,23 @@ test("daemon: overlap detection, kill -9 recovery, CLI integration", async () =>
 
   const fl = JSON.parse(execFileSync(process.execPath, [KEEL, "fleet"], { cwd: repo, encoding: "utf8", env: { ...process.env, KEEL_DAEMON: SOCKET } }));
   assert.ok(fl.workspaces.length >= 2, "fleet lists machine-wide sessions");
+
+  // shared cache: verified fetch, second request is a cache hit, bad hash refused
+  const { createServer: httpServer } = await import("node:http");
+  const { createHash } = await import("node:crypto");
+  const payload = Buffer.from("chunk-payload-for-cache");
+  const hash = createHash("sha256").update(payload).digest("hex");
+  let hits = 0;
+  const upstream = httpServer((_, res) => { hits++; res.end(payload); });
+  await new Promise((r) => upstream.listen(0, "127.0.0.1", r));
+  const url = `http://127.0.0.1:${upstream.address().port}/c`;
+  const f1 = await call({ op: "fetch", url, hash });
+  assert.equal(f1.ok, true);
+  assert.equal(f1.cached, false);
+  const f2 = await call({ op: "fetch", url, hash });
+  assert.equal(f2.cached, true, "second fetch must be a cache hit");
+  assert.equal(hits, 1, "upstream must be hit exactly once");
+  const bad = await call({ op: "fetch", url, hash: "0".repeat(64) });
+  assert.equal(bad.ok, false, "hash mismatch must refuse to cache");
+  upstream.close();
 });

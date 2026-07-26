@@ -15,8 +15,9 @@
 //   {"op":"fleet"}                               → {"ok":true,"workspaces":[…]}
 
 import { createServer } from "node:net";
-import { appendFileSync, readFileSync, mkdirSync, unlinkSync, existsSync } from "node:fs";
+import { appendFileSync, readFileSync, writeFileSync, mkdirSync, unlinkSync, existsSync } from "node:fs";
 import { join, dirname } from "node:path";
+import { createHash } from "node:crypto";
 
 const arg = (name, dflt) => {
   const i = process.argv.indexOf(name);
@@ -53,8 +54,35 @@ try {
   }
 } catch { /* first boot */ }
 
-function handle(req) {
+// shared chunk cache: one fetch per hash machine-wide, verified, single-flighted.
+// N agents asking for the same chunk cost one network round trip, ever.
+const CACHE = join(dirname(SOCKET), "cache");
+mkdirSync(CACHE, { recursive: true });
+const inflight = new Map();
+
+async function fetchChunk(url, hash) {
+  const file = join(CACHE, hash);
+  if (existsSync(file)) return { ok: true, path: file, cached: true };
+  if (!inflight.has(hash)) {
+    inflight.set(hash, (async () => {
+      const res = await fetch(url);
+      if (!res.ok) throw new Error(`upstream ${res.status}`);
+      const buf = Buffer.from(await res.arrayBuffer());
+      if (createHash("sha256").update(buf).digest("hex") !== hash) throw new Error("hash mismatch — refusing to cache");
+      writeFileSync(file, buf);
+    })().finally(() => inflight.delete(hash)));
+  }
+  await inflight.get(hash);
+  return { ok: true, path: file, cached: false };
+}
+
+async function handle(req) {
   if (req.op === "ping") return { ok: true, pid: process.pid, workspaces: sessions.size };
+  if (req.op === "fetch") {
+    if (!req.url || !req.hash) return { ok: false, error: "E_USAGE", fix: "fetch needs {url, hash}" };
+    try { return await fetchChunk(req.url, req.hash); }
+    catch (e) { return { ok: false, error: "E_FETCH", message: String(e.message ?? e).slice(0, 120) }; }
+  }
   if (req.op === "report") {
     if (!req.session || !Array.isArray(req.paths)) return { ok: false, error: "E_USAGE" };
     const overlaps = [];
@@ -91,9 +119,11 @@ const server = createServer((conn) => {
     while ((nl = buf.indexOf("\n")) !== -1) {
       const line = buf.slice(0, nl);
       buf = buf.slice(nl + 1);
-      let res;
-      try { res = handle(JSON.parse(line)); } catch { res = { ok: false, error: "E_PARSE" }; }
-      conn.write(JSON.stringify(res) + "\n");
+      let parsed;
+      try { parsed = JSON.parse(line); } catch { conn.write(JSON.stringify({ ok: false, error: "E_PARSE" }) + "\n"); continue; }
+      Promise.resolve(handle(parsed))
+        .catch((e) => ({ ok: false, error: "E_INTERNAL", message: String(e).slice(0, 120) }))
+        .then((res) => conn.write(JSON.stringify(res) + "\n"));
     }
   });
   conn.on("error", () => { /* client vanished — fine */ });
