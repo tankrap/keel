@@ -184,6 +184,28 @@ test("jj substrate: same verbs, stable change ids, op-log undo", async (t) => {
   assert.equal(log2.commits[0][1], "first change", "op-log undo reverses the save");
 });
 
+test("batch: many commands, one warm process, per-command results", () => {
+  const { dir } = repo();
+  writeFileSync(join(dir, "a.js"), "function f() {\n  return 1;\n}\n");
+  // read → read → mutate → read, all in one process; state must update between
+  const script = ["st --no-cursor", "d", 'save "first"', "st --no-cursor", "log -n 5"].join("\n");
+  const out = execFileSync(process.execPath, [KEEL, "batch"], { cwd: dir, encoding: "utf8", input: script,
+    env: { ...process.env, KEEL_DAEMON: "/nonexistent/x.sock" } });
+  const lines = out.trim().split("\n").map((l) => JSON.parse(l));
+  assert.equal(lines.length, 5, "one result line per command");
+  assert.equal(lines[0].files.length, 1, "st sees the uncommitted edit");
+  assert.ok(lines[1].files.some((f) => f[0] === "a.js"), "d sees the edit");
+  assert.match(lines[2].id, /^[0-9a-f]{4,}$/u, "save commits inside the batch");
+  assert.deepEqual(lines[3].files, [], "st clean after the in-batch save — state re-read fresh");
+  assert.equal(lines[4].commits[0][1], "first", "log reflects the in-batch commit");
+
+  const bad = execFileSync(process.execPath, [KEEL, "batch"], { cwd: dir, encoding: "utf8", input: "bogus\nst --no-cursor\n",
+    env: { ...process.env, KEEL_DAEMON: "/nonexistent/x.sock" } });
+  const bl = bad.trim().split("\n").map((l) => JSON.parse(l));
+  assert.equal(bl[0].error, "E_USAGE", "unknown command in batch is an error line, not a crash");
+  assert.ok(bl[1].branch, "batch continues past a bad line");
+});
+
 test("sync without upstream: structured error", () => {
   const { dir } = repo();
   writeFileSync(join(dir, "a.txt"), "x\n");

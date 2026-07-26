@@ -9,7 +9,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { createHash, generateKeyPairSync, sign as edSign } from "node:crypto";
 
-const argv = process.argv.slice(2);
+let ARGV = process.argv.slice(2);
 
 // ── profile: per-machine consumption config (design §6) ─────────────────────
 // Precedence (weakest → strongest): defaults < preset < machine file < env < flags.
@@ -55,6 +55,23 @@ function git(args, input) {
   return { code: r.status ?? 1, out: (r.stdout ?? "").replace(/\n+$/u, ""), err: (r.stderr ?? "").trim() };
 }
 
+// One rev-parse resolves git-dir, toplevel, HEAD sha, and branch — memoized, so
+// the metadata every command re-derives costs a single spawn instead of ~5.
+let REPO_INFO;
+function repoInfo() {
+  if (REPO_INFO !== undefined) return REPO_INFO;
+  // git-dir + toplevel succeed even with an unborn HEAD; branch/head must not be
+  // in the same fatal call (a fresh repo has no commit yet).
+  const r = git(["rev-parse", "--git-dir", "--show-toplevel"]);
+  if (r.code !== 0) return (REPO_INFO = null);
+  const [gitDir, toplevel] = r.out.split("\n");
+  const b = git(["symbolic-ref", "--short", "-q", "HEAD"]); // "" on detached HEAD
+  const h = git(["rev-parse", "--short", "HEAD"]); // "" on unborn HEAD
+  REPO_INFO = { gitDir, toplevel, branch: b.code === 0 ? b.out : "HEAD", head: h.code === 0 ? h.out : "" };
+  return REPO_INFO;
+}
+const invalidateRepoInfo = () => { REPO_INFO = undefined; JJ_CACHE = undefined; };
+
 function sortKeys(v) {
   if (Array.isArray(v)) return v.map(sortKeys);
   if (v && typeof v === "object") {
@@ -72,15 +89,23 @@ const estTokens = (s) => Math.ceil(s.length / 4);
 let CMD = "";
 let FULL_EST = 0;
 
+// batch mode: emit/die yield the result to the batch loop instead of exiting,
+// so one warm process serves many commands (startup paid once — ~3× faster per
+// command for an agent issuing a stream of them).
+let BATCH = false;
+class Yield { constructor(obj, code) { this.obj = obj; this.code = code; } }
+
 function emit(obj, exit = 0) {
+  if (BATCH) throw new Yield(obj, exit);
   const s = JSON.stringify(sortKeys(obj), null, TTY ? 1 : 0);
   process.stdout.write(s + "\n");
   if (CMD && CMD !== "metrics" && CMD !== "profile") {
-    // no keelDir()/die() here: a recording failure must never break the command
-    const gd = git(["rev-parse", "--git-dir"]);
-    if (gd.code === 0) {
+    // no die() here: a recording failure must never break the command. Reuse the
+    // memoized git-dir (already resolved by the command) — no extra spawn.
+    const info = REPO_INFO;
+    if (info) {
       try {
-        const d = join(gd.out, "keel");
+        const d = join(info.gitDir, "keel");
         mkdirSync(d, { recursive: true });
         const rec = { c: CMD, o: estTokens(s), ...(FULL_EST > estTokens(s) ? { f: FULL_EST } : {}) };
         appendFileSync(join(d, "metrics.jsonl"), JSON.stringify(rec) + "\n");
@@ -94,10 +119,36 @@ function die(code, message, fix) {
   emit({ error: code, message, ...(fix ? { fix } : {}) }, 1);
 }
 
+// ── batch: one warm process, many commands, startup amortized to ~0 ──────────
+async function cmdBatch() {
+  BATCH = true;
+  const lines = readFileSync(0, "utf8").split("\n").filter((l) => l.trim());
+  const out = [];
+  for (const line of lines) {
+    // tokenize with single/double-quote support so `save "a b"` is one arg
+    const parts = (line.trim().match(/"[^"]*"|'[^']*'|\S+/gu) ?? [])
+      .map((t) => (/^["'].*["']$/u.test(t) ? t.slice(1, -1) : t));
+    const name = parts[0];
+    invalidateRepoInfo(); // each command sees fresh repo state
+    if (!cmds[name] || name === "batch") { out.push(JSON.stringify({ error: "E_USAGE", message: `unknown command: ${name}` })); continue; }
+    ARGV = parts; CMD = name; FULL_EST = 0;
+    try {
+      await cmds[name]();
+      out.push(JSON.stringify({ error: "E_NO_OUTPUT", command: name })); // a command must emit
+    } catch (e) {
+      if (e instanceof Yield) out.push(JSON.stringify(sortKeys(e.obj)));
+      else out.push(JSON.stringify({ error: "E_INTERNAL", message: String(e?.message ?? e).slice(0, 200) }));
+    }
+  }
+  BATCH = false;
+  process.stdout.write(out.join("\n") + "\n");
+  process.exit(0);
+}
+
 function requireRepo() {
-  const r = git(["rev-parse", "--git-dir"]);
-  if (r.code !== 0) die("E_NO_REPO", "not inside a repository", "cd into one, or: git init");
-  return r.out;
+  const info = repoInfo();
+  if (!info) die("E_NO_REPO", "not inside a repository", "cd into one, or: git init");
+  return info.gitDir;
 }
 
 function keelDir() {
@@ -107,8 +158,8 @@ function keelDir() {
 }
 
 function head() {
-  const r = git(["rev-parse", "--short", "HEAD"]);
-  return r.code === 0 ? r.out : "";
+  const info = repoInfo();
+  return info ? info.head : "";
 }
 
 const EMPTY_TREE = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
@@ -121,8 +172,8 @@ const diffBase = () => (head() ? "HEAD" : EMPTY_TREE);
 let JJ_CACHE;
 function jjRepo() {
   if (JJ_CACHE !== undefined) return JJ_CACHE;
-  const gd = git(["rev-parse", "--show-toplevel"]);
-  JJ_CACHE = gd.code === 0 && existsSync(join(gd.out, ".jj"));
+  const info = repoInfo();
+  JJ_CACHE = !!info && existsSync(join(info.toplevel, ".jj"));
   return JJ_CACHE;
 }
 function jj(args) {
@@ -131,17 +182,17 @@ function jj(args) {
 }
 
 function flag(name) {
-  const i = argv.indexOf(name);
+  const i = ARGV.indexOf(name);
   if (i === -1) return undefined;
-  argv.splice(i, 1);
+  ARGV.splice(i, 1);
   return true;
 }
 
 function opt(name, dflt) {
-  const i = argv.indexOf(name);
+  const i = ARGV.indexOf(name);
   if (i === -1) return dflt;
-  const v = argv[i + 1];
-  argv.splice(i, 2);
+  const v = ARGV[i + 1];
+  ARGV.splice(i, 2);
   return v;
 }
 
@@ -199,7 +250,8 @@ function cmdSt() {
   };
   // cross-agent awareness: report the working set; surface overlaps (design §7)
   if (rows.length) {
-    const rep = daemonCall({ op: "report", session: sessionKey(), repo: git(["rev-parse", "--show-toplevel"]).out, paths: rows.map((r) => r[1]) });
+    const info = repoInfo();
+    const rep = daemonCall({ op: "report", session: `${info.toplevel}#${info.branch}`, repo: info.toplevel, paths: rows.map((r) => r[1]) });
     if (rep && rep.overlaps && rep.overlaps.length) {
       out.overlap = rep.overlaps.map((o) => [o.path, o.session]).sort();
     }
@@ -227,7 +279,7 @@ function cmdD() {
   const usage = flag("--usage");
   const full = flag("--full");
   const reshow = flag("--reshow") === true;
-  const paths = argv.slice(1);
+  const paths = ARGV.slice(1);
   const budgetChars = budget * 4;
 
   const patch = git(["diff", "--no-color", diffBase(), "--", ...paths]).out;
@@ -317,7 +369,7 @@ function oplogPath() { return join(keelDir(), "oplog.jsonl"); }
 
 function cmdSave() {
   requireRepo();
-  const msg = argv[1];
+  const msg = ARGV[1];
   if (!msg) die("E_USAGE", "save needs a message", 'save "what changed"');
   if (jjRepo()) {
     // jj: the working copy IS a commit — describing+finalizing it is one op,
@@ -333,6 +385,7 @@ function cmdSave() {
   if (git(["diff", "--cached", "--quiet"]).code === 0 && before) emit({ id: before, noop: true });
   const c = git(["commit", "-q", "-m", msg]);
   if (c.code !== 0) die("E_SAVE", c.err.slice(0, 200), "check repo state with: st");
+  invalidateRepoInfo();
   const after = head();
   appendFileSync(oplogPath(), JSON.stringify({ op: "save", before, after }) + "\n");
   emit({ id: after });
@@ -435,7 +488,7 @@ function cmdLog() {
   requireRepo();
   const n = Number(opt("-n", "10"));
   const grep = opt("--grep");
-  const range = argv[1];
+  const range = ARGV[1];
   if (jjRepo() && !range && !grep) {
     const r = jj(["log", "--no-graph", "-n", String(n), "-r", "::@-", "-T", 'change_id.short() ++ "\\t" ++ description.first_line() ++ "\\n"']);
     if (r.code === 0) {
@@ -469,9 +522,8 @@ function daemonCall(req, timeoutMs = 250) {
 }
 
 function sessionKey() {
-  const root = git(["rev-parse", "--show-toplevel"]).out;
-  const branch = git(["rev-parse", "--abbrev-ref", "HEAD"]).out;
-  return `${root}#${branch}`;
+  const info = repoInfo();
+  return `${info.toplevel}#${info.branch}`;
 }
 
 function cmdFleet() {
@@ -501,7 +553,7 @@ async function api(cfg, method, path, body, signed = false) {
 
 async function cmdLink() {
   requireRepo();
-  const url = argv[1]; const repo = argv[2];
+  const url = ARGV[1]; const repo = ARGV[2];
   if (!url || !repo) die("E_USAGE", "link needs a server and a repo name", "link http://host:port myrepo");
   const { publicKey, privateKey } = generateKeyPairSync("ed25519");
   const pub = publicKey.export({ format: "der", type: "spki" }).toString("base64");
@@ -536,7 +588,7 @@ const issueCert = (kind, subPub, caveats, parent, issuerPriv) => {
 const idDir = () => join(process.env.HOME ?? "/tmp", ".keel", "id");
 
 function cmdId() {
-  const sub = argv[1];
+  const sub = ARGV[1];
   if (sub === "init") {
     mkdirSync(idDir(), { recursive: true });
     if (existsSync(join(idDir(), "chain.json")) && flag("--force") !== true) {
@@ -563,7 +615,7 @@ function cmdId() {
     emit({ session: cert.id, refs, ttl_s: ttl, chain: `org:${id.orgCert.id}/account:${id.accountCert.id}/machine:${id.machineCert.id}/session:${cert.id}` });
   }
   if (sub === "revoke") {
-    const target = argv[2];
+    const target = ARGV[2];
     if (!target) die("E_USAGE", "id revoke <cert-id> (needs a linked server)", "id revoke abc123…");
     const cfgS = serverCfg();
     if (!cfgS) die("E_NO_SERVER", "no server linked", "link <url> <repo> first");
@@ -673,7 +725,7 @@ async function cmdPull() {
 }
 
 async function cmdClone() {
-  const url = argv[1]; const repo = argv[2]; const dir = argv[3] ?? repo;
+  const url = ARGV[1]; const repo = ARGV[2]; const dir = ARGV[3] ?? repo;
   if (!url || !repo) die("E_USAGE", "clone needs a server and a repo name", "clone http://host:port myrepo [dir]");
   if (existsSync(join(dir, ".git"))) die("E_EXISTS", `${dir} is already a repository`);
   mkdirSync(dir, { recursive: true });
@@ -739,10 +791,12 @@ Output is JSON when piped. Errors: {error,message,fix} + exit 1. Never interacti
   id init|mint|revoke    identity chain: org→account→machine, then per-repo
                          session credentials (--refs a,b --ttl s); pushes use
                          the strongest credential present
+  batch                  read commands from stdin (one per line), run them in
+                         one warm process — ~3× faster per command for agents
 `;
 
-const cmds = { st: cmdSt, d: cmdD, save: cmdSave, sync: cmdSync, fix: cmdFix, log: cmdLog, undo: cmdUndo, profile: cmdProfile, metrics: cmdMetrics, fleet: cmdFleet, link: cmdLink, push: cmdPush, pull: cmdPull, clone: cmdClone, id: cmdId };
-const cmd = argv[0];
+const cmds = { st: cmdSt, d: cmdD, save: cmdSave, sync: cmdSync, fix: cmdFix, log: cmdLog, undo: cmdUndo, profile: cmdProfile, metrics: cmdMetrics, fleet: cmdFleet, link: cmdLink, push: cmdPush, pull: cmdPull, clone: cmdClone, id: cmdId, batch: cmdBatch };
+const cmd = ARGV[0];
 if (!cmd || cmd === "help" || cmd === "--help") { process.stdout.write(HELP); process.exit(0); }
 if (!cmds[cmd]) die("E_USAGE", `unknown command: ${cmd}`, "run: keel help");
 CMD = cmd;
