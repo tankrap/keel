@@ -532,6 +532,34 @@ function cmdFleet() {
   emit({ cols: ["session", "repo", "paths"], workspaces: (res.workspaces ?? []).map((w) => [w.session, w.repo, w.paths]) });
 }
 
+// ── coordination (#2): reserve regions, list reservations, predict collisions ─
+function cmdReserve() {
+  requireRepo();
+  const force = flag("--force");
+  const globs = ARGV.slice(1);
+  if (!globs.length) die("E_USAGE", "reserve needs one or more path globs", "reserve 'src/auth/**' 'docs/*.md'");
+  const info = repoInfo();
+  const res = daemonCall({ op: "reserve", session: sessionKey(), repo: info.toplevel, globs, force }, 1000);
+  if (!res) die("E_NO_DAEMON", "keeld is not running on this machine", "start it: node src/keeld.mjs");
+  if (!res.ok) die(res.error ?? "E_RESERVE", res.error === "E_RESERVED" ? `region is reserved by another session: ${res.conflicts.map((c) => `${c.glob}↔${c.held}(${c.session})`).join(" ")}` : "reserve failed", res.fix ?? "");
+  emit({ reserved: res.reserved, ...(res.forced_over ? { forced_over: res.forced_over.length } : {}) });
+}
+
+function cmdReservations() {
+  const res = daemonCall({ op: "reservations" }, 500);
+  if (!res) die("E_NO_DAEMON", "keeld is not running on this machine", "start it: node src/keeld.mjs");
+  emit({ cols: ["session", "globs", "repo"], reservations: (res.reservations ?? []).map((r) => [r.session, r.globs.join(" "), r.repo]) });
+}
+
+function cmdPlan() {
+  requireRepo();
+  const globs = ARGV.slice(1);
+  if (!globs.length) die("E_USAGE", "plan needs the path globs you intend to touch", "plan 'src/auth/**'");
+  const res = daemonCall({ op: "predict", session: sessionKey(), globs }, 500);
+  if (!res) die("E_NO_DAEMON", "keeld is not running on this machine", "start it: node src/keeld.mjs");
+  emit({ collides: res.collides, conflicts: (res.conflicts ?? []).map((c) => [c.glob, c.held, c.session]), ...(res.collides ? {} : { clear: true }) });
+}
+
 // ── server client: link / push / pull (protocol-v0, signed with the machine
 // key; chunk fetches go through keeld's shared cache when it's running) ─────
 
@@ -795,7 +823,7 @@ Output is JSON when piped. Errors: {error,message,fix} + exit 1. Never interacti
                          one warm process — ~3× faster per command for agents
 `;
 
-const cmds = { st: cmdSt, d: cmdD, save: cmdSave, sync: cmdSync, fix: cmdFix, log: cmdLog, undo: cmdUndo, profile: cmdProfile, metrics: cmdMetrics, fleet: cmdFleet, link: cmdLink, push: cmdPush, pull: cmdPull, clone: cmdClone, id: cmdId, batch: cmdBatch };
+const cmds = { st: cmdSt, d: cmdD, save: cmdSave, sync: cmdSync, fix: cmdFix, log: cmdLog, undo: cmdUndo, profile: cmdProfile, metrics: cmdMetrics, fleet: cmdFleet, reserve: cmdReserve, reservations: cmdReservations, plan: cmdPlan, link: cmdLink, push: cmdPush, pull: cmdPull, clone: cmdClone, id: cmdId, batch: cmdBatch };
 const cmd = ARGV[0];
 if (!cmd || cmd === "help" || cmd === "--help") { process.stdout.write(HELP); process.exit(0); }
 if (!cmds[cmd]) die("E_USAGE", `unknown command: ${cmd}`, "run: keel help");

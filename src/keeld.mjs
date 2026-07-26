@@ -33,6 +33,9 @@ mkdirSync(dirname(SOCKET), { recursive: true });
 // registry: session key → {repo, paths:Set}. Rebuilt from journal at boot —
 // a kill -9 at any point loses at most an unacked request.
 const sessions = new Map();
+// coordination (design #2): session → { globs: [...] } reservations. A fleet
+// claims regions BEFORE working so collisions are prevented, not detected late.
+const reservations = new Map();
 
 function apply(rec) {
   if (rec.op === "report") {
@@ -41,9 +44,37 @@ function apply(rec) {
   } else if (rec.op === "acquire") {
     const cur = sessions.get(rec.session) ?? { paths: new Set() };
     sessions.set(rec.session, { ...cur, repo: rec.base, ws: rec.ws, branch: rec.branch, paths: cur.paths ?? new Set() });
+  } else if (rec.op === "reserve") {
+    reservations.set(rec.session, { globs: rec.globs, repo: rec.repo ?? "", ts: rec.ts });
+  } else if (rec.op === "unreserve") {
+    reservations.delete(rec.session);
   } else if (rec.op === "release") {
     sessions.delete(rec.session);
+    reservations.delete(rec.session);
   }
+}
+
+// A glob normalizes to a prefix (strip trailing /**, /*, *). Two claims collide
+// if either prefix contains the other (prefix overlap) — pragmatic and honest;
+// exact path membership is the prefix-equality case.
+const prefixOf = (glob) => glob.replace(/\/?\*+$/u, "").replace(/\/$/u, "");
+function globsCollide(a, b) {
+  const pa = prefixOf(a), pb = prefixOf(b);
+  if (pa === "" || pb === "") return true; // a bare "*" claims everything
+  return pa === pb || pa.startsWith(pb + "/") || pb.startsWith(pa + "/");
+}
+// conflicts between a candidate glob set and everyone else's reservations
+function collisions(session, globs) {
+  const out = [];
+  for (const [sid, r] of reservations) {
+    if (sid === session) continue;
+    for (const g of globs) {
+      for (const held of r.globs) {
+        if (globsCollide(g, held)) out.push({ glob: g, held, session: sid });
+      }
+    }
+  }
+  return out.sort((x, y) => (x.glob + x.session < y.glob + y.session ? -1 : 1));
 }
 
 function journal(rec) {
@@ -140,9 +171,35 @@ function opRelease(req) {
   return { ok: true, ...(s?.ws ? { removed: s.ws } : {}) };
 }
 
+function opReserve(req) {
+  if (!req.session || !Array.isArray(req.globs) || !req.globs.length) {
+    return { ok: false, error: "E_USAGE", fix: "reserve needs {session, globs:[...]}" };
+  }
+  const conflicts = collisions(req.session, req.globs);
+  // strict by default: refuse a reservation that collides with a live one, so
+  // the orchestrator routes elsewhere. --force lets an operator claim anyway.
+  if (conflicts.length && !req.force) {
+    return { ok: false, error: "E_RESERVED", conflicts, fix: "reserve a disjoint region, or pass force to override" };
+  }
+  journal({ op: "reserve", session: req.session, globs: req.globs, repo: req.repo ?? "", ts: req.ts ?? 0 });
+  return { ok: true, reserved: req.globs, ...(conflicts.length ? { forced_over: conflicts } : {}) };
+}
+
 async function handle(req) {
   if (req.op === "ping") return { ok: true, pid: process.pid, workspaces: sessions.size };
   if (req.op === "acquire") return opAcquire(req);
+  if (req.op === "reserve") return opReserve(req);
+  if (req.op === "unreserve") { journal({ op: "unreserve", session: req.session }); return { ok: true }; }
+  if (req.op === "reservations") {
+    const held = [...reservations.entries()].map(([session, r]) => ({ session, globs: r.globs, repo: r.repo })).sort((a, b) => (a.session < b.session ? -1 : 1));
+    return { ok: true, reservations: held };
+  }
+  if (req.op === "predict") {
+    // collision risk for a candidate set of globs WITHOUT reserving (planning)
+    if (!Array.isArray(req.globs)) return { ok: false, error: "E_USAGE", fix: "predict needs {globs:[...]}" };
+    const conflicts = collisions(req.session ?? "", req.globs);
+    return { ok: true, collides: conflicts.length > 0, conflicts };
+  }
   if (req.op === "fetch") {
     if (!req.url || !req.hash) return { ok: false, error: "E_USAGE", fix: "fetch needs {url, hash}" };
     try { return await fetchChunk(req.url, req.hash); }

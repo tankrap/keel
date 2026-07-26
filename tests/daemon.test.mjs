@@ -161,3 +161,38 @@ test("workspaces: shared store, minted credentials, isolation, crash recovery", 
   assert.equal(existsSync(join(a.workspace, "shared.js")), false, "release removes the worktree");
   assert.equal((await call2({ op: "fleet" })).workspaces.filter((w) => w.workspace).length, 1);
 });
+
+test("coordination #2: reservations, collision refusal, predict, release + crash", async () => {
+  await startDaemon(); // idempotent-ish; a fresh daemon on the shared SOCKET
+
+  // A reserves auth; disjoint claim by B succeeds; overlapping claim by C is refused
+  assert.equal((await call({ op: "reserve", session: "A", globs: ["src/auth/**"] })).ok, true);
+  assert.equal((await call({ op: "reserve", session: "B", globs: ["src/billing/**"] })).ok, true);
+  const c = await call({ op: "reserve", session: "C", globs: ["src/auth/login.js"] });
+  assert.equal(c.ok, false);
+  assert.equal(c.error, "E_RESERVED");
+  assert.ok(c.conflicts.some((x) => x.session === "A"), "conflict names the holder");
+
+  // predict is non-mutating: reports the same collision without reserving
+  const p = await call({ op: "predict", session: "C", globs: ["src/auth/x.js", "src/docs/y.md"] });
+  assert.equal(p.collides, true);
+  assert.equal((await call({ op: "reservations" })).reservations.length, 2, "predict did not reserve");
+
+  // force overrides
+  const f = await call({ op: "reserve", session: "C", globs: ["src/auth/login.js"], force: true });
+  assert.equal(f.ok, true);
+  assert.ok(f.forced_over.length >= 1);
+
+  // release clears a session's reservation
+  await call({ op: "release", session: "A" });
+  const held = (await call({ op: "reservations" })).reservations.map((r) => r.session);
+  assert.ok(!held.includes("A"), "release clears reservations");
+
+  // crash-only: reservations survive kill -9 via the journal
+  const alive = kids[kids.length - 1];
+  process.kill(alive.pid, "SIGKILL");
+  await new Promise((r) => alive.once("exit", r));
+  await startDaemon();
+  const after = (await call({ op: "reservations" })).reservations.map((r) => r.session).sort();
+  assert.deepEqual(after, ["B", "C"], "reservations recovered after crash");
+});
