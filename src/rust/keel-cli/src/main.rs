@@ -386,8 +386,13 @@ fn write_shown(m: &HashMap<String, String>) -> String {
 // ── save / undo ──────────────────────────────────────────────────────────────
 fn oplog(info: &Info) -> PathBuf { keel_dir(info).join("oplog.jsonl") }
 
-fn cmd_save(args: &mut [String]) -> ! {
+fn cmd_save(args: &mut Vec<String>) -> ! {
     let info = require_repo();
+    // #3: a change carries meaning + verification, bound to the commit and
+    // queryable later (git only has prose). --task, --intent, --verified k=v,...
+    let task = opt(args, "--task");
+    let intent = opt(args, "--intent");
+    let verified = opt(args, "--verified");
     let msg = args.get(1).cloned().unwrap_or_default();
     if msg.is_empty() {
         die("E_USAGE", "save needs a message", "save \"what changed\"");
@@ -402,8 +407,56 @@ fn cmd_save(args: &mut [String]) -> ! {
         die("E_SAVE", &err.chars().take(200).collect::<String>(), "check repo state with: st");
     }
     let after = git(&["rev-parse", "--short", "HEAD"]).1;
+    let full = git(&["rev-parse", "HEAD"]).1;
     let _ = append_line(&oplog(&info), &format!("{{\"after\":\"{}\",\"before\":\"{}\",\"op\":\"save\"}}", after, before));
-    emit(&Ctx { cmd: "save".into(), full_est: 0 }, J::O(vec![("id".into(), s(&after))]));
+
+    // change record — signed provenance comes later; v0 is a keel sidecar keyed by commit
+    if task.is_some() || intent.is_some() || verified.is_some() {
+        let mut rec: Vec<(String, J)> = vec![("commit".into(), s(&full))];
+        if let Some(t) = &task { rec.push(("task".into(), s(t))); }
+        if let Some(i) = &intent { rec.push(("intent".into(), s(i))); }
+        if let Some(v) = &verified {
+            let kvs: Vec<(String, J)> = v.split(',').filter_map(|p| { let mut it = p.splitn(2, '='); Some((it.next()?.to_string(), s(it.next().unwrap_or("true")))) }).collect();
+            rec.push(("verified".into(), J::O(kvs)));
+        }
+        let _ = append_line(&keel_dir(&info).join("changes.jsonl"), &canonical(&J::O(rec)));
+    }
+    let mut out = vec![("id".into(), s(&after))];
+    if let Some(t) = &task { out.push(("task".into(), s(t))); }
+    emit(&Ctx { cmd: "save".into(), full_est: 0 }, J::O(out));
+}
+
+// #3 query: the meaning + verification bound to the last change touching a path
+fn change_records(info: &Info) -> Vec<(String, String)> {
+    // (full_commit, raw_json_line)
+    fs::read_to_string(keel_dir(info).join("changes.jsonl"))
+        .unwrap_or_default()
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .filter_map(|l| {
+            let key = "\"commit\":\"";
+            l.find(key).map(|i| { let s0 = i + key.len(); let c = l[s0..].find('"').map(|j| l[s0..s0 + j].to_string()).unwrap_or_default(); (c, l.to_string()) })
+        })
+        .collect()
+}
+fn cmd_why(args: &mut Vec<String>) -> ! {
+    let info = require_repo();
+    let path = args.get(1).cloned().unwrap_or_default();
+    if path.is_empty() {
+        die("E_USAGE", "why needs a path", "why src/auth/login.js");
+    }
+    let commit = git(&["log", "-1", "--format=%H", "--", &path]).1;
+    if commit.is_empty() {
+        die("E_NO_HISTORY", "no commit touches that path", "");
+    }
+    let recs = change_records(&info);
+    if let Some((_, raw)) = recs.iter().find(|(c, _)| *c == commit) {
+        // the record is already canonical JSON — emit it verbatim (it's the answer)
+        println!("{}", raw);
+        exit(0);
+    }
+    let subj = git(&["log", "-1", "--format=%s", &commit]).1;
+    emit(&Ctx { cmd: "why".into(), full_est: 0 }, J::O(vec![("commit".into(), s(&commit[..commit.len().min(7)])), ("note".into(), s("no keel metadata; save with --task/--intent/--verified to record it")), ("subject".into(), s(&subj))]));
 }
 
 fn cmd_undo(_args: &mut [String]) -> ! {
@@ -616,6 +669,7 @@ fn main() {
         Some("undo") => cmd_undo(&mut args),
         Some("fix") => cmd_fix(&mut args),
         Some("sync") => cmd_sync(&mut args),
+        Some("why") => cmd_why(&mut args),
         Some("profile") => cmd_profile(&mut args),
         Some("metrics") => cmd_metrics(&mut args),
         Some("version") | Some("--version") => println!("{{\"core\":\"keel-core\",\"keel\":\"0.2.0-rust\"}}"),
