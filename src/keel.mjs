@@ -114,6 +114,22 @@ function head() {
 const EMPTY_TREE = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
 const diffBase = () => (head() ? "HEAD" : EMPTY_TREE);
 
+// ── jj substrate (decisions/0001 stage 2): when the repo is jj-colocated, the
+// change-model verbs ride jj — working-copy-as-commit, stable change IDs, op-log
+// undo — behind the SAME output contract. Reads (st/d) stay on git plumbing,
+// which colocation keeps in sync. Nothing in the output may leak the backend.
+let JJ_CACHE;
+function jjRepo() {
+  if (JJ_CACHE !== undefined) return JJ_CACHE;
+  const gd = git(["rev-parse", "--show-toplevel"]);
+  JJ_CACHE = gd.code === 0 && existsSync(join(gd.out, ".jj"));
+  return JJ_CACHE;
+}
+function jj(args) {
+  const r = spawnSync("jj", args, { encoding: "utf8", maxBuffer: 64 * 1024 * 1024, env: { ...process.env, JJ_CONFIG: process.env.JJ_CONFIG ?? "" } });
+  return { code: r.status ?? 1, out: (r.stdout ?? "").replace(/\n+$/u, ""), err: (r.stderr ?? "").trim() };
+}
+
 function flag(name) {
   const i = argv.indexOf(name);
   if (i === -1) return undefined;
@@ -175,6 +191,7 @@ function cmdSt() {
   }).sort((x, y) => (x[1] < y[1] ? -1 : 1));
   const out = {
     branch: info.branch,
+    ...(jjRepo() ? { change: jj(["log", "--no-graph", "-r", "@", "-T", "change_id.short()"]).out } : {}),
     ...(info.upstream ? { upstream: info.upstream, ahead: info.ahead, behind: info.behind } : {}),
     ...(conflicts.length ? { conflicts: conflicts.sort() } : {}),
     cols: ["s", "p", "+", "-"],
@@ -302,6 +319,15 @@ function cmdSave() {
   requireRepo();
   const msg = argv[1];
   if (!msg) die("E_USAGE", "save needs a message", 'save "what changed"');
+  if (jjRepo()) {
+    // jj: the working copy IS a commit — describing+finalizing it is one op,
+    // and the id we return is a STABLE change id that survives rewrites
+    const before = jj(["log", "--no-graph", "-r", "@", "-T", "change_id.short()"]).out;
+    const c = jj(["commit", "-m", msg]);
+    if (c.code !== 0) die("E_SAVE", c.err.slice(0, 200), "check repo state with: st");
+    const id = jj(["log", "--no-graph", "-r", "@-", "-T", "change_id.short()"]).out || before;
+    emit({ id });
+  }
   const before = head();
   git(["add", "-A"]);
   if (git(["diff", "--cached", "--quiet"]).code === 0 && before) emit({ id: before, noop: true });
@@ -314,6 +340,13 @@ function cmdSave() {
 
 function cmdUndo() {
   requireRepo();
+  if (jjRepo()) {
+    // jj's op log undoes ANY operation, not just keel's own saves — this is
+    // the durability model the design wants, inherited wholesale
+    const r = jj(["undo"]);
+    if (r.code !== 0) die("E_UNDO", r.err.slice(0, 200));
+    emit({ undone: "op" });
+  }
   let entries = [];
   try { entries = readFileSync(oplogPath(), "utf8").trim().split("\n").filter(Boolean).map((l) => JSON.parse(l)); } catch { /* empty */ }
   const last = entries.pop();
@@ -403,6 +436,13 @@ function cmdLog() {
   const n = Number(opt("-n", "10"));
   const grep = opt("--grep");
   const range = argv[1];
+  if (jjRepo() && !range && !grep) {
+    const r = jj(["log", "--no-graph", "-n", String(n), "-r", "::@-", "-T", 'change_id.short() ++ "\\t" ++ description.first_line() ++ "\\n"']);
+    if (r.code === 0) {
+      const commits = r.out ? r.out.split("\n").filter(Boolean).map((l) => { const i = l.indexOf("\t"); return [l.slice(0, i), l.slice(i + 1)]; }) : [];
+      emit({ cols: ["id", "s"], commits });
+    }
+  }
   const args = ["log", `-n${n}`, "--format=%h\t%s"];
   if (grep) args.push(`--grep=${grep}`);
   if (range) args.push(range);

@@ -156,6 +156,34 @@ test("metrics: usage accumulates with displaced counterfactual", () => {
   assert.ok(verb.d[3] >= 0, "displaced tracked for d");
 });
 
+test("jj substrate: same verbs, stable change ids, op-log undo", async (t) => {
+  const probe = (() => { try { execFileSync("jj", ["--version"], { encoding: "utf8" }); return true; } catch { return false; } })();
+  if (!probe) return t.skip("jj not installed");
+  const { dir } = repo();
+  const jjEnv = { JJ_USER: "t", JJ_EMAIL: "t@t.test" };
+  execFileSync("jj", ["git", "init", "--colocate"], { cwd: dir, encoding: "utf8", env: { ...process.env, ...jjEnv } });
+
+  writeFileSync(join(dir, "a.txt"), "one\n");
+  const s1 = j(keel(dir, "save", "first change", jjEnv));
+  assert.match(s1.id, /^[a-z]{6,}$/u, "jj backend returns a stable change id, not a sha");
+
+  const st = j(keel(dir, "st", "--no-cursor", jjEnv));
+  assert.ok(st.change, "st carries the working-copy change id under jj");
+
+  writeFileSync(join(dir, "a.txt"), "one\ntwo\n");
+  const s2 = j(keel(dir, "save", "second change", jjEnv));
+  assert.notEqual(s1.id, s2.id);
+
+  const log = j(keel(dir, "log", "-n", "5", jjEnv));
+  assert.equal(log.commits[0][1], "second change", "log reads through jj with the same shape");
+  assert.equal(log.commits[0][0], s2.id, "log ids are the change ids save returned");
+
+  const u = j(keel(dir, "undo", jjEnv));
+  assert.equal(u.undone, "op");
+  const log2 = j(keel(dir, "log", "-n", "5", jjEnv));
+  assert.equal(log2.commits[0][1], "first change", "op-log undo reverses the save");
+});
+
 test("sync without upstream: structured error", () => {
   const { dir } = repo();
   writeFileSync(join(dir, "a.txt"), "x\n");
