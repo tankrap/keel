@@ -9,3 +9,4 @@ path = "src/main.rs"
 
 [dependencies]
 keel-core = { path = "../keel-core" }
+regex = "1"

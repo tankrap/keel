@@ -87,6 +87,7 @@ pub fn chunk_ranges(buf: &[u8]) -> Vec<(usize, usize)> {
 /// Deep key-sorted JSON with no incidental whitespace, matching the Node
 /// `canonical()` used for cert/manifest signing. Minimal serializer over the
 /// value types keel actually signs (objects, arrays, strings, numbers, bools).
+#[derive(Clone)]
 pub enum J {
     S(String),
     N(f64),
@@ -95,9 +96,30 @@ pub enum J {
     O(Vec<(String, J)>),
 }
 
+/// JSON string escaping matching JS `JSON.stringify` (so canonical bytes are
+/// identical to the Node reference — required for both output parity and
+/// signature verification).
+pub fn escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\u{08}' => out.push_str("\\b"),
+            '\u{0c}' => out.push_str("\\f"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
 pub fn canonical(v: &J) -> String {
     match v {
-        J::S(s) => format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\"")),
+        J::S(s) => format!("\"{}\"", escape(s)),
         J::N(n) => {
             if n.fract() == 0.0 {
                 format!("{}", *n as i64)
