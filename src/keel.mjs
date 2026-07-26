@@ -4,9 +4,10 @@
 // no prompts, no pagers, byte-stable ordering. See src/design.md §3–§4.
 
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, writeFileSync, appendFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync, appendFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
-import { createHash } from "node:crypto";
+import { tmpdir } from "node:os";
+import { createHash, generateKeyPairSync, sign as edSign } from "node:crypto";
 
 const argv = process.argv.slice(2);
 
@@ -429,6 +430,95 @@ function cmdFleet() {
   emit({ cols: ["session", "repo", "paths"], workspaces: (res.workspaces ?? []).map((w) => [w.session, w.repo, w.paths]) });
 }
 
+// ── server client: link / push / pull (protocol-v0, signed with the machine
+// key; chunk fetches go through keeld's shared cache when it's running) ─────
+
+function serverCfg() {
+  try { return JSON.parse(readFileSync(join(keelDir(), "server.json"), "utf8")); } catch { return null; }
+}
+
+async function api(cfg, method, path, body, signed = false) {
+  const raw = body === undefined ? undefined : Buffer.from(JSON.stringify(body));
+  const headers = {};
+  if (signed && raw) {
+    headers["x-keel-machine"] = cfg.machine;
+    headers["x-keel-sig"] = edSign(null, raw, cfg.privkey).toString("base64");
+  }
+  const res = await fetch(`${cfg.url}${path}`, { method, body: raw, headers });
+  const text = await res.text();
+  try { return JSON.parse(text); } catch { return { error: "E_PROTO", message: text.slice(0, 120) }; }
+}
+
+async function cmdLink() {
+  requireRepo();
+  const url = argv[1]; const repo = argv[2];
+  if (!url || !repo) die("E_USAGE", "link needs a server and a repo name", "link http://host:port myrepo");
+  const { publicKey, privateKey } = generateKeyPairSync("ed25519");
+  const pub = publicKey.export({ format: "der", type: "spki" }).toString("base64");
+  const r = await api({ url }, "POST", "/v0/enroll", { pubkey: pub });
+  if (!r.ok) die("E_LINK", `enroll failed: ${r.message ?? r.error ?? ""}`, "check the server URL");
+  const cfg = { url, repo, machine: r.machine, privkey: privateKey.export({ format: "pem", type: "pkcs8" }) };
+  writeFileSync(join(keelDir(), "server.json"), JSON.stringify(cfg), { mode: 0o600 });
+  emit({ linked: repo, server: url, machine: r.machine });
+}
+
+function refName(cfg) {
+  const branch = git(["rev-parse", "--abbrev-ref", "HEAD"]).out;
+  return { branch, ref: `${cfg.repo}/${branch}` };
+}
+
+async function cmdPush() {
+  requireRepo();
+  const cfg = serverCfg();
+  if (!cfg) die("E_NO_SERVER", "no server linked to this repo", "link <url> <repo> first");
+  const head = git(["rev-parse", "HEAD"]).out;
+  const { branch, ref } = refName(cfg);
+  const state = await api(cfg, "GET", "/v0/state");
+  const old = state.refs?.[ref] ?? null;
+  if (old === head) emit({ pushed: false, current: true, head: head.slice(0, 8) });
+  const bundlePath = join(tmpdir(), `keel-${head.slice(0, 12)}.bundle`);
+  const b = git(["bundle", "create", bundlePath, branch]);
+  if (b.code !== 0) die("E_BUNDLE", b.err.slice(0, 200));
+  const bundle = readFileSync(bundlePath);
+  rmSync(bundlePath, { force: true });
+  const chunk = createHash("sha256").update(bundle).digest("hex");
+  const put = await fetch(`${cfg.url}/v0/chunk/${chunk}`, { method: "PUT", body: bundle });
+  if (!(await put.json()).ok) die("E_CHUNK", "chunk upload failed");
+  const r = await api(cfg, "POST", "/v0/push", { ref, old, new: head, chunks: [chunk], idem: head, ingest: true, repo: cfg.repo }, true);
+  if (!r.ok) die(r.error ?? "E_PUSH", r.message ?? "", r.fix ?? (r.head ? "pull first, then push" : undefined));
+  emit({ pushed: true, ref, head: head.slice(0, 8), by: r.by, size: bundle.length });
+}
+
+async function cmdPull() {
+  requireRepo();
+  const cfg = serverCfg();
+  if (!cfg) die("E_NO_SERVER", "no server linked to this repo", "link <url> <repo> first");
+  const { branch, ref } = refName(cfg);
+  const state = await api(cfg, "GET", "/v0/state");
+  const target = state.refs?.[ref];
+  if (!target) die("E_NO_REF", `server has no ${ref}`, "push from the originating repo first");
+  const head = git(["rev-parse", "HEAD"]).out;
+  if (target === head) emit({ current: true, head: head.slice(0, 8) });
+  const ev = [...(state.events ?? [])].reverse().find((e) => e.ref === ref && e.new === target && e.chunks?.length);
+  if (!ev) die("E_NO_CHUNK", "no chunk recorded for the ref head", "originating side must push with chunks");
+  // prefer the daemon's shared verified cache; fall back to a direct fetch
+  let bundlePath;
+  const cached = daemonCall({ op: "fetch", url: `${cfg.url}/v0/chunk/${ev.chunks[0]}`, hash: ev.chunks[0] }, 5000);
+  if (cached?.ok) bundlePath = cached.path;
+  else {
+    const res = await fetch(`${cfg.url}/v0/chunk/${ev.chunks[0]}`);
+    const buf = Buffer.from(await res.arrayBuffer());
+    if (createHash("sha256").update(buf).digest("hex") !== ev.chunks[0]) die("E_HASH", "chunk failed verification — refusing");
+    bundlePath = join(tmpdir(), `keel-pull-${ev.chunks[0].slice(0, 12)}.bundle`);
+    writeFileSync(bundlePath, buf);
+  }
+  const f = git(["fetch", "--quiet", bundlePath, `${branch}:refs/keel/incoming`]);
+  if (f.code !== 0) die("E_FETCH", f.err.slice(0, 200));
+  const m = git(["merge", "--ff-only", "--quiet", "refs/keel/incoming"]);
+  if (m.code !== 0) die("E_DIVERGED", "local history diverged from the server ref", "save your work, then rebase onto refs/keel/incoming");
+  emit({ pulled: true, head: target.slice(0, 8), via: cached?.ok ? "daemon-cache" : "direct" });
+}
+
 // ── profile / metrics ───────────────────────────────────────────────────────
 
 function cmdProfile() {
@@ -468,11 +558,13 @@ Output is JSON when piped. Errors: {error,message,fix} + exit 1. Never interacti
   profile                effective config, each value with its source
   metrics                this repo's usage: calls, tokens out, tokens displaced
   fleet                  all sessions on this machine (needs keeld)
+  link <url> <repo>      enroll this machine with a keel-server
+  push / pull            signed, chunk-verified sync through the linked server
 `;
 
-const cmds = { st: cmdSt, d: cmdD, save: cmdSave, sync: cmdSync, fix: cmdFix, log: cmdLog, undo: cmdUndo, profile: cmdProfile, metrics: cmdMetrics, fleet: cmdFleet };
+const cmds = { st: cmdSt, d: cmdD, save: cmdSave, sync: cmdSync, fix: cmdFix, log: cmdLog, undo: cmdUndo, profile: cmdProfile, metrics: cmdMetrics, fleet: cmdFleet, link: cmdLink, push: cmdPush, pull: cmdPull };
 const cmd = argv[0];
 if (!cmd || cmd === "help" || cmd === "--help") { process.stdout.write(HELP); process.exit(0); }
 if (!cmds[cmd]) die("E_USAGE", `unknown command: ${cmd}`, "run: keel help");
 CMD = cmd;
-cmds[cmd]();
+Promise.resolve(cmds[cmd]()).catch((e) => die("E_INTERNAL", String(e?.message ?? e).slice(0, 200)));

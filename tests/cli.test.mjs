@@ -164,6 +164,54 @@ test("sync without upstream: structured error", () => {
   assert.equal(j(r).error, "E_NO_UPSTREAM");
 });
 
+test("link/push/pull: signed, chunk-verified sync through keel-server", async (t) => {
+  const SERVER = new URL("../../keel-server/src/server.mjs", import.meta.url).pathname;
+  const { existsSync } = await import("node:fs");
+  if (!existsSync(SERVER)) return t.skip("keel-server checkout not present");
+  const { spawn } = await import("node:child_process");
+  const store = mkdtempSync(join(tmpdir(), "keel-srv-store-"));
+  const child = spawn(process.execPath, [SERVER, "--port", "0", "--store", store], { stdio: ["ignore", "pipe", "inherit"] });
+  t.after(() => { try { process.kill(child.pid, "SIGKILL"); } catch { /* gone */ } });
+  const port = await new Promise((resolve, reject) => {
+    child.stdout.once("data", (d) => resolve(JSON.parse(String(d)).port));
+    setTimeout(() => reject(new Error("server boot timeout")), 5000);
+  });
+  const url = `http://127.0.0.1:${port}`;
+
+  const { dir } = repo();
+  writeFileSync(join(dir, "a.txt"), "one\n");
+  keel(dir, "save", "first");
+  const link = j(keel(dir, "link", url, "proj"));
+  assert.match(link.machine, /^[0-9a-f]{16}$/u);
+  const push = j(keel(dir, "push"));
+  assert.equal(push.pushed, true);
+  assert.equal(push.by, link.machine, "push must be attributed to this machine");
+  assert.equal(j(keel(dir, "push")).current, true, "re-push is a cheap no-op");
+
+  // an unrelated second repo pulls the same history via the server
+  const { dir: dir2 } = repo();
+  writeFileSync(join(dir2, "seed.txt"), "seed\n");
+  keel(dir2, "save", "seed");
+  j(keel(dir2, "link", url, "proj"));
+  const pull = keel(dir2, "pull");
+  assert.equal(j(pull).error, "E_DIVERGED", "unrelated history must not silently merge");
+
+  // a clone of the origin fast-forwards cleanly
+  const clone = mkdtempSync(join(tmpdir(), "keel-pull-"));
+  execFileSync("git", ["clone", "-q", dir, clone]);
+  execFileSync("git", ["config", "user.email", "t@t.test"], { cwd: clone });
+  execFileSync("git", ["config", "user.name", "t"], { cwd: clone });
+  writeFileSync(join(dir, "a.txt"), "one\ntwo\n");
+  keel(dir, "save", "second");
+  j(keel(dir, "push"));
+  j(keel(clone, "link", url, "proj"));
+  const ok = j(keel(clone, "pull"));
+  assert.equal(ok.pulled, true);
+  const clonedHead = execFileSync("git", ["rev-parse", "HEAD"], { cwd: clone, encoding: "utf8" }).trim();
+  const originHead = execFileSync("git", ["rev-parse", "HEAD"], { cwd: dir, encoding: "utf8" }).trim();
+  assert.equal(clonedHead, originHead, "pull lands on the pushed commit");
+});
+
 test("sync round-trip against a bare remote, and E_DIVERGED", () => {
   const { dir, g } = repo();
   const remote = mkdtempSync(join(tmpdir(), "keel-remote-"));
