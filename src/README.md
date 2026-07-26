@@ -28,6 +28,22 @@ up anything humans need.
 - **Git feature parity via interop** — speaks the git wire protocol both ways
   during adoption.
 
+## v0 is real
+
+`src/keel.mjs` — single-file, zero-dependency Node ≥22 CLI over the git backend
+(substrate staging: [decisions/0001](decisions/0001-substrate.md)). In any git repo:
+
+```
+node src/keel.mjs st              # whole situation, one call; "=" when unchanged
+node src/keel.mjs d --usage       # digest diff + counterfactual token frame
+node src/keel.mjs d a.js --budget 500   # hunks for one file, budget-capped
+node src/keel.mjs save "msg"      # snapshot + describe → {"id":"abc1234"}
+node src/keel.mjs sync            # pull+push; conflicts come back structured
+```
+
+Piped output is stable-key JSON; errors are `{error, message, fix}` + exit 1;
+never interactive. Tests: `node --test tests/cli.test.mjs`.
+
 ## Repos
 
 | repo | contents |
