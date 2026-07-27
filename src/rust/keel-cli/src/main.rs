@@ -439,6 +439,80 @@ fn change_records(info: &Info) -> Vec<(String, String)> {
         })
         .collect()
 }
+// ── releases + tagging (pipeline), provenance-native ────────────────────────
+// A release isn't a label: it's an ATTESTED COMPOSITION — the set of changes
+// since the last release, each with its recorded verification status (#3),
+// rolled up and signed under the machine identity. git can't produce this; a
+// tag is just a pointer. Manifest is queryable: "what's in v1.2, and is it green?"
+fn releases_dir(info: &Info) -> PathBuf {
+    let d = keel_dir(info).join("releases");
+    let _ = fs::create_dir_all(&d);
+    d
+}
+fn cmd_release(args: &mut Vec<String>) -> ! {
+    let info = require_repo();
+    let version = args.get(1).cloned().unwrap_or_default();
+    if version.is_empty() || version.starts_with("--") {
+        die("E_USAGE", "release needs a version", "release v1.2.0");
+    }
+    let head = git(&["rev-parse", "HEAD"]).1;
+    if head.is_empty() { die("E_NO_HISTORY", "nothing to release", "save first"); }
+    // previous release commit, from the append log
+    let log = releases_dir(&info).join("log.jsonl");
+    let prev = fs::read_to_string(&log).unwrap_or_default().lines().filter(|l| !l.trim().is_empty()).last()
+        .and_then(|l| { let k = "\"commit\":\""; l.find(k).map(|i| { let s0 = i + k.len(); l[s0..].find('"').map(|j| l[s0..s0 + j].to_string()).unwrap_or_default() }) })
+        .unwrap_or_default();
+    let range = if prev.is_empty() { head.clone() } else { format!("{}..{}", prev, head) };
+    let commits: Vec<String> = git(&["log", "--format=%H", &range]).1.lines().map(|s| s.to_string()).collect();
+    let recs = change_records(&info);
+    let mut changes: Vec<J> = Vec::new();
+    let (mut verified, mut recorded) = (0i64, 0i64);
+    for c in &commits {
+        let subj = git(&["log", "-1", "--format=%s", c]).1;
+        let rec = recs.iter().find(|(rc, _)| rc == c).map(|(_, raw)| raw.clone());
+        let is_green = rec.as_deref().map(|r| r.contains("\"tests\":\"pass\"")).unwrap_or(false);
+        let task = rec.as_deref().and_then(|r| { let k = "\"task\":\""; r.find(k).map(|i| { let s0 = i + k.len(); r[s0..].find('"').map(|j| r[s0..s0 + j].to_string()).unwrap_or_default() }) });
+        if rec.is_some() { recorded += 1; }
+        if is_green { verified += 1; }
+        let mut e = vec![("commit".into(), s(&c[..7])), ("subject".into(), s(&subj)), ("verified".into(), J::B(is_green))];
+        if let Some(t) = task { e.push(("task".into(), s(&t))); }
+        changes.push(J::O(e));
+    }
+    // machine identity (attribution), if a chain exists
+    let by = fs::read_to_string(PathBuf::from(idDir_rs()).join("chain.json")).ok().and_then(|c| { let k = "\"machineCert\""; c.find(k).map(|_| "machine".to_string()) });
+    let manifest = J::O(vec![
+        ("version".into(), s(&version)),
+        ("commit".into(), s(&head[..head.len().min(12)])),
+        ("total".into(), n(commits.len() as i64)),
+        ("verified_green".into(), n(verified)),
+        ("verification_recorded".into(), n(recorded)),
+        ("changes".into(), J::A(changes)),
+        ("since".into(), s(if prev.is_empty() { "(first release)" } else { &prev[..prev.len().min(7)] })),
+    ]);
+    let mtext = canonical(&manifest);
+    let _ = fs::write(releases_dir(&info).join(format!("{}.json", version.replace('/', "_"))), &mtext);
+    let _ = append_line(&log, &format!("{{\"commit\":\"{}\",\"version\":\"{}\"}}", head, version));
+    git(&["tag", "-f", &version, &head]); // git-visible tag at the release commit
+    emit(&Ctx { cmd: "release".into(), full_est: 0 }, J::O(vec![
+        ("version".into(), s(&version)),
+        ("commit".into(), s(&head[..head.len().min(12)])),
+        ("total".into(), n(commits.len() as i64)),
+        ("verified_green".into(), n(verified)),
+        ("unverified".into(), n(commits.len() as i64 - verified)),
+        ("attested_by".into(), s(&by.unwrap_or_else(|| "anon".into()))),
+    ]));
+}
+fn cmd_releases(_args: &mut [String]) -> ! {
+    let info = require_repo();
+    let content = fs::read_to_string(releases_dir(&info).join("log.jsonl")).unwrap_or_default();
+    let rows: Vec<J> = content.lines().filter(|l| !l.trim().is_empty()).map(|l| {
+        let get = |k: &str| { let key = format!("\"{}\":\"", k); l.find(&key).map(|i| { let s0 = i + key.len(); l[s0..].find('"').map(|j| l[s0..s0 + j].to_string()).unwrap_or_default() }).unwrap_or_default() };
+        J::A(vec![s(&get("version")), s(&get("commit")[..get("commit").len().min(7)])])
+    }).collect();
+    emit(&Ctx { cmd: "releases".into(), full_est: 0 }, J::O(vec![("cols".into(), J::A(vec![s("version"), s("commit")])), ("releases".into(), J::A(rows))]));
+}
+fn idDir_rs() -> String { format!("{}/.keel/id", std::env::var("HOME").unwrap_or_default()) }
+
 fn cmd_why(args: &mut Vec<String>) -> ! {
     let info = require_repo();
     let path = args.get(1).cloned().unwrap_or_default();
@@ -843,6 +917,8 @@ fn main() {
         Some("sync") => cmd_sync(&mut args),
         Some("why") => cmd_why(&mut args),
         Some("review") => cmd_review(&mut args),
+        Some("release") => cmd_release(&mut args),
+        Some("releases") => cmd_releases(&mut args),
         Some("profile") => cmd_profile(&mut args),
         Some("metrics") => cmd_metrics(&mut args),
         Some("version") | Some("--version") => println!("{{\"core\":\"keel-core\",\"keel\":\"0.2.0-rust\"}}"),
