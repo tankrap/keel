@@ -516,12 +516,51 @@ fn cmd_review(_args: &mut [String]) -> ! {
     gone_syms.sort();
     changed_syms.sort();
 
+    // ── mechanical vs substantive (the deep semantic-diff win) ──────────────
+    // Agent-written diffs are big AND repetitive: the same edit applied to many
+    // sites. Mask each changed line (identifiers→_, numbers→#) to a shape, group
+    // hunks by shape; a shape recurring ≥3× is a MECHANICAL pattern (shown once,
+    // "×N sites"); unique hunks are SUBSTANTIVE (shown in full). A reviewer/agent
+    // reads only the substantive changes + a one-line note per mechanical pattern.
+    struct Hunk { file: String, changed: Vec<String>, sig: String }
+    let mut hunks: Vec<Hunk> = Vec::new();
+    let mut cf = String::new();
+    for line in patch.lines() {
+        if let Some(c) = file_re.captures(line) { cf = c[1].to_string(); continue; }
+        if line.starts_with("@@") { hunks.push(Hunk { file: cf.clone(), changed: vec![], sig: String::new() }); continue; }
+        if (line.starts_with('+') || line.starts_with('-')) && !line.starts_with("+++") && !line.starts_with("---") {
+            if let Some(h) = hunks.last_mut() { h.changed.push(line.to_string()); }
+        }
+    }
+    for h in hunks.iter_mut() {
+        h.sig = h.changed.iter().map(|l| mask_shape(l)).collect::<Vec<_>>().join("\n");
+    }
+    let mut freq: HashMap<String, usize> = HashMap::new();
+    for h in &hunks { if !h.sig.is_empty() { *freq.entry(h.sig.clone()).or_insert(0) += 1; } }
+    // mechanical groups: sig → (sites, files, example shape)
+    let mut mech: HashMap<String, (i64, std::collections::BTreeSet<String>)> = HashMap::new();
+    let mut substantive: Vec<&Hunk> = Vec::new();
+    for h in &hunks {
+        if h.sig.is_empty() { continue; }
+        if freq[&h.sig] >= 3 {
+            let e = mech.entry(h.sig.clone()).or_insert((0, std::collections::BTreeSet::new()));
+            e.0 += 1; e.1.insert(h.file.clone());
+        } else {
+            substantive.push(h);
+        }
+    }
+    let mut mech_v: Vec<(String, i64, usize)> = mech.iter().map(|(sig, (c, files))| (sig.clone(), *c, files.len())).collect();
+    mech_v.sort_by(|a, b| b.1.cmp(&a.1)); // most-repeated first
+
     // a one-line human summary a reviewer reads first
     let mut bits: Vec<String> = Vec::new();
     if !renames.is_empty() { bits.push(format!("{} rename(s)", renames.len())); }
     if !new_syms.is_empty() { bits.push(format!("{} added", new_syms.len())); }
     if !gone_syms.is_empty() { bits.push(format!("{} removed", gone_syms.len())); }
     if !changed_syms.is_empty() { bits.push(format!("{} signature change(s)", changed_syms.len())); }
+    if !substantive.is_empty() { bits.push(format!("{} substantive hunk(s)", substantive.len())); }
+    let mech_sites: i64 = mech_v.iter().map(|(_, c, _)| c).sum();
+    if mech_sites > 0 { bits.push(format!("{} mechanical across {} pattern(s)", mech_sites, mech_v.len())); }
     let summary = if bits.is_empty() { "no structural changes".to_string() } else { bits.join(", ") };
 
     let mut o: Vec<(String, J)> = vec![("summary".into(), s(&summary))];
@@ -537,9 +576,59 @@ fn cmd_review(_args: &mut [String]) -> ! {
     if added_files != 0 || removed_files != 0 {
         o.push(("files".into(), J::O(vec![("added".into(), n(added_files)), ("removed".into(), n(removed_files))])));
     }
+    // mechanical patterns: shown once each, "×N sites across F files"
+    if !mech_v.is_empty() {
+        o.push(("mechanical".into(), J::A(mech_v.iter().map(|(sig, c, files)| J::O(vec![
+            ("pattern".into(), s(&sig.replace('\n', " ⏎ ").chars().take(120).collect::<String>())),
+            ("sites".into(), n(*c)),
+            ("files".into(), n(*files as i64)),
+        ])).collect())));
+    }
+    // substantive hunks: the changes actually worth reading, in full (budget-capped)
+    if !substantive.is_empty() {
+        let budget: i64 = std::env::var("KEEL_BUDGET").ok().and_then(|v| v.parse().ok()).unwrap_or(2000);
+        let mut spent = canonical(&J::O(o.clone())).len() as i64;
+        let mut shown: Vec<J> = Vec::new();
+        let mut elided = 0;
+        for h in &substantive {
+            let text = h.changed.join("\n");
+            if spent + text.len() as i64 <= budget * 4 {
+                shown.push(J::O(vec![("file".into(), s(&h.file)), ("change".into(), s(&text))]));
+                spent += text.len() as i64;
+            } else { elided += 1; }
+        }
+        o.push(("substantive".into(), J::A(shown)));
+        if elided > 0 { o.push(("substantive_elided".into(), n(elided))); }
+    }
     // full-est so metrics captures what a diff-dump would have cost a reviewer
     let full_est = (patch.len() as f64 / 4.0).ceil() as i64;
     emit(&Ctx { cmd: "review".into(), full_est }, J::O(o));
+}
+
+// mask a diff line to its structural SHAPE: identifiers→_, numbers→#, whitespace
+// collapsed, operators/punctuation kept. Same shape ⇒ same kind of edit.
+fn mask_shape(line: &str) -> String {
+    let t = line.trim_start_matches(['+', '-']).trim();
+    let b = t.as_bytes();
+    let mut out = String::with_capacity(t.len());
+    let mut i = 0;
+    while i < b.len() {
+        let c = b[i] as char;
+        if c.is_ascii_digit() {
+            while i < b.len() && (b[i] as char).is_ascii_digit() { i += 1; }
+            out.push('#');
+        } else if c.is_ascii_alphabetic() || c == '_' {
+            while i < b.len() && ((b[i] as char).is_ascii_alphanumeric() || b[i] == b'_') { i += 1; }
+            out.push('_');
+        } else if c.is_whitespace() {
+            while i < b.len() && (b[i] as char).is_whitespace() { i += 1; }
+            out.push(' ');
+        } else {
+            out.push(c);
+            i += 1;
+        }
+    }
+    out
 }
 
 fn cmd_undo(_args: &mut [String]) -> ! {
