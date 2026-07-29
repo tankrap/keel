@@ -1,0 +1,13 @@
+[package]
+name = "keel-store"
+version.workspace = true
+edition.workspace = true
+description = "keel native content-addressed object store — BLAKE3 addressing, canonical binary objects, LMDB backing"
+
+[dependencies]
+blake3 = "1"
+heed = "0.20"
+
+[dev-dependencies]
+keel-resolve = { path = "../keel-resolve" }
+keel-graph = { path = "../keel-graph" }

@@ -1,9 +1,11 @@
-//! keel-core — the byte-identical primitives shared by the CLI and the server.
+//! keel-core — **LEGACY** Node-compatible primitives (BLAKE2b addressing, FastCDC,
+//! canonical JSON), differential-tested byte-for-byte against the Node reference
+//! (`keel-server/src/store.mjs`). Used only by the prototype CLI and the interop layer.
 //!
-//! Content addressing and chunk boundaries MUST be computed identically on
-//! every peer or dedup and signature verification break. This crate is the one
-//! source of truth; it is differential-tested against the Node reference
-//! (`keel-server/src/store.mjs`) to guarantee the two agree byte-for-byte.
+//! The **native, greenfield VCS uses BLAKE3** and lives in `keel-store`, which does NOT
+//! depend on this crate — it has its own FastCDC chunker and hashes with BLAKE3. This
+//! crate exists solely to read/write data that is byte-compatible with the old Node
+//! prototype during the transition; do not build new native functionality on it.
 
 use blake2::{Blake2b512, Digest};
 

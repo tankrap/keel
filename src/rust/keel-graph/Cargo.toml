@@ -1,0 +1,9 @@
+[package]
+name = "keel-graph"
+version.workspace = true
+edition.workspace = true
+description = "keel live dependency graph — maintained over the working tree via the resolver sidecar, incrementally (only changed files re-resolve). The write-path-live graph a static index can't be."
+
+[dependencies]
+keel-resolve = { path = "../keel-resolve" }
+blake3 = "1"

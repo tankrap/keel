@@ -1,0 +1,8 @@
+[package]
+name = "keel-resolve"
+version.workspace = true
+edition.workspace = true
+description = "keel language-resolver sidecar client — spawns per-language resolver subprocesses (Node/TS, gopls, tree-sitter) over a stable line-delimited JSON protocol"
+
+[dependencies]
+serde_json = "1"

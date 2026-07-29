@@ -1,0 +1,7 @@
+[package]
+name = "keel-coord"
+version.workspace = true
+edition.workspace = true
+description = "keel coordination — reservations piggybacked on the brief. Free when uncontended, prevent-not-detect: an agent reserves the files it will edit before it edits them, and a collision is reported (redirect) instead of merged later."
+
+[dependencies]

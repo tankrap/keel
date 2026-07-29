@@ -1,0 +1,7 @@
+{
+  "name": "keel-resolver-sidecar",
+  "private": true,
+  "type": "module",
+  "description": "keel TS/JS resolver sidecar — TypeScript compiler symbol resolution",
+  "dependencies": { "typescript": "^5.6.3" }
+}

@@ -1,0 +1,11 @@
+[package]
+name = "keel-brief"
+version.workspace = true
+edition.workspace = true
+description = "keel's fused fetch — one call returns task-relevant context + dependency graph + provenance, over the live working tree. The primitive every agent calls instead of grep + read + ask-around."
+
+[dependencies]
+keel-store = { path = "../keel-store" }
+keel-resolve = { path = "../keel-resolve" }
+keel-graph = { path = "../keel-graph" }
+keel-coord = { path = "../keel-coord" }
