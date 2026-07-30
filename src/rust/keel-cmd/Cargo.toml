@@ -1,0 +1,16 @@
+[package]
+name = "keel-cmd"
+version.workspace = true
+edition.workspace = true
+description = "keel — the agent-facing CLI. `keel brief` returns task-relevant context + dependency graph + coordination + provenance + relevant prior sessions in one call, as byte-stable JSON or human text."
+
+[[bin]]
+name = "keel"
+path = "src/main.rs"
+
+[dependencies]
+keel-brief = { path = "../keel-brief" }
+keel-store = { path = "../keel-store" }
+keel-git = { path = "../keel-git" }
+serde_json = "1"
+miniz_oxide = "0.8"
