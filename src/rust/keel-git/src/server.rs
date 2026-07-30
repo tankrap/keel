@@ -60,21 +60,25 @@ pub fn reachable(store: &Store, wants: &[Oid]) -> io::Result<Vec<Oid>> {
 pub fn pack_for(store: &Store, wants: &[Oid]) -> io::Result<Vec<u8>> {
     let oids = reachable(store, wants)?;
     let mut objects = Vec::with_capacity(oids.len());
-    let mut total = 0usize;
     for oid in &oids {
         if let Some(obj) = mirror::get_object(store, oid)? {
-            total += obj.1.len();
             objects.push(obj);
         }
     }
-    // Delta-compress when it's affordable; on a very large repo full LZ delta over every object
-    // would stall the request, so fall back to the fast undeltified writer (git repacks locally).
+    Ok(pack_bytes(&objects))
+}
+
+/// Pack a set of objects, delta-compressing when it's affordable. On a very large repo, full LZ
+/// delta over every object would stall the request, so fall back to the fast undeltified writer
+/// (the client repacks locally either way).
+pub fn pack_bytes(objects: &[(Kind, Vec<u8>)]) -> Vec<u8> {
     const DELTA_BUDGET_OBJS: usize = 20_000;
     const DELTA_BUDGET_BYTES: usize = 128 * 1024 * 1024;
+    let total: usize = objects.iter().map(|(_, p)| p.len()).sum();
     if objects.len() <= DELTA_BUDGET_OBJS && total <= DELTA_BUDGET_BYTES {
-        Ok(crate::pack::write_deltified(&objects))
+        crate::pack::write_deltified(objects)
     } else {
-        Ok(crate::pack::write(&objects))
+        crate::pack::write(objects)
     }
 }
 
