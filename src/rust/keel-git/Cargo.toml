@@ -1,0 +1,13 @@
+[package]
+name = "keel-git"
+version.workspace = true
+edition.workspace = true
+
+# The git-compatibility edge adapter: read/write git's native object format (byte-identical,
+# real SHA-1 identity) so keel can mirror to a `.git`, and later serve/consume the git wire
+# protocol. keel's fused-graph core stays git-agnostic; this crate is the removable bridge.
+
+[dependencies]
+sha1 = "0.10"
+miniz_oxide = "0.8"
+keel-store = { path = "../keel-store" }
