@@ -1,0 +1,13 @@
+[package]
+name = "keel-daemon"
+version.workspace = true
+edition.workspace = true
+description = "keeld — the long-lived, crash-only keel daemon. Keeps the object store, live graph, and coordination warm so `keel brief` is fast (no per-call graph rebuild). One daemon per machine, over a Unix socket."
+
+[[bin]]
+name = "keeld"
+path = "src/main.rs"
+
+[dependencies]
+keel-brief = { path = "../keel-brief" }
+serde_json = "1"
