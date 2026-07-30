@@ -7,6 +7,7 @@
 //! re-resolves only what changed.
 
 use keel_graph::LiveGraph;
+use keel_resolve::Sidecar;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -20,21 +21,25 @@ fn main() {
     let copied = copy_ts(Path::new(&src), &work);
     println!("copied {copied} .ts files → workspace");
 
-    let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("../keel-resolve/sidecar/resolve.mjs");
-    let mut g = match LiveGraph::open(&work, &script) {
-        Ok(g) => g,
+    // optional 2nd arg: resolver sidecar script (default TS; pass resolve-c.mjs for C)
+    let script = std::env::args().nth(2).map(PathBuf::from).unwrap_or_else(|| {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../keel-resolve/sidecar/resolve.mjs")
+    });
+    let mut sc = match Sidecar::spawn(&script) {
+        Ok(s) => s,
         Err(e) => {
             eprintln!("node not available: {e}");
             return;
         }
     };
+    let mut g = LiveGraph::new(&work);
 
     let t = Instant::now();
-    let n = g.build().unwrap();
+    let n = g.build(&mut sc).unwrap();
     let build = t.elapsed();
 
     let t = Instant::now();
-    let c0 = g.refresh().unwrap();
+    let c0 = g.refresh(&mut sc).unwrap();
     let noop = t.elapsed();
 
     // edit one file and re-resolve
@@ -43,7 +48,7 @@ fn main() {
     content.extend_from_slice(b"\n// keel live-bench touch\n");
     std::fs::write(&victim, &content).unwrap();
     let t = Instant::now();
-    let c1 = g.refresh().unwrap();
+    let c1 = g.refresh(&mut sc).unwrap();
     let inc = t.elapsed();
 
     println!("\n=== keel live-graph incrementality — REAL code ===");

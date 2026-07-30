@@ -9,7 +9,7 @@
 //! This first cut is an in-process registry behind a mutex (the single-daemon model). The
 //! ordered-authority / subgraph-overlap prediction is a later layer.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 /// A file wanted by the caller but currently held by another agent.
@@ -18,6 +18,17 @@ pub struct Conflict {
     pub file: String,
     pub agent: String,
     pub task: String,
+}
+
+/// A *predicted* (soft) conflict: another agent holds a file in the same directory as one the
+/// caller intends to touch — not the exact file, but close enough to likely collide. Surfaced
+/// so a fleet spreads across modules instead of piling into the same area.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PredictedConflict {
+    pub held_file: String,
+    pub agent: String,
+    pub task: String,
+    pub dir: String,
 }
 
 #[derive(Default)]
@@ -85,8 +96,42 @@ impl Coordinator {
         }
     }
 
+    /// Predict soft conflicts for `files`: reservations by *other* agents that share a
+    /// directory with any requested file (excluding exact-file collisions, which `reserve`
+    /// and `peek` already report as hard conflicts). This is the "someone is already working
+    /// in this module — consider elsewhere" signal that lets a fleet self-spread. The
+    /// coordinator is the single ordered authority, so this view is consistent by construction.
+    pub fn predict(&self, agent: &str, files: &[String]) -> Vec<PredictedConflict> {
+        let reg = self.inner.lock().unwrap();
+        let want: HashSet<&str> = files.iter().map(String::as_str).collect();
+        let want_dirs: HashSet<&str> = files.iter().map(|f| dir_of(f)).collect();
+        let mut out: Vec<PredictedConflict> = reg
+            .held
+            .iter()
+            .filter(|(held, (a, _))| a != agent && !want.contains(held.as_str()))
+            .filter(|(held, _)| want_dirs.contains(dir_of(held)))
+            .map(|(held, (a, t))| PredictedConflict {
+                held_file: held.clone(),
+                agent: a.clone(),
+                task: t.clone(),
+                dir: dir_of(held).to_string(),
+            })
+            .collect();
+        out.sort_by(|a, b| a.held_file.cmp(&b.held_file));
+        out
+    }
+
     pub fn held_count(&self) -> usize {
         self.inner.lock().unwrap().held.len()
+    }
+}
+
+/// The directory portion of a repo-relative path (everything before the last `/`), or `""`
+/// for a top-level file.
+fn dir_of(path: &str) -> &str {
+    match path.rfind('/') {
+        Some(i) => &path[..i],
+        None => "",
     }
 }
 
@@ -124,6 +169,28 @@ mod tests {
         assert_eq!(conf, vec![Conflict { file: "b.ts".into(), agent: "alice".into(), task: "t".into() }]);
         c.release_agent("alice");
         assert!(c.reserve("bob", "t2", &files(&["b.ts"])).is_empty());
+    }
+
+    #[test]
+    fn predict_warns_on_same_directory_not_exact_file() {
+        let c = Coordinator::new();
+        c.reserve("alice", "auth", &files(&["src/auth/login.rs", "src/auth/token.rs"]));
+        c.reserve("carol", "ui", &files(&["src/ui/page.rs"]));
+
+        // bob wants a DIFFERENT file in src/auth → predicted (soft) conflict with alice,
+        // and nothing about src/ui (different module).
+        let pred = c.predict("bob", &files(&["src/auth/session.rs"]));
+        assert_eq!(pred.len(), 2, "both of alice's src/auth files are near; got {pred:?}");
+        assert!(pred.iter().all(|p| p.agent == "alice" && p.dir == "src/auth"));
+
+        // an exact-file want is a HARD conflict (reserve/peek), excluded from prediction
+        let pred2 = c.predict("bob", &files(&["src/auth/login.rs"]));
+        assert!(
+            pred2.iter().all(|p| p.held_file != "src/auth/login.rs"),
+            "exact file is a hard conflict, not a prediction; got {pred2:?}"
+        );
+        // own reservations never predicted against self
+        assert!(c.predict("alice", &files(&["src/auth/session.rs"])).is_empty());
     }
 
     #[test]

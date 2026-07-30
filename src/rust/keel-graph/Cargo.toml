@@ -6,4 +6,6 @@ description = "keel live dependency graph — maintained over the working tree v
 
 [dependencies]
 keel-resolve = { path = "../keel-resolve" }
-blake3 = "1"
+# OS filesystem notifications, so refresh can be O(changed) instead of stat-ing the whole
+# tree every call (NEW-1075 / NEW-1110): on the linux kernel that's 0.6 s → ~0 without a walk.
+notify = "6"
