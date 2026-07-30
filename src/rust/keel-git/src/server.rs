@@ -60,12 +60,22 @@ pub fn reachable(store: &Store, wants: &[Oid]) -> io::Result<Vec<Oid>> {
 pub fn pack_for(store: &Store, wants: &[Oid]) -> io::Result<Vec<u8>> {
     let oids = reachable(store, wants)?;
     let mut objects = Vec::with_capacity(oids.len());
+    let mut total = 0usize;
     for oid in &oids {
         if let Some(obj) = mirror::get_object(store, oid)? {
+            total += obj.1.len();
             objects.push(obj);
         }
     }
-    Ok(crate::pack::write(&objects))
+    // Delta-compress when it's affordable; on a very large repo full LZ delta over every object
+    // would stall the request, so fall back to the fast undeltified writer (git repacks locally).
+    const DELTA_BUDGET_OBJS: usize = 20_000;
+    const DELTA_BUDGET_BYTES: usize = 128 * 1024 * 1024;
+    if objects.len() <= DELTA_BUDGET_OBJS && total <= DELTA_BUDGET_BYTES {
+        Ok(crate::pack::write_deltified(&objects))
+    } else {
+        Ok(crate::pack::write(&objects))
+    }
 }
 
 /// The direct (non-symbolic) refs to advertise, as `(name, oid)`. Symbolic refs like HEAD are

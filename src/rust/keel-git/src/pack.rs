@@ -38,6 +38,184 @@ pub fn write(objects: &[(Kind, Vec<u8>)]) -> Vec<u8> {
     out
 }
 
+/// Assemble a **delta-compressed** v2 packfile. Objects are sorted by (type, size desc) and each
+/// is encoded as a REF-delta against the best of a small window of earlier *full* objects of the
+/// same type when that beats storing it whole — git's basic pack heuristic. Bases are always
+/// emitted before their deltas (so a reader resolving by oid has them), and only full objects are
+/// used as bases, so delta chains stay depth-1. git accepts this and repacks locally.
+pub fn write_deltified(objects: &[(Kind, Vec<u8>)]) -> Vec<u8> {
+    const WINDOW: usize = 16;
+    let mut order: Vec<usize> = (0..objects.len()).collect();
+    order.sort_by_key(|&i| (type_num(objects[i].0), std::cmp::Reverse(objects[i].1.len())));
+
+    let mut out = Vec::new();
+    out.extend_from_slice(b"PACK");
+    out.extend_from_slice(&2u32.to_be_bytes());
+    out.extend_from_slice(&(objects.len() as u32).to_be_bytes());
+
+    // sliding window of recent FULL objects, each with its delta-index built ONCE (reused across
+    // every target it's probed against — that caching is what makes this tractable at repo scale).
+    let mut window: std::collections::VecDeque<(Oid, Kind, usize, DeltaIndex)> = std::collections::VecDeque::new();
+    for &idx in &order {
+        let (kind, payload) = &objects[idx];
+        let full_compressed = miniz_oxide::deflate::compress_to_vec_zlib(payload, 6);
+
+        let mut best: Option<(Oid, Vec<u8>)> = None;
+        for (boid, bkind, bidx, bindex) in window.iter().rev() {
+            if bkind != kind {
+                continue;
+            }
+            let delta = delta_with(&objects[*bidx].1, bindex, payload);
+            if best.as_ref().is_none_or(|(_, d)| delta.len() < d.len()) {
+                best = Some((*boid, delta));
+            }
+        }
+
+        let use_delta = best
+            .as_ref()
+            .map(|(_, d)| miniz_oxide::deflate::compress_to_vec_zlib(d, 6).len() + 20 < full_compressed.len())
+            .unwrap_or(false);
+        if let (true, Some((boid, delta))) = (use_delta, best) {
+            write_obj_header(&mut out, 7, delta.len()); // OBJ_REF_DELTA
+            out.extend_from_slice(boid.as_bytes());
+            out.extend_from_slice(&miniz_oxide::deflate::compress_to_vec_zlib(&delta, 6));
+        } else {
+            write_obj_header(&mut out, type_num(*kind), payload.len());
+            out.extend_from_slice(&full_compressed);
+            window.push_back((hash(*kind, payload), *kind, idx, DeltaIndex::build(payload)));
+            if window.len() > WINDOW {
+                window.pop_front();
+            }
+        }
+    }
+    let digest = Sha1::digest(&out);
+    out.extend_from_slice(&digest);
+    out
+}
+
+/// Minimum match length / index window for the delta encoder.
+const DELTA_W: usize = 16;
+
+/// A reusable index of a base blob's windows (`window-hash → offsets`), so probing many targets
+/// against the same base doesn't rebuild it each time.
+struct DeltaIndex {
+    map: HashMap<u64, Vec<usize>>,
+}
+impl DeltaIndex {
+    fn build(base: &[u8]) -> DeltaIndex {
+        let mut map: HashMap<u64, Vec<usize>> = HashMap::new();
+        if base.len() >= DELTA_W {
+            for i in 0..=base.len() - DELTA_W {
+                let e = map.entry(hash_window(&base[i..i + DELTA_W])).or_default();
+                if e.len() < 16 {
+                    e.push(i);
+                }
+            }
+        }
+        DeltaIndex { map }
+    }
+}
+
+/// Encode `target` as a git delta against `base` using a prebuilt index.
+fn delta_with(base: &[u8], index: &DeltaIndex, target: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    write_size_varint(&mut out, base.len());
+    write_size_varint(&mut out, target.len());
+    let mut i = 0;
+    let mut lit_start = 0;
+    while i < target.len() {
+        let mut best_len = 0;
+        let mut best_off = 0;
+        if i + DELTA_W <= target.len() {
+            if let Some(cands) = index.map.get(&hash_window(&target[i..i + DELTA_W])) {
+                for &off in cands {
+                    let mut l = 0;
+                    while off + l < base.len() && i + l < target.len() && base[off + l] == target[i + l] {
+                        l += 1;
+                    }
+                    if l > best_len {
+                        best_len = l;
+                        best_off = off;
+                    }
+                }
+            }
+        }
+        if best_len >= DELTA_W {
+            emit_insert(&mut out, &target[lit_start..i]);
+            emit_copy(&mut out, best_off, best_len);
+            i += best_len;
+            lit_start = i;
+        } else {
+            i += 1;
+        }
+    }
+    emit_insert(&mut out, &target[lit_start..]);
+    out
+}
+
+/// Encode `target` as a git delta against `base` (builds a fresh index; convenience for callers
+/// that only delta once against a base).
+pub fn encode_delta(base: &[u8], target: &[u8]) -> Vec<u8> {
+    delta_with(base, &DeltaIndex::build(base), target)
+}
+
+fn emit_copy(out: &mut Vec<u8>, mut off: usize, mut size: usize) {
+    while size > 0 {
+        let chunk = size.min(0xff_ffff); // one COPY op carries up to 3 size bytes
+        let mut op = 0x80u8;
+        let mut bytes = Vec::new();
+        for b in 0..4 {
+            let v = (off >> (8 * b)) & 0xff;
+            if v != 0 {
+                op |= 1 << b;
+                bytes.push(v as u8);
+            }
+        }
+        for b in 0..3 {
+            let v = (chunk >> (8 * b)) & 0xff;
+            if v != 0 {
+                op |= 0x10 << b;
+                bytes.push(v as u8);
+            }
+        }
+        out.push(op);
+        out.extend_from_slice(&bytes);
+        off += chunk;
+        size -= chunk;
+    }
+}
+
+fn emit_insert(out: &mut Vec<u8>, data: &[u8]) {
+    for chunk in data.chunks(127) {
+        out.push(chunk.len() as u8);
+        out.extend_from_slice(chunk);
+    }
+}
+
+fn write_size_varint(out: &mut Vec<u8>, mut v: usize) {
+    loop {
+        let mut b = (v & 0x7f) as u8;
+        v >>= 7;
+        if v != 0 {
+            b |= 0x80;
+        }
+        out.push(b);
+        if v == 0 {
+            break;
+        }
+    }
+}
+
+fn hash_window(w: &[u8]) -> u64 {
+    // FNV-1a over the window — good enough to bucket candidates (matches are byte-verified).
+    let mut h = 0xcbf29ce484222325u64;
+    for &b in w {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    h
+}
+
 /// The variable-length object header: first byte carries `type` in bits 6-4 and the low 4 bits of
 /// the (uncompressed) size in bits 3-0; each continuation byte carries 7 more size bits. Bit 7 is
 /// the "more bytes follow" flag. Size is little-endian across the bytes.
@@ -265,6 +443,28 @@ mod tests {
         let pack = write(&objs);
         let got = read(&pack, &no_base).unwrap();
         assert_eq!(got, objs, "pack write->read must round-trip every object");
+    }
+
+    #[test]
+    fn deltified_pack_roundtrips_and_shrinks() {
+        // near-duplicate blobs → the deltified writer should encode later ones as deltas, and a
+        // read must reconstruct every object exactly (order-independent: compare as a set).
+        let base: Vec<u8> = (0..4000).map(|i| (i % 251) as u8).collect();
+        let mut objs = Vec::new();
+        for v in 0..8u8 {
+            let mut b = base.clone();
+            b[2000] = v; // one-byte change each → highly deltafiable
+            objs.push((Kind::Blob, b));
+        }
+        let full = write(&objs);
+        let delta = write_deltified(&objs);
+        assert!(delta.len() < full.len(), "deltified pack should be smaller: {} vs {}", delta.len(), full.len());
+
+        let got = read(&delta, &no_base).unwrap();
+        use std::collections::HashSet;
+        let want: HashSet<_> = objs.iter().map(|(k, p)| hash(*k, p).to_hex()).collect();
+        let have: HashSet<_> = got.iter().map(|(k, p)| hash(*k, p).to_hex()).collect();
+        assert_eq!(want, have, "every object must survive the delta round-trip");
     }
 
     #[test]
