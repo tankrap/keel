@@ -109,9 +109,96 @@ async function ensureTs() {
   return TS;
 }
 
-// program cache keyed by root dir. (Liveness/incremental refresh is a later increment;
-// for now a program is built once per dir and reused.)
-const programs = new Map();
+// One TypeScript LanguageService per root dir. A one-shot `createProgram` froze the file
+// set at first slice, so files added/changed afterward were invisible — the graph went live
+// via fs-watch but slices stayed stale. The LanguageService is incremental: on each slice we
+// re-stat the tree, and it re-parses only files whose (mtime,size) changed, reusing the rest
+// through the document registry — so the brief's *context* is live too, and cheap after the
+// first (expensive) build.
+const services = new Map();
+
+function tsCompilerOptions(ts, dir) {
+  const opts = {
+    allowJs: false,
+    noEmit: true,
+    skipLibCheck: true,
+    target: ts.ScriptTarget.ES2022,
+    module: ts.ModuleKind.ESNext,
+    moduleResolution: ts.ModuleResolutionKind.Bundler,
+    noResolve: false,
+  };
+  // Honor the project's tsconfig `baseUrl` + `paths` so monorepo path aliases (`@app/*`,
+  // `vs/*`, …) resolve cross-package — the ~30-35% of monorepo deps a naive resolver misses.
+  try {
+    const cfg = ts.readConfigFile(path.join(dir, "tsconfig.json"), ts.sys.readFile);
+    const co = (cfg && cfg.config && cfg.config.compilerOptions) || {};
+    if (co.paths) {
+      opts.paths = co.paths;
+      opts.baseUrl = path.resolve(dir, co.baseUrl || ".");
+    } else if (co.baseUrl) {
+      opts.baseUrl = path.resolve(dir, co.baseUrl);
+    }
+  } catch {
+    /* no/invalid tsconfig — fall back to the defaults above */
+  }
+  return opts;
+}
+
+// A LanguageServiceHost backed by the live working tree. `refresh()` re-walks + re-stats so
+// the service sees the current files and versions; the service diffs versions to decide what
+// to re-parse.
+function makeTsHost(ts, dir) {
+  let fileNames = [];
+  const versions = new Map();
+  // Re-walk + re-stat; returns whether anything changed (new / removed / mtime+size differs),
+  // so getProgram can skip the (expensive) program rebuild when the tree is untouched.
+  const refresh = () => {
+    let changed = false;
+    fileNames = walkFiles(dir);
+    const now = new Set(fileNames);
+    for (const f of fileNames) {
+      let v = "0";
+      try {
+        const s = fs.statSync(f);
+        v = `${s.mtimeMs}:${s.size}`;
+      } catch {
+        /* unreadable — leave version */
+      }
+      if (versions.get(f) !== v) {
+        versions.set(f, v);
+        changed = true;
+      }
+    }
+    for (const f of [...versions.keys()]) {
+      if (!now.has(f)) {
+        versions.delete(f);
+        changed = true;
+      }
+    }
+    return changed;
+  };
+  const host = {
+    getScriptFileNames: () => fileNames,
+    getScriptVersion: (f) => versions.get(f) ?? "0",
+    getScriptSnapshot: (f) => {
+      try {
+        return ts.ScriptSnapshot.fromString(fs.readFileSync(f, "utf8"));
+      } catch {
+        return undefined;
+      }
+    },
+    getCurrentDirectory: () => dir,
+    getCompilationSettings: () => tsCompilerOptions(ts, dir),
+    getDefaultLibFileName: (o) => ts.getDefaultLibFilePath(o),
+    fileExists: ts.sys.fileExists,
+    readFile: ts.sys.readFile,
+    readDirectory: ts.sys.readDirectory,
+    directoryExists: ts.sys.directoryExists,
+    getDirectories: ts.sys.getDirectories,
+    realpath: ts.sys.realpath,
+  };
+  return { host, refresh, fileNames: () => fileNames };
+}
 
 function walkFiles(dir) {
   const out = [];
@@ -137,26 +224,22 @@ function walkFiles(dir) {
 }
 
 async function getProgram(dir) {
-  if (programs.has(dir)) return programs.get(dir);
   const ts = await ensureTs();
-  const fileNames = walkFiles(dir);
-  const program = ts.createProgram(fileNames, {
-    allowJs: false,
-    noEmit: true,
-    skipLibCheck: true,
-    target: ts.ScriptTarget.ES2022,
-    module: ts.ModuleKind.ESNext,
-    moduleResolution: ts.ModuleResolutionKind.Bundler,
-    noResolve: false,
-  });
-  const entry = {
-    ts,
-    program,
-    checker: program.getTypeChecker(),
-    inRepo: new Set(fileNames),
-  };
-  programs.set(dir, entry);
-  return entry;
+  let entry = services.get(dir);
+  if (!entry) {
+    const h = makeTsHost(ts, dir);
+    const service = ts.createLanguageService(h.host, ts.createDocumentRegistry());
+    entry = { h, service, cached: null };
+    services.set(dir, entry);
+  }
+  const changed = entry.h.refresh(); // re-stat so the program reflects the CURRENT working tree
+  // Reuse the assembled program + checker when nothing changed — building them is the ~90 ms
+  // cost per slice; the re-stat above is what keeps it correct (live) between slices.
+  if (!changed && entry.cached) return entry.cached;
+  const program = entry.service.getProgram();
+  if (!program) throw new Error("no TypeScript program (no source files?)");
+  entry.cached = { ts, program, checker: program.getTypeChecker(), inRepo: new Set(entry.h.fileNames()) };
+  return entry.cached;
 }
 
 function helpers(ts, checker, inRepo) {

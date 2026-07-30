@@ -3,5 +3,11 @@
   "private": true,
   "type": "module",
   "description": "keel TS/JS resolver sidecar — TypeScript compiler symbol resolution",
-  "dependencies": { "typescript": "^5.6.3" }
+  "dependencies": {
+    "tree-sitter": "^0.25.1",
+    "tree-sitter-c": "^0.24.1",
+    "tree-sitter-go": "^0.25.0",
+    "tree-sitter-python": "^0.25.0",
+    "typescript": "^5.6.3"
+  }
 }

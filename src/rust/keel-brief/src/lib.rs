@@ -11,13 +11,18 @@
 //! the graph and the history can return all three, consistent, in one fetch. Coordination
 //! and relevant-prior-sessions are the next fields to fuse in (NEW-1092 / NEW-1076).
 
-use keel_coord::{Conflict, Coordinator};
+use keel_coord::{Conflict, PredictedConflict};
 use keel_graph::LiveGraph;
-use keel_resolve::{Sidecar, SliceDef};
+use keel_resolve::{Resolve, Router, SliceDef};
 use keel_store::{Object, ObjectId, Repo, Session, StoreError, Verification};
 use std::collections::HashSet;
 use std::io;
 use std::path::{Path, PathBuf};
+
+// Re-export the field types so callers (e.g. the CLI) don't need every subcrate.
+pub use keel_coord::Conflict as CoordConflict;
+pub use keel_coord::{Coordinator, PredictedConflict as CoordPredicted};
+pub use keel_resolve::SliceDef as ContextDef;
 
 /// A single change that touched the briefed file.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -37,6 +42,9 @@ pub struct RelevantSession {
     pub task: String,
     pub lesson: String,
     pub verified: bool,
+    /// whether this session recorded the context it was served — the feedback-edge signal
+    /// (`context_served → change → verified`) the selector learns from.
+    pub has_context: bool,
 }
 
 /// The fused response.
@@ -47,48 +55,113 @@ pub struct Brief {
     pub symbol: Option<String>,
     /// task-relevant code (target + resolved cross-file callees), budget-bounded
     pub context: Vec<SliceDef>,
+    /// why context is empty, if the slice couldn't run (missing symbol / resolver error).
+    /// The brief still returns the other pillars rather than failing the whole fetch.
+    pub context_error: Option<String>,
     /// files the target imports
     pub deps: Vec<String>,
     /// files that import the target (blast radius)
     pub rdeps: Vec<String>,
+    /// verification of the file's most recent change (post-hoc CI result if recorded, else
+    /// the change's committed state) — "is what I'm about to edit currently green?"
+    pub verification: Verification,
     /// changes that modified this file, newest first
     pub provenance: Vec<Provenance>,
     /// files in the working set currently held by *other* agents (coordination). Empty
     /// when uncontended; non-empty means back off / pick other work.
     pub coordination: Vec<Conflict>,
+    /// *predicted* soft conflicts — other agents working in the same directory as the target
+    /// (likely to collide even if not the exact file). "Someone's in this module, spread out."
+    pub predicted: Vec<PredictedConflict>,
     /// relevant prior sessions (with the lessons they recorded), from the graph
     /// neighborhood — the compounding flywheel: how related code was changed before.
     pub sessions: Vec<RelevantSession>,
+    /// curated invariants pinned to symbols in play (target + sliced defs), always served —
+    /// the cold-start lever: a single pin steers every future brief that touches the symbol.
+    pub invariants: Vec<(String, String)>,
     /// estimated token size of `context`
     pub tokens: usize,
     /// true if the budget forced context to be trimmed
     pub truncated: bool,
 }
 
+impl Brief {
+    /// Serialize to a stable JSON value (serde_json sorts object keys via BTreeMap, so the
+    /// output is deterministic). Shared by the CLI and the daemon.
+    pub fn to_json(&self) -> serde_json::Value {
+        use serde_json::json;
+        json!({
+            "task": self.task,
+            "file": self.file,
+            "symbol": self.symbol,
+            "context": self.context.iter()
+                .map(|d| json!({"file": d.file, "symbol": d.symbol, "text": d.text}))
+                .collect::<Vec<_>>(),
+            "context_error": self.context_error,
+            "verification": match self.verification {
+                Verification::Green => "green",
+                Verification::Red => "red",
+                Verification::Unverified => "unverified",
+            },
+            "deps": self.deps,
+            "rdeps": self.rdeps,
+            "provenance": self.provenance.iter()
+                .map(|p| json!({"change": p.change, "intent": p.intent, "author": p.author, "verified": p.verified}))
+                .collect::<Vec<_>>(),
+            "coordination": self.coordination.iter()
+                .map(|c| json!({"file": c.file, "agent": c.agent, "task": c.task}))
+                .collect::<Vec<_>>(),
+            "predicted": self.predicted.iter()
+                .map(|p| json!({"held_file": p.held_file, "agent": p.agent, "task": p.task, "dir": p.dir}))
+                .collect::<Vec<_>>(),
+            "sessions": self.sessions.iter()
+                .map(|s| json!({"change": s.change, "task": s.task, "lesson": s.lesson, "verified": s.verified, "has_context": s.has_context}))
+                .collect::<Vec<_>>(),
+            "invariants": self.invariants.iter()
+                .map(|(sym, lesson)| json!({"symbol": sym, "lesson": lesson}))
+                .collect::<Vec<_>>(),
+            "tokens": self.tokens,
+            "truncated": self.truncated,
+        })
+    }
+}
+
 pub struct BriefService {
     root: PathBuf,
     repo: Repo,
     graph: LiveGraph,
-    slicer: Sidecar,
+    resolver: Router,
     agent: String,
     coord: Coordinator,
 }
 
 impl BriefService {
-    /// Open a brief service: `root` is the live working tree, `store_path` the object
-    /// store (history), `script` the resolver sidecar. Builds the graph on open. Defaults
-    /// to agent `"local"` with a private coordinator; use [`Self::with_agent`] /
-    /// [`Self::with_coordinator`] to join a shared multi-agent coordinator.
-    pub fn open(root: &Path, store_path: &Path, script: &Path) -> io::Result<BriefService> {
+    /// Open a brief service: `root` is the live working tree, `store_path` the object store
+    /// (history), `sidecar_dir` holds the resolver scripts (`resolve.mjs`, `resolve-c.mjs`).
+    /// A [`Router`] spawns the right sidecar per file lazily, so one service handles a
+    /// mixed-language repo and drives both the graph and the slicer. Builds the graph on
+    /// open. Defaults to agent `"local"` with a private coordinator; use [`Self::with_agent`]
+    /// / [`Self::with_coordinator`] to join a shared multi-agent coordinator.
+    pub fn open(root: &Path, store_path: &Path, sidecar_dir: &Path) -> io::Result<BriefService> {
         let repo = Repo::open(store_path).map_err(to_io)?;
-        let mut graph = LiveGraph::open(root, script)?;
-        graph.build()?;
-        let slicer = Sidecar::spawn(script)?;
+        let mut resolver = Router::new(sidecar_dir);
+        let mut graph = LiveGraph::new(root);
+        // Load a persisted graph if present and reconcile it with the tree, so a cold brief
+        // re-resolves only files that CHANGED rather than the whole repo (the dominant cost on a
+        // large repo — the kernel is ~19s of whole-tree import resolution otherwise). First run
+        // builds + saves; subsequent runs are a stat sweep. The cache lives under `.keel/` (git-
+        // excluded); a stale/corrupt file just triggers re-resolution.
+        let graph_path = root.join(".keel").join("graph");
+        let had_cache = graph.load(&graph_path).is_ok();
+        let changed = graph.refresh(&mut resolver)?;
+        if !had_cache || !changed.is_empty() {
+            let _ = graph.save(&graph_path); // best-effort persistence
+        }
         Ok(BriefService {
             root: root.to_path_buf(),
             repo,
             graph,
-            slicer,
+            resolver,
             agent: "local".to_string(),
             coord: Coordinator::new(),
         })
@@ -97,6 +170,14 @@ impl BriefService {
     pub fn with_agent(mut self, agent: &str) -> Self {
         self.agent = agent.to_string();
         self
+    }
+
+    /// Set the requesting agent for subsequent briefs. The daemon calls this per request (it
+    /// holds ONE shared coordinator across all agents), so reservations/predictions are
+    /// evaluated against the *right* agent — this is what makes multi-agent coordination work
+    /// through the warm daemon rather than only within one process.
+    pub fn set_agent(&mut self, agent: &str) {
+        self.agent = agent.to_string();
     }
 
     /// Join a shared coordinator so this agent sees (and takes) reservations against others.
@@ -123,9 +204,16 @@ impl BriefService {
         self.repo.commit_dir(&self.root, intent, author, timestamp, Some(sid)).map_err(to_io)
     }
 
+    /// Start fs-watching the working tree so [`refresh`](Self::refresh) becomes O(changed)
+    /// instead of walking the whole tree. Best called once right after opening (the warm
+    /// daemon does this); if unsupported it just leaves refresh on its full-walk path.
+    pub fn watch(&mut self) -> io::Result<()> {
+        self.graph.watch()
+    }
+
     /// Bring the graph up to the current working-tree state (incremental).
     pub fn refresh(&mut self) -> io::Result<()> {
-        self.graph.refresh()?;
+        self.graph.refresh(&mut self.resolver)?;
         Ok(())
     }
 
@@ -141,9 +229,14 @@ impl BriefService {
         budget_tokens: usize,
         reserve: bool,
     ) -> io::Result<Brief> {
-        let full = match symbol {
-            Some(sym) => self.slicer.slice(&self.root, file, sym, 1)?,
-            None => Vec::new(),
+        let (full, context_error) = match symbol {
+            Some(sym) => match self.resolver.slice(&self.root, file, sym, 1) {
+                Ok(defs) => (defs, None),
+                // a missing symbol / resolver hiccup degrades to empty context (with a
+                // reason); deps + provenance + coordination + sessions still come back.
+                Err(e) => (Vec::new(), Some(e.to_string())),
+            },
+            None => (Vec::new(), None),
         };
         let full_len = full.len();
 
@@ -171,18 +264,30 @@ impl BriefService {
         } else {
             self.coord.peek(&self.agent, &working_set)
         };
+        let predicted = self.coord.predict(&self.agent, &working_set);
 
-        let provenance = self
-            .repo
-            .history_touching(file)
-            .map_err(to_io)?
-            .into_iter()
+        // history of the target, newest first; verification prefers the post-hoc side-table
+        // (CI result) over the change's committed state.
+        let touching = self.repo.history_touching(file).map_err(to_io)?;
+        let verify_of = |id: &ObjectId, baked: Verification| -> Verification {
+            match self.repo.store().verification(id) {
+                Ok(Verification::Unverified) => baked, // nothing recorded → fall back to committed
+                Ok(v) => v,
+                Err(_) => baked,
+            }
+        };
+        let verification = touching
+            .first()
+            .map(|(id, c)| verify_of(id, c.verification))
+            .unwrap_or(Verification::Unverified);
+        let provenance = touching
+            .iter()
             .take(5)
             .map(|(id, c)| Provenance {
                 change: id.to_hex(),
-                intent: c.intent,
-                author: c.author,
-                verified: matches!(c.verification, Verification::Green),
+                intent: c.intent.clone(),
+                author: c.author.clone(),
+                verified: matches!(verify_of(id, c.verification), Verification::Green),
             })
             .collect();
 
@@ -211,6 +316,7 @@ impl BriefService {
                             task: s.task,
                             lesson: s.lesson,
                             verified,
+                            has_context: s.context_served.is_some(),
                         });
                     }
                 }
@@ -218,16 +324,33 @@ impl BriefService {
         }
         sessions.truncate(5);
 
+        // pinned invariants for the symbols in play (target + sliced defs) — always served,
+        // regardless of history, so a single curated pin steers every relevant future brief.
+        let mut inv_syms: Vec<String> = symbol.map(str::to_string).into_iter().collect();
+        inv_syms.extend(context.iter().map(|d| d.symbol.clone()));
+        inv_syms.sort();
+        inv_syms.dedup();
+        let mut invariants = Vec::new();
+        for sym in &inv_syms {
+            if let Some(lesson) = self.repo.store().pin(sym).map_err(to_io)? {
+                invariants.push((sym.clone(), lesson));
+            }
+        }
+
         Ok(Brief {
             task: task.to_string(),
             file: file.to_string(),
             symbol: symbol.map(str::to_string),
             context,
+            context_error,
+            verification,
             deps,
             rdeps,
             provenance,
             coordination,
+            predicted,
             sessions,
+            invariants,
             tokens,
             truncated,
         })
@@ -253,8 +376,8 @@ mod tests {
         p
     }
 
-    fn script() -> PathBuf {
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("../keel-resolve/sidecar/resolve.mjs")
+    fn sidecar_dir() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../keel-resolve/sidecar")
     }
 
     #[test]
@@ -268,7 +391,7 @@ mod tests {
         )
         .unwrap();
 
-        let mut svc = match BriefService::open(&work, &store, &script()) {
+        let mut svc = match BriefService::open(&work, &store, &sidecar_dir()) {
             Ok(s) => s,
             Err(e) => {
                 eprintln!("skipping brief test: {e}");
@@ -321,7 +444,7 @@ mod tests {
         fs::write(work.join("y.ts"), "export function g() { return 2; }\n").unwrap();
 
         let coord = Coordinator::new();
-        let mut svc = match BriefService::open(&work, &store, &script()) {
+        let mut svc = match BriefService::open(&work, &store, &sidecar_dir()) {
             Ok(s) => s.with_agent("me").with_coordinator(coord.clone()),
             Err(e) => {
                 eprintln!("skipping coord test: {e}");
@@ -357,7 +480,7 @@ mod tests {
         )
         .unwrap();
 
-        let mut svc = match BriefService::open(&work, &store, &script()) {
+        let mut svc = match BriefService::open(&work, &store, &sidecar_dir()) {
             Ok(s) => s,
             Err(e) => {
                 eprintln!("skipping session test: {e}");

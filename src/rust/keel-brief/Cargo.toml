@@ -9,3 +9,4 @@ keel-store = { path = "../keel-store" }
 keel-resolve = { path = "../keel-resolve" }
 keel-graph = { path = "../keel-graph" }
 keel-coord = { path = "../keel-coord" }
+serde_json = "1"
