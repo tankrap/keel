@@ -7,15 +7,41 @@
 //! ref advances; a crash mid-snapshot leaves only unreachable objects (future GC), never a
 //! dangling HEAD.
 
-use crate::object::{Change, Object, ObjectId, Verification};
+use crate::object::{Change, Object, ObjectId, TreeEntry, Verification};
 use crate::snapshot;
-use crate::store::{Result, Store, StoreError};
-use std::collections::HashSet;
+use crate::store::{Applied, Result, Store, StoreError};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 
 pub struct Repo {
     store: Store,
     branch: String,
+}
+
+/// How a path differs between two trees.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChangeKind {
+    Added,
+    Modified,
+    Deleted,
+}
+
+impl ChangeKind {
+    /// Single-letter status marker (git-like): `A` / `M` / `D`.
+    pub fn marker(self) -> char {
+        match self {
+            ChangeKind::Added => 'A',
+            ChangeKind::Modified => 'M',
+            ChangeKind::Deleted => 'D',
+        }
+    }
+}
+
+/// One path that differs between two trees (e.g. working tree vs `HEAD`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PathChange {
+    pub path: String,
+    pub kind: ChangeKind,
 }
 
 impl Repo {
@@ -47,20 +73,27 @@ impl Repo {
         timestamp: u64,
         session: Option<ObjectId>,
     ) -> Result<ObjectId> {
-        let parents = self.head()?.into_iter().collect::<Vec<_>>();
-        let obj = Object::Change(Change {
-            parents,
-            tree,
-            session,
-            intent: intent.to_string(),
-            author: author.to_string(),
-            timestamp,
-            verification: Verification::Unverified,
-        });
-        let id = obj.id();
-        // fused commit: the change lands and the branch advances atomically
-        self.store.apply(&[obj], &[(self.branch.as_str(), id)])?;
-        Ok(id)
+        // Compare-and-swap against the current head, retrying if a concurrent committer moved
+        // the branch — so two un-coordinated commits LINEARIZE (never silently lose one). Each
+        // retry re-parents onto the new head (so the change id changes, which is correct).
+        for _ in 0..64 {
+            let expected = self.head()?;
+            let obj = Object::Change(Change {
+                parents: expected.into_iter().collect(),
+                tree,
+                session,
+                intent: intent.to_string(),
+                author: author.to_string(),
+                timestamp,
+                verification: Verification::Unverified,
+            });
+            let id = obj.id();
+            match self.store.apply_cas(&[obj], self.branch.as_str(), expected, id)? {
+                Applied::Committed => return Ok(id),
+                Applied::Conflict(_) => continue, // head moved under us — rebuild on it
+            }
+        }
+        Err(StoreError::Io(std::io::Error::other("branch too contended: gave up after 64 commit retries")))
     }
 
     /// Snapshot `work_dir` and commit it in one step.
@@ -73,6 +106,21 @@ impl Repo {
         session: Option<ObjectId>,
     ) -> Result<ObjectId> {
         let tree = snapshot::snapshot(&self.store, work_dir)?;
+        self.commit_tree(tree, intent, author, timestamp, session)
+    }
+
+    /// Like [`commit_dir`](Self::commit_dir) but bypasses the stat cache (always re-hashes).
+    /// For committing distinct trees in rapid succession at the same paths — e.g. `keel
+    /// import` replaying git history — where the mtime+size cache could racily false-hit.
+    pub fn commit_dir_uncached(
+        &self,
+        work_dir: &Path,
+        intent: &str,
+        author: &str,
+        timestamp: u64,
+        session: Option<ObjectId>,
+    ) -> Result<ObjectId> {
+        let tree = snapshot::snapshot_uncached(&self.store, work_dir)?;
         self.commit_tree(tree, intent, author, timestamp, session)
     }
 
@@ -129,6 +177,16 @@ impl Repo {
         }
     }
 
+    /// The raw bytes of `path` as of `change` (its blob content), or `None` if the path is
+    /// absent or resolves to a directory. Chunked/deduped blobs are reassembled by the store.
+    pub fn file_bytes_at(&self, change: ObjectId, path: &str) -> Result<Option<Vec<u8>>> {
+        let Some(id) = self.file_at(change, path)? else { return Ok(None) };
+        match self.store.get(&id)? {
+            Some(Object::Blob(bytes)) => Ok(Some(bytes)),
+            _ => Ok(None), // a tree (directory) or missing object → not a file
+        }
+    }
+
     fn path_in_tree(&self, tree: ObjectId, path: &str) -> Result<Option<ObjectId>> {
         let parts: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
         let mut cur = tree;
@@ -147,6 +205,97 @@ impl Repo {
             cur = entry.id;
         }
         Ok(None)
+    }
+
+    /// Working-tree status: how `work_dir` differs from `HEAD` (added / modified / deleted
+    /// files), path-sorted. With no commits yet, every file reads as added.
+    ///
+    /// Note: this snapshots `work_dir` into the store to get its tree (content-addressed,
+    /// so re-runs are near-free via dedup); the snapshot objects are unreferenced until a
+    /// real commit and are reclaimed by GC — `status` never advances a ref.
+    pub fn status(&self, work_dir: &Path) -> Result<Vec<PathChange>> {
+        let work_tree = snapshot::snapshot(&self.store, work_dir)?;
+        let head_tree = match self.head()? {
+            Some(h) => Some(self.change(h)?.ok_or(StoreError::Corrupt(h))?.tree),
+            None => None,
+        };
+        let mut out = Vec::new();
+        self.diff_trees(head_tree, Some(work_tree), "", &mut out)?;
+        out.sort_by(|a, b| a.path.cmp(&b.path));
+        Ok(out)
+    }
+
+    /// The entries of a tree object, or `[]` for `None` / a non-tree id.
+    fn tree_entries(&self, tree: Option<ObjectId>) -> Result<Vec<TreeEntry>> {
+        match tree {
+            None => Ok(Vec::new()),
+            Some(id) => match self.store.get(&id)? {
+                Some(Object::Tree(t)) => Ok(t.entries),
+                _ => Ok(Vec::new()),
+            },
+        }
+    }
+
+    /// Recursively diff two (optional) trees, appending per-file changes under `prefix`.
+    fn diff_trees(
+        &self,
+        old: Option<ObjectId>,
+        new: Option<ObjectId>,
+        prefix: &str,
+        out: &mut Vec<PathChange>,
+    ) -> Result<()> {
+        // name → (in old?, in new?), each carrying (id, is_dir)
+        type Side = Option<(ObjectId, bool)>;
+        let mut map: BTreeMap<String, (Side, Side)> = BTreeMap::new();
+        for e in self.tree_entries(old)? {
+            map.entry(e.name).or_default().0 = Some((e.id, e.mode == snapshot::MODE_DIR));
+        }
+        for e in self.tree_entries(new)? {
+            map.entry(e.name).or_default().1 = Some((e.id, e.mode == snapshot::MODE_DIR));
+        }
+        for (name, (o, n)) in map {
+            let path = if prefix.is_empty() { name } else { format!("{prefix}/{name}") };
+            match (o, n) {
+                (None, Some((id, is_dir))) => self.emit_side(id, is_dir, &path, ChangeKind::Added, out)?,
+                (Some((id, is_dir)), None) => self.emit_side(id, is_dir, &path, ChangeKind::Deleted, out)?,
+                (Some((oid, od)), Some((nid, nd))) => {
+                    if oid == nid {
+                        continue; // identical subtree/blob — content-addressing makes this exact
+                    }
+                    match (od, nd) {
+                        (true, true) => self.diff_trees(Some(oid), Some(nid), &path, out)?,
+                        (false, false) => out.push(PathChange { path, kind: ChangeKind::Modified }),
+                        // a file replaced a directory (or vice-versa): delete one side, add the other
+                        _ => {
+                            self.emit_side(oid, od, &path, ChangeKind::Deleted, out)?;
+                            self.emit_side(nid, nd, &path, ChangeKind::Added, out)?;
+                        }
+                    }
+                }
+                (None, None) => {}
+            }
+        }
+        Ok(())
+    }
+
+    /// Emit `kind` for a single entry: one line for a blob, or every blob beneath a dir.
+    fn emit_side(
+        &self,
+        id: ObjectId,
+        is_dir: bool,
+        path: &str,
+        kind: ChangeKind,
+        out: &mut Vec<PathChange>,
+    ) -> Result<()> {
+        if !is_dir {
+            out.push(PathChange { path: path.to_string(), kind });
+            return Ok(());
+        }
+        for e in self.tree_entries(Some(id))? {
+            let child = format!("{path}/{}", e.name);
+            self.emit_side(e.id, e.mode == snapshot::MODE_DIR, &child, kind, out)?;
+        }
+        Ok(())
     }
 
     /// First-parent history changes (newest first) that modified `path` — i.e. where the
@@ -172,6 +321,149 @@ impl Repo {
         }
         Ok(out)
     }
+
+    /// Every `(path, blob-id)` under `tree` (recursively), depth-first — the leaf inventory
+    /// used by `repack` to build per-path version chains.
+    fn tree_files(&self, tree: ObjectId, prefix: &str, out: &mut Vec<(String, ObjectId)>) -> Result<()> {
+        for e in self.tree_entries(Some(tree))? {
+            let path = if prefix.is_empty() { e.name.clone() } else { format!("{prefix}/{}", e.name) };
+            if e.mode == snapshot::MODE_DIR {
+                self.tree_files(e.id, &path, out)?;
+            } else {
+                out.push((path, e.id));
+            }
+        }
+        Ok(())
+    }
+
+    /// Delta-compress history in place: for each path, store each successive version as a
+    /// prefix/suffix byte-delta against its previous version, keeping a full "keyframe" every
+    /// [`KEYFRAME`] versions so any blob reconstructs in a bounded number of hops. This is the
+    /// storage-only pass that narrows keel's gap to git's cross-object delta compression; it
+    /// never changes an address (a delta is re-verified against its id on read) and never
+    /// regresses size (`deltify` adopts a delta only when it beats the full compressed blob).
+    ///
+    /// Idempotent: a re-run finds already-deltified versions gone from `objects` and skips them.
+    /// Run it after a bulk `import` or periodically, like `git gc`.
+    pub fn repack(&self) -> Result<RepackStats> {
+        let mut commits = self.log()?; // newest-first
+        commits.reverse(); // walk oldest→newest so a base is an earlier version than its target
+        let mut chains: HashMap<String, Vec<ObjectId>> = HashMap::new();
+        // Global first-appearance rank per blob. Delta edges only ever point from a
+        // higher-rank blob to a STRICTLY lower-rank one, so the delta graph is a DAG even when
+        // the same blob recurs across commits in different orders (reverts, identical files, a
+        // blob shared by two paths) — that acyclicity is what makes reconstruct terminate.
+        let mut rank: HashMap<ObjectId, u64> = HashMap::new();
+        let mut next_rank = 0u64;
+        for cid in &commits {
+            let tree = match self.change(*cid)? {
+                Some(c) => c.tree,
+                None => continue,
+            };
+            let mut files = Vec::new();
+            self.tree_files(tree, "", &mut files)?;
+            for (path, blob) in files {
+                rank.entry(blob).or_insert_with(|| {
+                    let r = next_rank;
+                    next_rank += 1;
+                    r
+                });
+                let v = chains.entry(path).or_default();
+                if v.last() != Some(&blob) {
+                    v.push(blob); // record only when the content actually changed
+                }
+            }
+        }
+
+        let mut stats = RepackStats::default();
+        // ── Pass 1: same-path chains (each version deltas against its predecessor) ──────────
+        for versions in chains.values() {
+            for i in 1..versions.len() {
+                if i % KEYFRAME == 0 {
+                    continue; // leave a full keyframe so delta chains stay shallow (bounds depth)
+                }
+                let (target, base) = (&versions[i], &versions[i - 1]);
+                // Only delta downward in rank — guarantees the acyclicity described above.
+                if rank[base] >= rank[target] {
+                    continue;
+                }
+                let saved = self.store.deltify(target, base)?;
+                if saved > 0 {
+                    stats.deltified += 1;
+                    stats.bytes_saved += saved;
+                }
+            }
+        }
+        self.repack_similar(&rank, &mut stats)?;
+        Ok(stats)
+    }
+
+    /// ── Pass 2: cross-path similarity ──────────────────────────────────────────────────────
+    /// Delta each *remaining full* blob against a **similar, lower-rank, full** blob found via a
+    /// MinHash sketch (base stays full → the delta is depth 1, so reads stay fast). Catches
+    /// content the same-path pass can't — a file copied/renamed, generated files, near-duplicate
+    /// configs/tests — that share no same-path history. Rank-downward + full-base keeps the delta
+    /// graph an acyclic, shallow DAG.
+    fn repack_similar(&self, rank: &HashMap<ObjectId, u64>, stats: &mut RepackStats) -> Result<()> {
+        const SKETCH_K: usize = 24;
+        const MIN_SHARED: u32 = 8; // require ~1/3 of the sketch to overlap before attempting
+
+        // Full blobs that survived pass 1, ascending rank (so any base is processed before its
+        // targets and is strictly lower-rank).
+        let mut fulls: Vec<(u64, ObjectId, Vec<u8>)> = Vec::new();
+        for (id, &rk) in rank {
+            if let Some(bytes) = self.store.blob_bytes_if_full(id)? {
+                fulls.push((rk, *id, bytes));
+            }
+        }
+        fulls.sort_by_key(|(rk, _, _)| *rk);
+        let sketches: Vec<Vec<u64>> =
+            fulls.iter().map(|(_, _, b)| crate::delta::sketch(b, SKETCH_K)).collect();
+
+        // sketch-hash → indices of already-seen full blobs eligible as bases
+        let mut index: HashMap<u64, Vec<usize>> = HashMap::new();
+        let mut tally: HashMap<usize, u32> = HashMap::new();
+        for t in 0..fulls.len() {
+            tally.clear();
+            for h in &sketches[t] {
+                if let Some(cands) = index.get(h) {
+                    for &c in cands {
+                        *tally.entry(c).or_default() += 1;
+                    }
+                }
+            }
+            let best = tally.iter().max_by_key(|(_, n)| **n).map(|(&c, &n)| (c, n));
+            let mut deltified = false;
+            if let Some((c, shared)) = best {
+                if shared >= MIN_SHARED {
+                    let saved = self.store.deltify(&fulls[t].1, &fulls[c].1)?;
+                    if saved > 0 {
+                        stats.deltified += 1;
+                        stats.bytes_saved += saved;
+                        deltified = true; // now a delta — must NOT become a base for others
+                    }
+                }
+            }
+            if !deltified {
+                for h in &sketches[t] {
+                    index.entry(*h).or_default().push(t);
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Longest delta chain before a full keyframe — bounds reconstruct hops (and recursion depth).
+const KEYFRAME: usize = 16;
+
+/// What a [`Repo::repack`] pass accomplished.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct RepackStats {
+    /// Blobs re-stored as deltas this pass.
+    pub deltified: u64,
+    /// On-disk bytes reclaimed (sum of full-form size minus delta size).
+    pub bytes_saved: u64,
 }
 
 #[cfg(test)]
@@ -179,6 +471,30 @@ mod tests {
     use super::*;
     use crate::testutil::TmpDir;
     use std::fs;
+    use std::sync::Arc;
+
+    #[test]
+    fn concurrent_commits_linearize_no_loss() {
+        // N threads commit distinct trees to the SAME branch at once; the CAS + retry must
+        // linearize them so every commit survives (the pre-CAS bug lost all but the last).
+        let sd = TmpDir::new();
+        let repo = Arc::new(Repo::open(sd.path()).unwrap());
+        let n = 16u64;
+        let handles: Vec<_> = (0..n)
+            .map(|i| {
+                let repo = Arc::clone(&repo);
+                std::thread::spawn(move || {
+                    let w = TmpDir::new();
+                    fs::write(w.path().join("f.txt"), format!("commit {i}")).unwrap();
+                    repo.commit_dir(w.path(), &format!("c{i}"), "a", i, None).unwrap();
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+        assert_eq!(repo.log().unwrap().len(), n as usize, "all {n} concurrent commits kept");
+    }
 
     #[test]
     fn commit_chain_advances_head_and_links_parents() {
@@ -199,6 +515,112 @@ mod tests {
         assert_eq!(repo.log().unwrap(), vec![c2, c1]);
         assert_eq!(repo.change(c2).unwrap().unwrap().parents, vec![c1]);
         assert!(repo.change(c1).unwrap().unwrap().parents.is_empty());
+    }
+
+    #[test]
+    fn repack_deltifies_history_and_reads_back_identically() {
+        // A file edited across many commits (localized change each time) should delta-compress,
+        // and EVERY historical version must still reconstruct byte-for-byte after repack.
+        let sd = TmpDir::new();
+        let work = TmpDir::new();
+        let repo = Repo::open(sd.path()).unwrap();
+        let base: String = (0..2000).map(|i| format!("line {i}\n")).collect();
+
+        let mut versions = Vec::new(); // (change-id, expected bytes)
+        for v in 0..40 {
+            // change only one line deep in the middle → long shared prefix + suffix
+            let content = base.replace("line 1000\n", &format!("line 1000 EDIT v{v}\n"));
+            fs::write(work.path().join("big.txt"), &content).unwrap();
+            let c = repo.commit_dir(work.path(), &format!("v{v}"), "acct", v, None).unwrap();
+            versions.push((c, content.into_bytes()));
+        }
+
+        let stats = repo.repack().unwrap();
+        assert!(stats.deltified > 0, "repack should have deltified some versions");
+        // 39 edits of a ~14KB file, each changing one line → each delta is a few hundred bytes
+        // vs a multi-KB compressed blob; the saving should be most of the redundant history.
+        assert!(stats.bytes_saved > 10_000, "expected real savings, got {}", stats.bytes_saved);
+
+        // gc reclaims the now-orphaned full forms; EVERY version must still read back byte-identical
+        // (delta bases stay reachable via the delta→base edge in the GC mark).
+        repo.store().gc().unwrap();
+        for (c, expected) in &versions {
+            let got = repo.file_bytes_at(*c, "big.txt").unwrap().expect("version present");
+            assert_eq!(&got, expected, "reconstructed bytes differ from what was committed");
+        }
+        // idempotent: a second repack finds the deltified versions gone from `objects` → no-op
+        assert_eq!(repo.repack().unwrap().deltified, 0, "repack must be idempotent");
+    }
+
+    #[test]
+    fn repack_survives_blobs_recurring_in_reverse_order() {
+        // The cycle trap: two files swap two near-identical blobs between commits, so path A's
+        // chain is [X,Y] and path B's is [Y,X]. Without the global-rank rule this produced a
+        // delta cycle X→Y→X and reconstruct overflowed the stack. It must terminate and every
+        // version must still read back exactly.
+        let sd = TmpDir::new();
+        let work = TmpDir::new();
+        let repo = Repo::open(sd.path()).unwrap();
+        let x: String = (0..2000).map(|i| format!("x line {i}\n")).collect();
+        let y = x.replace("x line 1000\n", "x line 1000 DIFFERENT\n"); // near-identical → deltafiable
+
+        fs::write(work.path().join("a.txt"), &x).unwrap();
+        fs::write(work.path().join("b.txt"), &y).unwrap();
+        let c1 = repo.commit_dir(work.path(), "c1", "acct", 1, None).unwrap();
+        fs::write(work.path().join("a.txt"), &y).unwrap(); // swap
+        fs::write(work.path().join("b.txt"), &x).unwrap();
+        let c2 = repo.commit_dir(work.path(), "c2", "acct", 2, None).unwrap();
+
+        repo.repack().unwrap(); // must not overflow
+        repo.store().gc().unwrap();
+        assert_eq!(repo.file_bytes_at(c1, "a.txt").unwrap().unwrap(), x.as_bytes());
+        assert_eq!(repo.file_bytes_at(c1, "b.txt").unwrap().unwrap(), y.as_bytes());
+        assert_eq!(repo.file_bytes_at(c2, "a.txt").unwrap().unwrap(), y.as_bytes());
+        assert_eq!(repo.file_bytes_at(c2, "b.txt").unwrap().unwrap(), x.as_bytes());
+    }
+
+    #[test]
+    fn repack_cross_path_similarity_deltifies_a_near_duplicate() {
+        // Two files that share NO same-path history but are near-identical (a copy with one edit).
+        // The same-path pass can't touch them; the cross-path similarity pass must delta the
+        // later one against the earlier, and both must read back exactly.
+        let sd = TmpDir::new();
+        let work = TmpDir::new();
+        let repo = Repo::open(sd.path()).unwrap();
+        let a: String = (0..1500).map(|i| format!("shared line {i}\n")).collect();
+        let b = a.replace("shared line 700\n", "shared line 700 -- the one change\n");
+
+        fs::write(work.path().join("original.txt"), &a).unwrap();
+        let c1 = repo.commit_dir(work.path(), "add original", "acct", 1, None).unwrap();
+        fs::write(work.path().join("copy.txt"), &b).unwrap(); // a near-dup at a different path
+        let c2 = repo.commit_dir(work.path(), "add near-dup copy", "acct", 2, None).unwrap();
+
+        let before = repo.store().delta_count().unwrap();
+        repo.repack().unwrap();
+        assert!(
+            repo.store().delta_count().unwrap() > before,
+            "cross-path similarity pass should have deltified the near-duplicate"
+        );
+        repo.store().gc().unwrap();
+        assert_eq!(repo.file_bytes_at(c1, "original.txt").unwrap().unwrap(), a.as_bytes());
+        assert_eq!(repo.file_bytes_at(c2, "copy.txt").unwrap().unwrap(), b.as_bytes());
+    }
+
+    #[test]
+    fn repack_never_regresses_on_scattered_edits() {
+        // When edits are scattered (no long shared ends), the delta can't beat the whole blob,
+        // so repack must adopt zero deltas rather than storing something larger.
+        let sd = TmpDir::new();
+        let work = TmpDir::new();
+        let repo = Repo::open(sd.path()).unwrap();
+        for v in 0..5u64 {
+            // completely different content each commit → no meaningful common prefix/suffix
+            let content: String = (0..500).map(|i| format!("{v}-{}-{i}\n", (i * 7 + v as usize) % 97)).collect();
+            fs::write(work.path().join("f.txt"), content).unwrap();
+            repo.commit_dir(work.path(), &format!("v{v}"), "acct", v, None).unwrap();
+        }
+        let stats = repo.repack().unwrap();
+        assert_eq!(stats.deltified, 0, "scattered edits must not be deltified (would grow the store)");
     }
 
     #[test]
@@ -251,6 +673,63 @@ mod tests {
 
         assert!(repo.file_at(c2, "a").unwrap().is_some());
         assert_eq!(repo.file_at(c2, "missing").unwrap(), None);
+    }
+
+    #[test]
+    fn status_reports_add_modify_delete_vs_head() {
+        let sd = TmpDir::new();
+        let work = TmpDir::new();
+        let repo = Repo::open(sd.path()).unwrap();
+
+        // no HEAD yet → every file reads as added, nested dirs walked
+        fs::create_dir_all(work.path().join("src")).unwrap();
+        fs::write(work.path().join("src/a.ts"), b"1").unwrap();
+        fs::write(work.path().join("src/b.ts"), b"1").unwrap();
+        fs::write(work.path().join("keep.ts"), b"k").unwrap();
+        // keel's own metadata dir must never show up in status (it's ignored like .git);
+        // the exact-match assertions below would fail if `.keel/...` leaked in.
+        fs::create_dir_all(work.path().join(".keel/store")).unwrap();
+        fs::write(work.path().join(".keel/store/data.mdb"), b"db").unwrap();
+        let pre: Vec<_> = repo.status(work.path()).unwrap();
+        assert_eq!(
+            pre.iter().map(|c| (c.kind.marker(), c.path.as_str())).collect::<Vec<_>>(),
+            vec![('A', "keep.ts"), ('A', "src/a.ts"), ('A', "src/b.ts")],
+            "no-HEAD status = everything added, path-sorted"
+        );
+
+        repo.commit_dir(work.path(), "init", "acct", 1, None).unwrap();
+        // clean tree right after commit
+        assert!(repo.status(work.path()).unwrap().is_empty(), "no diff immediately after commit");
+
+        // now: modify one, add one, delete one (keep one untouched)
+        fs::write(work.path().join("src/a.ts"), b"2").unwrap(); // modified
+        fs::write(work.path().join("src/c.ts"), b"new").unwrap(); // added
+        fs::remove_file(work.path().join("src/b.ts")).unwrap(); // deleted
+        let st: Vec<_> =
+            repo.status(work.path()).unwrap().iter().map(|c| (c.kind.marker(), c.path.clone())).collect();
+        assert_eq!(
+            st,
+            vec![
+                ('M', "src/a.ts".to_string()),
+                ('D', "src/b.ts".to_string()),
+                ('A', "src/c.ts".to_string()),
+            ],
+            "keep.ts unchanged & omitted; a modified, b deleted, c added"
+        );
+    }
+
+    #[test]
+    fn file_bytes_at_returns_blob_content() {
+        let sd = TmpDir::new();
+        let work = TmpDir::new();
+        let repo = Repo::open(sd.path()).unwrap();
+        fs::create_dir_all(work.path().join("d")).unwrap();
+        fs::write(work.path().join("d/a.txt"), b"hello bytes").unwrap();
+        let c = repo.commit_dir(work.path(), "c", "acct", 1, None).unwrap();
+
+        assert_eq!(repo.file_bytes_at(c, "d/a.txt").unwrap().as_deref(), Some(&b"hello bytes"[..]));
+        assert_eq!(repo.file_bytes_at(c, "d/missing.txt").unwrap(), None, "absent path → None");
+        assert_eq!(repo.file_bytes_at(c, "d").unwrap(), None, "a directory is not a file → None");
     }
 
     #[test]

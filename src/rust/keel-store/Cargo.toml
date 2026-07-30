@@ -7,6 +7,9 @@ description = "keel native content-addressed object store — BLAKE3 addressing,
 [dependencies]
 blake3 = "1"
 heed = "0.20"
+# pure-Rust DEFLATE (no C toolchain dep) — stored object/chunk values are compressed so a
+# source tree doesn't cost MORE on disk than the raw files (see NEW-1109).
+miniz_oxide = "0.8"
 
 [dev-dependencies]
 keel-resolve = { path = "../keel-resolve" }
