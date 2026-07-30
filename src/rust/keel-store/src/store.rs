@@ -547,6 +547,15 @@ impl Store {
         Ok(self.aux.get(&r, &Self::aux_key(ns, key))?.map(|v| v.to_vec()))
     }
 
+    /// Delete `key` from namespace `ns` (returns whether it existed). Used e.g. for a ref
+    /// deletion pushed by a client.
+    pub fn aux_delete(&self, ns: &str, key: &[u8]) -> Result<bool> {
+        let mut w = self.env.write_txn()?;
+        let existed = self.aux.delete(&mut w, &Self::aux_key(ns, key))?;
+        w.commit()?;
+        Ok(existed)
+    }
+
     /// All `(key, val)` in namespace `ns` (key without the namespace prefix).
     pub fn aux_iter(&self, ns: &str) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
         let r = self.env.read_txn()?;

@@ -652,7 +652,13 @@ fn serve_conn(mut stream: std::net::TcpStream, store: &keel_store::store::Store)
         return respond(&mut stream, "200 OK", "application/x-git-upload-pack-result", &resp);
     }
     if method == "POST" && path.ends_with("/git-receive-pack") {
-        return respond(&mut stream, "403 Forbidden", "text/plain", b"keel serve: push (receive-pack) not yet implemented");
+        let resp = keel_git::smart_http::receive_pack(store, &body)?;
+        // Rebuild keel-native history for the pushed commits so brief/provenance see them.
+        let _ = keel_git::bridge::bridge(store);
+        if std::env::var("KEEL_SERVE_DEBUG").is_ok() {
+            eprintln!("keel serve: receive-pack {} byte request → {} byte report", body.len(), resp.len());
+        }
+        return respond(&mut stream, "200 OK", "application/x-git-receive-pack-result", &resp);
     }
     respond(&mut stream, "404 Not Found", "text/plain", b"not found")
 }

@@ -163,6 +163,58 @@ pub fn has_object(store: &Store, oid: &Oid) -> io::Result<bool> {
         || store.aux_get(NS_BLOB, k).map_err(to_io)?.is_some())
 }
 
+/// Ingest already-resolved git objects (e.g. from a received/unpacked push) into the mirror:
+/// blob bytes deduped into keel's blob store, tree/commit/tag payloads kept verbatim. Bulk-writes.
+pub fn ingest_objects(store: &Store, objs: &[(Kind, Vec<u8>)]) -> io::Result<MirrorStats> {
+    let mut stats = MirrorStats::default();
+    let mut obj_batch: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+    let mut blob_batch: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+    const FLUSH: usize = 2048;
+    for (kind, payload) in objs {
+        let goid = hash(*kind, payload);
+        match kind {
+            Kind::Blob => {
+                let id = store.put(&Object::Blob(payload.clone())).map_err(to_io)?;
+                blob_batch.push((goid.as_bytes().to_vec(), id.0.to_vec()));
+                stats.blobs += 1;
+            }
+            _ => {
+                let mut v = Vec::with_capacity(1 + payload.len());
+                v.push(kind_tag(*kind));
+                v.extend_from_slice(payload);
+                obj_batch.push((goid.as_bytes().to_vec(), v));
+                match kind {
+                    Kind::Tree => stats.trees += 1,
+                    Kind::Commit => stats.commits += 1,
+                    Kind::Tag => stats.tags += 1,
+                    Kind::Blob => unreachable!(),
+                }
+            }
+        }
+        if obj_batch.len() >= FLUSH {
+            store.aux_put_many(NS_OBJ, &obj_batch).map_err(to_io)?;
+            obj_batch.clear();
+        }
+        if blob_batch.len() >= FLUSH {
+            store.aux_put_many(NS_BLOB, &blob_batch).map_err(to_io)?;
+            blob_batch.clear();
+        }
+    }
+    store.aux_put_many(NS_OBJ, &obj_batch).map_err(to_io)?;
+    store.aux_put_many(NS_BLOB, &blob_batch).map_err(to_io)?;
+    Ok(stats)
+}
+
+/// Point a ref at a target (40-hex oid or `"ref: <target>"`).
+pub fn set_ref(store: &Store, name: &str, value: &str) -> io::Result<()> {
+    store.aux_put(NS_REF, name.as_bytes(), value.as_bytes()).map_err(to_io)
+}
+
+/// Delete a ref.
+pub fn delete_ref(store: &Store, name: &str) -> io::Result<bool> {
+    store.aux_delete(NS_REF, name.as_bytes()).map_err(to_io)
+}
+
 /// Record refs (name → target). A symbolic ref (e.g. HEAD) has a `"ref: <target>"` value; a
 /// direct ref has a 40-hex value.
 pub fn ingest_refs(store: &Store, refs: &[(String, String)]) -> io::Result<u64> {
