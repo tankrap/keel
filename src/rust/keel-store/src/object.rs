@@ -107,7 +107,8 @@ pub enum Verification {
     Red,
 }
 impl Verification {
-    fn tag(self) -> u8 {
+    /// Wire tag (also the side-table encoding).
+    pub fn tag(self) -> u8 {
         match self {
             Verification::Unverified => 0,
             Verification::Green => 1,
@@ -115,11 +116,15 @@ impl Verification {
         }
     }
     fn from_tag(t: u8) -> Result<Verification> {
+        Self::from_u8(t).ok_or(DecodeError::BadTag(t))
+    }
+    /// Decode a tag byte, or `None` if it isn't a valid verification.
+    pub fn from_u8(t: u8) -> Option<Verification> {
         match t {
-            0 => Ok(Verification::Unverified),
-            1 => Ok(Verification::Green),
-            2 => Ok(Verification::Red),
-            _ => Err(DecodeError::BadTag(t)),
+            0 => Some(Verification::Unverified),
+            1 => Some(Verification::Green),
+            2 => Some(Verification::Red),
+            _ => None,
         }
     }
 }

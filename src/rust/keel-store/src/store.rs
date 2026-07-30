@@ -5,6 +5,16 @@
 //! - `blob_manifests` id → chunk manifest (large blobs only)
 //! - `chunks`         chunk-id → chunk bytes (FastCDC, deduped across all blobs)
 //! - `refs`           name → id (mutable named pointers)
+//! - `stat_cache`     repo-relative path → (mtime_ns, size, blob-id); a git-style index
+//!   that lets a snapshot skip re-hashing files whose mtime+size are unchanged
+//! - `verifications`  change-id → verification tag; a POST-HOC annotation (CI runs after the
+//!   commit), kept out of the immutable change so recording green/red doesn't change its id
+//! - `pins`           symbol → invariant lesson; a curated rule auto-served in every brief
+//!   that touches the symbol (cold-start lever: pays off from one pin, no history needed)
+//! - `deltas`         blob-id → prefix/suffix byte-delta against a base blob (a `repack`-only
+//!   storage form that narrows the gap to git's cross-object delta compression). The id is still
+//!   BLAKE3 over the logical content; a read reconstructs and **re-verifies the id**, so a bad
+//!   delta fails loudly and can never be served as wrong bytes.
 //!
 //! Content-addressing is stable regardless of storage form: a blob's id is always
 //! `BLAKE3([KIND_BLOB] ++ content)`, computed over the *logical content*. Whether it
@@ -16,7 +26,7 @@
 //! single-writer + copy-on-write (no WAL) matches keel's read-heavy, concurrent,
 //! write-once, crash-only pattern, with zero-recovery restart.
 
-use crate::object::{DecodeError, Object, ObjectId};
+use crate::object::{DecodeError, Object, ObjectId, Verification};
 use heed::types::Bytes;
 use heed::{Database, Env, EnvOpenOptions, RoTxn, RwTxn};
 use std::collections::HashSet;
@@ -69,6 +79,25 @@ impl From<DecodeError> for StoreError {
 
 pub type Result<T> = std::result::Result<T, StoreError>;
 
+/// Outcome of a compare-and-swap commit ([`Store::apply_cas`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Applied {
+    Committed,
+    /// The ref had moved (its current value is carried back for the caller to retry against).
+    Conflict(Option<ObjectId>),
+}
+
+/// Reserved stat_cache key holding the cache epoch (a NUL byte can't appear in a repo path).
+const EPOCH_KEY: &[u8] = b"\0epoch";
+
+fn read_id(b: &[u8]) -> Option<ObjectId> {
+    (b.len() == 32).then(|| {
+        let mut a = [0u8; 32];
+        a.copy_from_slice(b);
+        ObjectId(a)
+    })
+}
+
 /// What a garbage-collection sweep reclaimed / kept.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GcStats {
@@ -87,7 +116,19 @@ pub struct Store {
     blob_manifests: Database<Bytes, Bytes>,
     chunks: Database<Bytes, Bytes>,
     refs: Database<Bytes, Bytes>,
+    stat_cache: Database<Bytes, Bytes>,
+    verifications: Database<Bytes, Bytes>,
+    pins: Database<Bytes, Bytes>,
+    deltas: Database<Bytes, Bytes>,
+    /// Generic namespaced KV for adapters that need to ride alongside the object store without
+    /// the core knowing about them (e.g. the git-mirror's oid↔object and ref maps). Keys are
+    /// `namespace ++ 0x00 ++ key`; the core stays adapter-agnostic.
+    aux: Database<Bytes, Bytes>,
 }
+
+/// A cached stat entry: `(mtime_ns, size, blob-id)`. A snapshot may reuse `id` (skipping the
+/// read+hash) when a file's mtime and size both still match.
+pub type StatEntry = (u64, u64, ObjectId);
 
 impl Store {
     pub fn open(path: &Path) -> Result<Store> {
@@ -97,14 +138,30 @@ impl Store {
     pub fn open_with_map_size(path: &Path, map_size: usize) -> Result<Store> {
         std::fs::create_dir_all(path)?;
         // SAFETY: standard LMDB open; the mapped file is only accessed through this env.
-        let env = unsafe { EnvOpenOptions::new().map_size(map_size).max_dbs(4).open(path)? };
+        let env = unsafe { EnvOpenOptions::new().map_size(map_size).max_dbs(9).open(path)? };
         let mut w = env.write_txn()?;
         let objects = env.create_database(&mut w, Some("objects"))?;
         let blob_manifests = env.create_database(&mut w, Some("blob_manifests"))?;
         let chunks = env.create_database(&mut w, Some("chunks"))?;
         let refs = env.create_database(&mut w, Some("refs"))?;
+        let stat_cache = env.create_database(&mut w, Some("stat_cache"))?;
+        let verifications = env.create_database(&mut w, Some("verifications"))?;
+        let pins = env.create_database(&mut w, Some("pins"))?;
+        let deltas = env.create_database(&mut w, Some("deltas"))?;
+        let aux = env.create_database(&mut w, Some("aux"))?;
         w.commit()?;
-        Ok(Store { env, objects, blob_manifests, chunks, refs })
+        Ok(Store {
+            env,
+            objects,
+            blob_manifests,
+            chunks,
+            refs,
+            stat_cache,
+            verifications,
+            pins,
+            deltas,
+            aux,
+        })
     }
 
     /// Store an object, returning its content address. Idempotent.
@@ -142,7 +199,7 @@ impl Store {
                         let cid = blake3::hash(chunk);
                         let cidb = cid.as_bytes();
                         if self.chunks.get(&*w, cidb)?.is_none() {
-                            self.chunks.put(w, cidb, chunk)?;
+                            self.chunks.put(w, cidb, &pack(chunk))?;
                         }
                         manifest.extend_from_slice(cidb);
                     }
@@ -151,8 +208,10 @@ impl Store {
                 return Ok(id);
             }
         }
-        if self.objects.get(&*w, &id.0)?.is_none() {
-            self.objects.put(w, &id.0, &obj.encode())?;
+        // Skip if already present in either full (`objects`) or delta form — re-writing a
+        // deltified blob back into `objects` would double-store it until the next repack.
+        if self.objects.get(&*w, &id.0)?.is_none() && self.deltas.get(&*w, &id.0)?.is_none() {
+            self.objects.put(w, &id.0, &pack(&obj.encode()))?;
         }
         Ok(id)
     }
@@ -173,16 +232,82 @@ impl Store {
         Ok(ids)
     }
 
+    /// Compare-and-swap commit: write `objs` and advance `ref_name` to `new_ref` **only if**
+    /// the ref still equals `expected`. Because LMDB permits one writer at a time, the read
+    /// of the current ref and its update happen with no interleaving, so two un-coordinated
+    /// committers linearize (the loser gets `Conflict` and retries against the new head)
+    /// instead of silently clobbering each other's commit. On conflict nothing is written.
+    pub fn apply_cas(
+        &self,
+        objs: &[Object],
+        ref_name: &str,
+        expected: Option<ObjectId>,
+        new_ref: ObjectId,
+    ) -> Result<Applied> {
+        let mut w = self.env.write_txn()?;
+        let cur = self.refs.get(&w, ref_name.as_bytes())?.and_then(read_id);
+        if cur != expected {
+            return Ok(Applied::Conflict(cur)); // dropping `w` discards any pending writes
+        }
+        for obj in objs {
+            self.write_object(&mut w, obj)?;
+        }
+        self.refs.put(&mut w, ref_name.as_bytes(), &new_ref.0)?;
+        w.commit()?;
+        Ok(Applied::Committed)
+    }
+
     /// Fetch and decode an object by address.
     pub fn get(&self, id: &ObjectId) -> Result<Option<Object>> {
         let r = self.env.read_txn()?;
-        if let Some(bytes) = self.objects.get(&r, &id.0)? {
-            return Ok(Some(Object::decode(bytes)?));
+        self.read_object(&r, id)
+    }
+
+    /// Resolve an object within one read txn, following the delta form recursively (a delta's
+    /// base may itself be a delta — `repack` bounds the chain with periodic full "keyframes", so
+    /// the recursion is shallow). Reusing a single txn avoids nested-read-txn slot issues.
+    fn read_object(&self, r: &RoTxn, id: &ObjectId) -> Result<Option<Object>> {
+        self.read_object_depth(r, id, 0)
+    }
+
+    /// Hard cap on delta-chain reconstruct depth. `repack` bounds real chains far below this
+    /// (a keyframe every 16 versions); the cap only exists so a *bug* that produced a delta
+    /// cycle would surface as `Corrupt` instead of a stack overflow. Chosen well above any
+    /// legitimate chain length.
+    const MAX_DELTA_DEPTH: u32 = 4096;
+
+    fn read_object_depth(&self, r: &RoTxn, id: &ObjectId, depth: u32) -> Result<Option<Object>> {
+        if depth > Self::MAX_DELTA_DEPTH {
+            return Err(StoreError::Corrupt(*id)); // runaway delta chain (should be impossible)
         }
-        if let Some(manifest) = self.blob_manifests.get(&r, &id.0)? {
-            return Ok(Some(self.reassemble_blob(&r, id, manifest)?));
+        if let Some(bytes) = self.objects.get(r, &id.0)? {
+            return Ok(Some(Object::decode(&unpack(bytes)?)?));
+        }
+        if let Some(stored) = self.deltas.get(r, &id.0)? {
+            return Ok(Some(self.reconstruct_delta(r, id, stored, depth)?));
+        }
+        if let Some(manifest) = self.blob_manifests.get(r, &id.0)? {
+            return Ok(Some(self.reassemble_blob(r, id, manifest)?));
         }
         Ok(None)
+    }
+
+    /// Rebuild a delta-stored blob: read its base, apply the copy/insert op stream, then
+    /// re-verify the id. A wrong delta (or a base that no longer matches) fails as `Corrupt`
+    /// rather than returning altered bytes — the same integrity guarantee chunked blobs get.
+    fn reconstruct_delta(&self, r: &RoTxn, id: &ObjectId, stored: &[u8], depth: u32) -> Result<Object> {
+        let raw = unpack(stored)?;
+        let (base_id, ops) = split_delta(&raw).ok_or(StoreError::Corrupt(*id))?;
+        let base = match self.read_object_depth(r, &base_id, depth + 1)? {
+            Some(Object::Blob(b)) => b,
+            _ => return Err(StoreError::Corrupt(*id)), // base missing or not a blob
+        };
+        let content = crate::delta::expand(&base, ops).ok_or(StoreError::Corrupt(*id))?;
+        let obj = Object::Blob(content);
+        if obj.id() != *id {
+            return Err(StoreError::Corrupt(*id));
+        }
+        Ok(obj)
     }
 
     fn reassemble_blob(&self, r: &RoTxn, id: &ObjectId, manifest: &[u8]) -> Result<Object> {
@@ -194,7 +319,7 @@ impl Store {
             let cidb = manifest.get(i..end).ok_or(StoreError::Corrupt(*id))?;
             i = end;
             let chunk = self.chunks.get(r, cidb)?.ok_or(StoreError::Corrupt(*id))?;
-            content.extend_from_slice(chunk);
+            content.extend_from_slice(&unpack(chunk)?);
         }
         if i != manifest.len() {
             return Err(StoreError::Corrupt(*id));
@@ -210,19 +335,275 @@ impl Store {
     pub fn has(&self, id: &ObjectId) -> Result<bool> {
         let r = self.env.read_txn()?;
         Ok(self.objects.get(&r, &id.0)?.is_some()
+            || self.deltas.get(&r, &id.0)?.is_some()
             || self.blob_manifests.get(&r, &id.0)?.is_some())
     }
 
     /// Number of stored logical objects (inline + chunked blobs).
     pub fn object_count(&self) -> Result<u64> {
         let r = self.env.read_txn()?;
-        Ok(self.objects.len(&r)? + self.blob_manifests.len(&r)?)
+        Ok(self.objects.len(&r)? + self.deltas.len(&r)? + self.blob_manifests.len(&r)?)
     }
 
     /// Number of distinct stored chunks (dedup denominator).
     pub fn chunk_count(&self) -> Result<u64> {
         let r = self.env.read_txn()?;
         Ok(self.chunks.len(&r)?)
+    }
+
+    /// Number of blobs currently stored in delta form.
+    pub fn delta_count(&self) -> Result<u64> {
+        let r = self.env.read_txn()?;
+        Ok(self.deltas.len(&r)?)
+    }
+
+    /// The content of `id` iff it is currently a **full inline blob** (in `objects`, decodes to
+    /// a Blob) — `None` for a delta, a chunked blob, a tree/change/session, or a miss. `repack`
+    /// uses this to pick cross-path delta bases that are full (so the delta chain stays depth 1).
+    pub fn blob_bytes_if_full(&self, id: &ObjectId) -> Result<Option<Vec<u8>>> {
+        let r = self.env.read_txn()?;
+        match self.objects.get(&r, &id.0)? {
+            Some(b) => match Object::decode(&unpack(b)?)? {
+                Object::Blob(c) => Ok(Some(c)),
+                _ => Ok(None),
+            },
+            None => Ok(None),
+        }
+    }
+
+    /// All content-table keys (objects + deltas + chunked-blob manifests). For benchmarks and
+    /// integrity sweeps — lets a caller `get` every stored object to time/verify reconstruction.
+    pub fn content_ids(&self) -> Result<Vec<ObjectId>> {
+        let r = self.env.read_txn()?;
+        let mut out = Vec::new();
+        for db in [&self.objects, &self.deltas, &self.blob_manifests] {
+            for kv in db.iter(&r)? {
+                let (k, _) = kv?;
+                if let Some(id) = read_id(k) {
+                    out.push(id);
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Total logical content bytes held (sum of stored value lengths across the content tables).
+    /// This is the honest "size on disk" for comparison — unlike the LMDB file length it isn't
+    /// inflated by map-size reservation or by freed-but-not-reclaimed pages after a GC.
+    pub fn stored_bytes(&self) -> Result<u64> {
+        let r = self.env.read_txn()?;
+        let mut total = 0u64;
+        for db in [&self.objects, &self.deltas, &self.chunks, &self.blob_manifests] {
+            for kv in db.iter(&r)? {
+                let (k, v) = kv?;
+                total += (k.len() + v.len()) as u64;
+            }
+        }
+        Ok(total)
+    }
+
+    /// Re-store the inline blob `target` as a copy/insert byte-delta against `base`, **iff**
+    /// that is smaller than its current on-disk (already-compressed) form. Returns the bytes
+    /// saved (0 if it wasn't worth it, or `target` isn't an inline blob).
+    ///
+    /// Caller contract: `base` must be reachable and must NOT (transitively) delta against
+    /// `target` — `repack` guarantees this by only ever pointing a higher-rank blob at a
+    /// strictly lower-rank one, so delta chains are acyclic and bounded by keyframes. The
+    /// reconstruct is verified against the address before the swap, so a bad delta is never
+    /// committed.
+    pub fn deltify(&self, target: &ObjectId, base: &ObjectId) -> Result<u64> {
+        if target == base {
+            return Ok(0);
+        }
+        let r = self.env.read_txn()?;
+        // target must currently be an inline blob (chunked/absent/already-delta → skip)
+        let Some(stored) = self.objects.get(&r, &target.0)? else {
+            return Ok(0);
+        };
+        let current_size = stored.len();
+        let content = match Object::decode(&unpack(stored)?)? {
+            Object::Blob(b) => b,
+            _ => return Ok(0), // only blobs deltify
+        };
+        let base_content = match self.read_object(&r, base)? {
+            Some(Object::Blob(b)) => b,
+            _ => return Ok(0),
+        };
+        drop(r);
+
+        let ops = crate::delta::compress(&base_content, &content);
+        let mut raw = Vec::with_capacity(32 + ops.len());
+        raw.extend_from_slice(&base.0);
+        raw.extend_from_slice(&ops);
+        let packed = pack(&raw);
+        if packed.len() >= current_size {
+            return Ok(0); // delta didn't beat the full compressed form — leave it whole
+        }
+
+        // Verify the round-trip IN MEMORY before deleting the full copy: rebuild from
+        // base_content + this delta and confirm it hashes back to `target`. A codec bug bails
+        // here (returns 0, blob left whole) instead of destroying the only full copy.
+        let verified = match crate::delta::expand(&base_content, &ops) {
+            Some(rebuilt) => Object::Blob(rebuilt).id() == *target,
+            None => false,
+        };
+        if !verified {
+            return Ok(0);
+        }
+
+        let mut w = self.env.write_txn()?;
+        self.deltas.put(&mut w, &target.0, &packed)?;
+        self.objects.delete(&mut w, &target.0)?;
+        w.commit()?;
+        Ok((current_size - packed.len()) as u64)
+    }
+
+    // ── verifications (post-hoc green/red on an immutable change) ────────────
+
+    /// Record a change's verification result (CI/tests run after the commit). Stored beside
+    /// the change, not in it, so the change's content address never moves.
+    pub fn set_verification(&self, change: &ObjectId, v: Verification) -> Result<()> {
+        let mut w = self.env.write_txn()?;
+        self.verifications.put(&mut w, &change.0, &[v.tag()])?;
+        w.commit()?;
+        Ok(())
+    }
+
+    /// A change's recorded verification, or `Unverified` if none was set.
+    pub fn verification(&self, change: &ObjectId) -> Result<Verification> {
+        let r = self.env.read_txn()?;
+        Ok(self
+            .verifications
+            .get(&r, &change.0)?
+            .and_then(|b| b.first().copied())
+            .and_then(Verification::from_u8)
+            .unwrap_or(Verification::Unverified))
+    }
+
+    // ── pinned invariants (symbol → curated lesson, auto-served) ─────────────
+
+    /// Pin an invariant lesson to a symbol (overwrites any existing pin for it).
+    pub fn set_pin(&self, symbol: &str, lesson: &str) -> Result<()> {
+        let mut w = self.env.write_txn()?;
+        self.pins.put(&mut w, symbol.as_bytes(), lesson.as_bytes())?;
+        w.commit()?;
+        Ok(())
+    }
+
+    /// The invariant pinned to `symbol`, if any.
+    pub fn pin(&self, symbol: &str) -> Result<Option<String>> {
+        let r = self.env.read_txn()?;
+        Ok(self.pins.get(&r, symbol.as_bytes())?.map(|b| String::from_utf8_lossy(b).into_owned()))
+    }
+
+    /// All pins (symbol, lesson), sorted by symbol — for `keel pins`.
+    pub fn pins(&self) -> Result<Vec<(String, String)>> {
+        let r = self.env.read_txn()?;
+        let mut out = Vec::new();
+        for kv in self.pins.iter(&r)? {
+            let (k, v) = kv?;
+            if let Ok(sym) = std::str::from_utf8(k) {
+                out.push((sym.to_string(), String::from_utf8_lossy(v).into_owned()));
+            }
+        }
+        out.sort();
+        Ok(out)
+    }
+
+    // ── generic namespaced KV (adapter side-tables; core stays adapter-agnostic) ─────────────
+
+    fn aux_key(ns: &str, key: &[u8]) -> Vec<u8> {
+        let mut k = Vec::with_capacity(ns.len() + 1 + key.len());
+        k.extend_from_slice(ns.as_bytes());
+        k.push(0);
+        k.extend_from_slice(key);
+        k
+    }
+
+    /// Put `key → val` in namespace `ns`.
+    pub fn aux_put(&self, ns: &str, key: &[u8], val: &[u8]) -> Result<()> {
+        let mut w = self.env.write_txn()?;
+        self.aux.put(&mut w, &Self::aux_key(ns, key), val)?;
+        w.commit()?;
+        Ok(())
+    }
+
+    /// Put many `(key, val)` in namespace `ns` in ONE transaction (bulk ingest).
+    pub fn aux_put_many(&self, ns: &str, items: &[(Vec<u8>, Vec<u8>)]) -> Result<()> {
+        if items.is_empty() {
+            return Ok(());
+        }
+        let mut w = self.env.write_txn()?;
+        for (k, v) in items {
+            self.aux.put(&mut w, &Self::aux_key(ns, k), v)?;
+        }
+        w.commit()?;
+        Ok(())
+    }
+
+    /// Get `key` from namespace `ns`.
+    pub fn aux_get(&self, ns: &str, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        let r = self.env.read_txn()?;
+        Ok(self.aux.get(&r, &Self::aux_key(ns, key))?.map(|v| v.to_vec()))
+    }
+
+    /// All `(key, val)` in namespace `ns` (key without the namespace prefix).
+    pub fn aux_iter(&self, ns: &str) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        let r = self.env.read_txn()?;
+        let prefix = Self::aux_key(ns, b"");
+        let mut out = Vec::new();
+        for kv in self.aux.iter(&r)? {
+            let (k, v) = kv?;
+            if let Some(rest) = k.strip_prefix(prefix.as_slice()) {
+                out.push((rest.to_vec(), v.to_vec()));
+            }
+        }
+        Ok(out)
+    }
+
+    /// Number of entries in namespace `ns`.
+    pub fn aux_count(&self, ns: &str) -> Result<usize> {
+        Ok(self.aux_iter(ns)?.len())
+    }
+
+    // ── stat cache (snapshot fast-path) ──────────────────────────────────────
+
+    /// Load the whole stat cache into memory (one read txn). Snapshot consults this to skip
+    /// re-hashing files whose mtime+size are unchanged.
+    /// Returns `(entries, epoch)`. `epoch` is the time the cache was last written (ns since the
+    /// epoch); an entry is only trustworthy if its mtime is strictly older than it (see the
+    /// snapshot fast path) — the "racy git" guard against a same-size edit within one mtime
+    /// tick of a snapshot. The epoch lives under a reserved NUL key (never a repo path).
+    pub fn load_stat_cache(&self) -> Result<(std::collections::HashMap<String, StatEntry>, u64)> {
+        let r = self.env.read_txn()?;
+        let mut map = std::collections::HashMap::new();
+        let mut epoch = 0u64;
+        for kv in self.stat_cache.iter(&r)? {
+            let (k, v) = kv?;
+            if k == EPOCH_KEY {
+                if v.len() == 8 {
+                    epoch = u64::from_le_bytes(v.try_into().unwrap());
+                }
+            } else if let (Ok(path), Some(entry)) = (std::str::from_utf8(k), decode_stat(v)) {
+                map.insert(path.to_string(), entry);
+            }
+        }
+        Ok((map, epoch))
+    }
+
+    /// Upsert stat-cache entries and stamp `epoch` (the snapshot's time). No-op on an empty
+    /// slice, so a snapshot that changed nothing writes nothing (the prior epoch stays valid).
+    pub fn put_stat_cache(&self, updates: &[(String, StatEntry)], epoch: u64) -> Result<()> {
+        if updates.is_empty() {
+            return Ok(());
+        }
+        let mut w = self.env.write_txn()?;
+        for (path, entry) in updates {
+            self.stat_cache.put(&mut w, path.as_bytes(), &encode_stat(entry))?;
+        }
+        self.stat_cache.put(&mut w, EPOCH_KEY, &epoch.to_le_bytes())?;
+        w.commit()?;
+        Ok(())
     }
 
     // ── refs (mutable named pointers) ────────────────────────────────────────
@@ -292,7 +673,7 @@ impl Store {
                 continue;
             }
             if let Some(bytes) = self.objects.get(&w, &idb)? {
-                match Object::decode(bytes)? {
+                match Object::decode(&unpack(bytes)?)? {
                     Object::Blob(_) => {}
                     Object::Tree(t) => {
                         for e in &t.entries {
@@ -317,6 +698,12 @@ impl Store {
                         }
                     }
                 }
+            } else if let Some(stored) = self.deltas.get(&w, &idb)? {
+                // a delta blob is kept alive, and its base must be kept too (the delta can't be
+                // reconstructed without it) — push the base so reachability follows the edge.
+                if let Some((base, _)) = split_delta(&unpack(stored)?) {
+                    stack.push(base.0);
+                }
             } else if let Some(manifest) = self.blob_manifests.get(&w, &idb)? {
                 let mut i = 0usize;
                 if let Some(n) = read_uvarint(manifest, &mut i) {
@@ -338,12 +725,14 @@ impl Store {
         // collect unreachable keys (mutating during iteration is unsafe), then sweep — all
         // still inside the same write txn `w`.
         let del_obj = unreached(self.objects.iter(&w)?, &reach_obj)?;
+        let del_delta = unreached(self.deltas.iter(&w)?, &reach_obj)?;
         let del_man = unreached(self.blob_manifests.iter(&w)?, &reach_obj)?;
         let del_chunk = unreached(self.chunks.iter(&w)?, &reach_chunk)?;
 
-        for k in del_obj.iter().chain(del_man.iter()) {
-            // an id is in exactly one of objects/blob_manifests; deleting a miss is a no-op
+        for k in del_obj.iter().chain(del_delta.iter()).chain(del_man.iter()) {
+            // an id is in exactly one of objects/deltas/blob_manifests; deleting a miss is a no-op
             self.objects.delete(&mut w, k.as_slice())?;
+            self.deltas.delete(&mut w, k.as_slice())?;
             self.blob_manifests.delete(&mut w, k.as_slice())?;
         }
         for k in &del_chunk {
@@ -352,7 +741,7 @@ impl Store {
         w.commit()?;
 
         Ok(GcStats {
-            objects_removed: (del_obj.len() + del_man.len()) as u64,
+            objects_removed: (del_obj.len() + del_delta.len() + del_man.len()) as u64,
             chunks_removed: del_chunk.len() as u64,
             objects_kept: self.object_count()?,
             chunks_kept: self.chunk_count()?,
@@ -377,6 +766,82 @@ where
         }
     }
     Ok(out)
+}
+
+// ── value compression (store-internal) ───────────────────────────────────────
+//
+// Stored `objects` and `chunks` values are DEFLATE-compressed with a 1-byte tag, so a
+// source tree (mostly small text files, inlined below the chunk threshold) doesn't cost
+// more on disk than the raw bytes. Addressing is unaffected — the id is BLAKE3 over the
+// *logical* content; compression is a pure storage-layer transform below the address.
+// Incompressible values keep their raw form (tag 0) so we never pay to "compress" noise.
+// (Manifests and refs are tiny/incompressible and stay raw — only objects/chunks go through
+// here.)
+
+const PACK_RAW: u8 = 0;
+const PACK_DEFLATE: u8 = 1;
+
+fn pack(bytes: &[u8]) -> Vec<u8> {
+    // Level 6: measured byte-identical to level 9 on real source trees, so the higher level only
+    // costs ingest CPU for no size win. The store's gap to git is NOT the codec — it's git's
+    // cross-object delta compression; `repack`'s prefix/suffix byte-deltas narrow that gap for
+    // the localized-edit case (see `deltify` / NEW-1111).
+    let comp = miniz_oxide::deflate::compress_to_vec(bytes, 6);
+    if comp.len() + 1 < bytes.len() {
+        let mut out = Vec::with_capacity(comp.len() + 1);
+        out.push(PACK_DEFLATE);
+        out.extend_from_slice(&comp);
+        out
+    } else {
+        let mut out = Vec::with_capacity(bytes.len() + 1);
+        out.push(PACK_RAW);
+        out.extend_from_slice(bytes);
+        out
+    }
+}
+
+fn unpack(stored: &[u8]) -> Result<Vec<u8>> {
+    match stored.split_first() {
+        Some((&PACK_RAW, rest)) => Ok(rest.to_vec()),
+        Some((&PACK_DEFLATE, rest)) => miniz_oxide::inflate::decompress_to_vec(rest)
+            .map_err(|_| StoreError::Io(std::io::Error::other("stored value: deflate failed"))),
+        _ => Err(StoreError::Io(std::io::Error::other("stored value: bad/empty pack tag"))),
+    }
+}
+
+// ── blob delta form (base-id ++ copy/insert op stream; see the `delta` module) ──
+//
+// A delta value is `base_id(32) ++ ops`, where `ops` is a copy/insert stream (module `delta`)
+// that reconstructs the blob from a base. `repack` builds these; `deltify` adopts one only when
+// it beats the full compressed blob, so a blob with no good base simply stays whole (never a
+// regression). The op codec finds shared regions anywhere in the base, so a blob can delta
+// against a merely *similar* one, not just its same-path predecessor.
+
+/// Split a delta value (already `unpack`ed) into `(base_id, ops)`.
+fn split_delta(raw: &[u8]) -> Option<(ObjectId, &[u8])> {
+    let base = ObjectId(raw.get(0..32)?.try_into().ok()?);
+    Some((base, raw.get(32..)?))
+}
+
+// ── stat-cache entry codec (fixed 48 bytes: mtime_ns | size | blob-id) ────────
+
+fn encode_stat((mtime, size, id): &StatEntry) -> [u8; 48] {
+    let mut out = [0u8; 48];
+    out[0..8].copy_from_slice(&mtime.to_le_bytes());
+    out[8..16].copy_from_slice(&size.to_le_bytes());
+    out[16..48].copy_from_slice(&id.0);
+    out
+}
+
+fn decode_stat(v: &[u8]) -> Option<StatEntry> {
+    if v.len() != 48 {
+        return None;
+    }
+    let mtime = u64::from_le_bytes(v[0..8].try_into().ok()?);
+    let size = u64::from_le_bytes(v[8..16].try_into().ok()?);
+    let mut id = [0u8; 32];
+    id.copy_from_slice(&v[16..48]);
+    Some((mtime, size, ObjectId(id)))
 }
 
 // ── manifest varint (store-internal) ─────────────────────────────────────────
@@ -531,6 +996,37 @@ mod tests {
     }
 
     #[test]
+    fn deltify_roundtrips_and_gc_keeps_the_base() {
+        let d = TmpDir::new();
+        let s = Store::open(&d.0).unwrap();
+        // two versions of a file: v2 tweaks the middle → long shared prefix + suffix
+        let v1: Vec<u8> = (0..3000).flat_map(|i| format!("line {i}\n").into_bytes()).collect();
+        let mut v2 = v1.clone();
+        let at = v1.windows(9).position(|w| w == b"line 1500").unwrap();
+        v2.splice(at..at + 9, b"line 1500-EDITED".iter().copied());
+
+        let base = s.put(&Object::Blob(v1.clone())).unwrap();
+        let target = s.put(&Object::Blob(v2.clone())).unwrap();
+        let saved = s.deltify(&target, &base).unwrap();
+        assert!(saved > 0, "localized edit should delta-compress");
+        assert_eq!(s.delta_count().unwrap(), 1);
+
+        // the delta still reads back byte-identical
+        assert_eq!(s.get(&target).unwrap(), Some(Object::Blob(v2.clone())));
+
+        // reference ONLY the delta (not its base); GC must keep the base alive via the delta edge
+        s.set_ref("r", &target).unwrap();
+        s.gc().unwrap();
+        assert!(s.has(&base).unwrap(), "GC must keep a delta's base");
+        assert_eq!(s.get(&target).unwrap(), Some(Object::Blob(v2)), "delta survives GC intact");
+
+        // dropping the reference lets BOTH the delta and its base go
+        s.delete_ref("r").unwrap();
+        s.gc().unwrap();
+        assert!(!s.has(&target).unwrap() && !s.has(&base).unwrap(), "unreferenced delta+base swept");
+    }
+
+    #[test]
     fn shared_content_deduplicates_chunks() {
         let d = TmpDir::new();
         let s = Store::open(&d.0).unwrap();
@@ -580,6 +1076,35 @@ mod tests {
             Err(StoreError::Corrupt(_)) => {}
             other => panic!("expected Corrupt, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn pins_roundtrip_and_list() {
+        let d = TmpDir::new();
+        let s = Store::open(&d.0).unwrap();
+        assert_eq!(s.pin("charge").unwrap(), None);
+        s.set_pin("charge", "settle before charge").unwrap();
+        s.set_pin("login", "rate-limit").unwrap();
+        assert_eq!(s.pin("charge").unwrap().as_deref(), Some("settle before charge"));
+        s.set_pin("charge", "settle FIRST").unwrap(); // overwrite
+        assert_eq!(s.pin("charge").unwrap().as_deref(), Some("settle FIRST"));
+        assert_eq!(
+            s.pins().unwrap(),
+            vec![("charge".to_string(), "settle FIRST".to_string()), ("login".to_string(), "rate-limit".to_string())],
+            "sorted by symbol"
+        );
+    }
+
+    #[test]
+    fn verification_side_table_roundtrips() {
+        let d = TmpDir::new();
+        let s = Store::open(&d.0).unwrap();
+        let id = s.put(&Object::Blob(b"x".to_vec())).unwrap();
+        assert_eq!(s.verification(&id).unwrap(), Verification::Unverified, "default is unverified");
+        s.set_verification(&id, Verification::Green).unwrap();
+        assert_eq!(s.verification(&id).unwrap(), Verification::Green);
+        s.set_verification(&id, Verification::Red).unwrap();
+        assert_eq!(s.verification(&id).unwrap(), Verification::Red, "later result overwrites");
     }
 
     #[test]

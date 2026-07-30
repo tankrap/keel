@@ -8,7 +8,6 @@
 use keel_graph::LiveGraph;
 use keel_resolve::Sidecar;
 use keel_store::{snapshot, Repo};
-use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -36,7 +35,7 @@ fn main() {
     let store = repo.store();
     let objs = store.object_count().unwrap();
     let chunks = store.chunk_count().unwrap();
-    let store_bytes = disk_blocks(&store_dir);
+    let store_bytes = dir_size(&store_dir);
     println!("\n[1] INGEST  (snapshot + atomic commit)");
     println!("    time        {:>7.0} ms   ({:.0} files/s)", ms(ingest), nfiles as f64 / ingest.as_secs_f64());
     println!("    objects     {objs:>7}   ({chunks} chunks)");
@@ -60,41 +59,49 @@ fn main() {
     println!("    time        {:>7.0} ms", ms(gct));
     println!("    removed     {} objs / {} chunks   kept {} / {}", gc.objects_removed, gc.chunks_removed, gc.objects_kept, gc.chunks_kept);
 
-    // [4] RELEVANCE — TS symbol slice
+    // [4] RELEVANCE — TS symbol slice (sample size from arg 2, default 100)
+    let sample: usize = std::env::args().nth(2).and_then(|s| s.parse().ok()).unwrap_or(100);
     let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("../keel-resolve/sidecar/resolve.mjs");
     if let Ok(mut sc) = Sidecar::spawn(&script) {
         let has_ts = sc.health().ok().and_then(|h| h.get("ts").cloned()).map(|v| !v.is_null()).unwrap_or(false);
         if has_ts {
             let t = Instant::now();
-            let targets = sc.targets(&srcp, 10).unwrap_or_default();
+            let targets = sc.targets(&srcp, sample).unwrap_or_default();
             let prog = t.elapsed();
-            let (mut n, mut tok, mut cross) = (0usize, 0usize, 0usize);
-            let mut st = Duration::ZERO;
+            let (mut n, mut cross) = (0usize, 0usize);
+            let mut toks: Vec<usize> = Vec::new();
+            let mut lats: Vec<f64> = Vec::new();
             for (f, s) in &targets {
                 let t = Instant::now();
                 if let Ok(defs) = sc.slice(&srcp, f, s, 1) {
-                    st += t.elapsed();
+                    lats.push(ms(t.elapsed()));
                     n += 1;
-                    tok += defs.iter().map(|d| d.text.len() / 4).sum::<usize>();
+                    toks.push(defs.iter().map(|d| d.text.len() / 4).sum::<usize>());
                     if defs.iter().any(|d| &d.file != f) {
                         cross += 1;
                     }
                 }
             }
-            println!("\n[4] RELEVANCE  (TS symbol slice, depth 1)");
-            println!("    program     {:>7.1} s    (one-time, {} targets)", prog.as_secs_f64(), targets.len());
+            println!("\n[4] RELEVANCE  (TS symbol slice, depth 1)  — sample n={n}");
+            println!("    program     {:>7.1} s    (one-time; targets each have a cross-file callee)", prog.as_secs_f64());
             if n > 0 {
-                println!("    cross-file  {cross}/{n} targets resolved");
+                let pct = 100.0 * cross as f64 / n as f64;
+                println!("    cross-file  {cross}/{n} targets resolved ({pct:.0}%)");
+                let (tmed, tp90) = (percentile_u(&toks, 50.0), percentile_u(&toks, 90.0));
+                let tmean = toks.iter().sum::<usize>() as f64 / n as f64;
+                println!("    slice tok   median {tmed}  · mean {tmean:.0}  · p90 {tp90}");
+                println!("    latency ms  median {:.1} · p90 {:.1}", percentile_f(&lats, 50.0), percentile_f(&lats, 90.0));
                 let repo_mtok = raw_bytes as f64 / 4.0 / 1e6;
-                println!("    slice       {:>7} tok  · {:.1} ms/slice   ({:.0}× smaller than the {:.1}M-tok repo)", tok / n, ms(st) / n as f64, repo_mtok * 1e6 / (tok / n).max(1) as f64, repo_mtok);
+                println!("    vs repo     {:.0}× smaller than the {:.1}M-tok tree (median slice)", repo_mtok * 1e6 / tmed.max(1) as f64, repo_mtok);
             }
         }
     }
 
     // [5] LIVE GRAPH
-    if let Ok(mut g) = LiveGraph::open(&srcp, &script) {
+    if let Ok(mut sc) = Sidecar::spawn(&script) {
+        let mut g = LiveGraph::new(&srcp);
         let t = Instant::now();
-        let nf = g.build().unwrap_or(0);
+        let nf = g.build(&mut sc).unwrap_or(0);
         let gb = t.elapsed();
         println!("\n[5] LIVE GRAPH  (working-tree, incremental)");
         println!("    build       {:>7.0} ms   ({nf} files, {} edges)", ms(gb), g.edge_count());
@@ -108,6 +115,24 @@ fn main() {
 
 fn ms(d: Duration) -> f64 {
     d.as_secs_f64() * 1000.0
+}
+
+fn percentile_u(v: &[usize], p: f64) -> usize {
+    if v.is_empty() {
+        return 0;
+    }
+    let mut s = v.to_vec();
+    s.sort_unstable();
+    s[(((p / 100.0) * (s.len() - 1) as f64).round() as usize).min(s.len() - 1)]
+}
+
+fn percentile_f(v: &[f64], p: f64) -> f64 {
+    if v.is_empty() {
+        return 0.0;
+    }
+    let mut s = v.to_vec();
+    s.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    s[(((p / 100.0) * (s.len() - 1) as f64).round() as usize).min(s.len() - 1)]
 }
 
 fn count_and_bytes(dir: &Path) -> (usize, u64) {
@@ -135,16 +160,20 @@ fn count_and_bytes(dir: &Path) -> (usize, u64) {
     (n, b)
 }
 
-fn disk_blocks(dir: &Path) -> u64 {
+/// Sum of apparent file sizes under `dir`. NB: use apparent `len()`, not allocated blocks —
+/// while the LMDB env is open its data file's block count reflects reserved/mmap'd pages
+/// (the 64 GiB map), which wildly overstates the real footprint; `len()` is the true logical
+/// size and matches `du` once the store is closed.
+fn dir_size(dir: &Path) -> u64 {
     let mut total = 0u64;
-    if let Ok(md) = std::fs::metadata(dir) {
-        if md.is_file() {
-            return md.blocks() * 512;
-        }
-    }
     if let Ok(rd) = std::fs::read_dir(dir) {
         for e in rd.flatten() {
-            total += disk_blocks(&e.path());
+            let Ok(md) = std::fs::metadata(e.path()) else { continue };
+            if md.is_file() {
+                total += md.len();
+            } else if md.is_dir() {
+                total += dir_size(&e.path());
+            }
         }
     }
     total

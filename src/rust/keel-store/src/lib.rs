@@ -18,13 +18,16 @@
 //! interop path in `keel-core`.
 
 pub mod chunk;
+pub mod delta;
 pub mod object;
 pub mod repo;
 pub mod snapshot;
 pub mod store;
+pub mod textdiff;
 
 pub use object::{Change, DecodeError, Object, ObjectId, Session, Tree, TreeEntry, Verification};
-pub use repo::Repo;
+pub use repo::{ChangeKind, PathChange, Repo};
+pub use textdiff::{diff_lines, DiffLine, Hunk, Tag};
 pub use store::{Store, StoreError};
 
 #[cfg(test)]
