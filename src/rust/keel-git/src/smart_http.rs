@@ -33,7 +33,7 @@ pub fn advertisement(store: &Store, service: &str) -> io::Result<Vec<u8>> {
     let caps = if service == "git-receive-pack" {
         format!("report-status delete-refs ofs-delta {AGENT}")
     } else {
-        format!("multi_ack_detailed no-done object-format=sha1 {AGENT}")
+        format!("multi_ack_detailed no-done shallow object-format=sha1 {AGENT}")
     };
     if refs.is_empty() {
         let zero = "0".repeat(40);
@@ -52,55 +52,52 @@ pub fn advertisement(store: &Store, service: &str) -> io::Result<Vec<u8>> {
     Ok(out)
 }
 
-/// The `POST /git-upload-pack` response for `request` (the client's want/have/done pkt-lines):
-/// `NAK` followed by an undeltified packfile of everything reachable from the wants. (No `have`
-/// negotiation yet — this always sends a full pack, correct for `clone` and a first `fetch`.)
+/// The `POST /git-upload-pack` response. Handles the basic (full) exchange — `NAK` + packfile — and
+/// the two-round `deepen` (shallow / `--depth`) exchange: round 1 (`deepen`, no `done`) returns the
+/// `shallow` boundary lines only; round 2 (`done`) returns them again followed by `NAK` + the pack.
+/// (No `have` negotiation yet — a full pack is sent, correct for `clone` and a first `fetch`.)
 pub fn upload_pack(store: &Store, request: &[u8]) -> io::Result<Vec<u8>> {
     let mut wants: Vec<Oid> = Vec::new();
-    let mut client_shallow = false; // did the client ask for a shallow/depth clone?
+    let mut deepen = false;
+    let mut done = false;
     let mut pos = 0;
     while let Some(pkt) = pktline::read_at(request, &mut pos) {
         if let pktline::Pkt::Line(line) = pkt {
             if let Some(rest) = line.strip_prefix(b"want ") {
-                // "want <40-hex>[ caps...]\n"
                 let hex = &rest[..rest.len().min(40)];
                 if let Ok(oid) = Oid::from_hex(hex) {
                     wants.push(oid);
                 }
-            } else if line.starts_with(b"deepen") || line.starts_with(b"shallow ") {
-                client_shallow = true;
+            } else if line.starts_with(b"deepen") {
+                deepen = true;
+            } else if line.starts_with(b"done") {
+                done = true;
             }
         }
     }
-    // Reachable object set (only objects actually present in the mirror).
+
     let oids = server::reachable(store, &wants)?;
     let present: HashSet<[u8; 20]> = oids.iter().map(|o| *o.as_bytes()).collect();
 
-    // Shallow boundaries: a mirror imported at a depth (`keel clone --depth 1`) holds commits whose
-    // parents aren't present. If the client asked for a shallow/depth clone, tell it which commits
-    // are shallow so it doesn't expect the missing parents. We only send these when the client
-    // requested shallow — an unsolicited `shallow` line breaks a normal clone (which expects
-    // ACK/NAK next). So a shallow mirror is cloneable with `git clone --depth N`; a full mirror
-    // serves any clone.
-    let mut shallows = Vec::new();
-    if client_shallow {
+    let mut out = Vec::new();
+    if deepen {
+        // Shallow boundary: reachable commits whose parents aren't present (a depth-limited /
+        // depth-imported mirror). Tell the client so it doesn't expect the missing parents.
         for oid in &oids {
             if let Some((Kind::Commit, payload)) = mirror::get_object(store, oid)? {
                 let parents = Headed::parse(&payload).parents().unwrap_or_default();
                 if parents.iter().any(|p| !present.contains(p.as_bytes())) {
-                    shallows.push(*oid);
+                    out.extend(pktline::encode(format!("shallow {}\n", oid.to_hex()).as_bytes()));
                 }
             }
         }
+        out.extend_from_slice(pktline::FLUSH);
+        if !done {
+            return Ok(out); // round 1: shallow-info only, no pack yet
+        }
     }
 
-    let mut out = Vec::new();
-    for s in &shallows {
-        out.extend(pktline::encode(format!("shallow {}\n", s.to_hex()).as_bytes()));
-    }
-    if !shallows.is_empty() {
-        out.extend_from_slice(pktline::FLUSH);
-    }
+    // round 2 (or a non-deepen clone): NAK then the pack of everything reachable
     out.extend(pktline::encode_str("NAK\n"));
     let mut objects = Vec::with_capacity(oids.len());
     for oid in &oids {
@@ -108,7 +105,7 @@ pub fn upload_pack(store: &Store, request: &[u8]) -> io::Result<Vec<u8>> {
             objects.push(obj);
         }
     }
-    out.extend_from_slice(&crate::pack::write(&objects));
+    out.extend_from_slice(&server::pack_bytes(&objects));
     Ok(out)
 }
 
