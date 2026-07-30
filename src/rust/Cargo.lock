@@ -429,6 +429,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "keel-daemon"
+version = "0.1.0"
+dependencies = [
+ "keel-brief",
+ "serde_json",
+]
+
+[[package]]
 name = "keel-graph"
 version = "0.1.0"
 dependencies = [
