@@ -10,6 +10,8 @@ heed = "0.20"
 # pure-Rust DEFLATE (no C toolchain dep) — stored object/chunk values are compressed so a
 # source tree doesn't cost MORE on disk than the raw files (see NEW-1109).
 miniz_oxide = "0.8"
+# ripgrep's gitignore matcher — real .gitignore/.keelignore semantics (anchoring, negation, **).
+ignore = "0.4"
 
 [dev-dependencies]
 keel-resolve = { path = "../keel-resolve" }

@@ -6,6 +6,7 @@
 //! on encode) — so `snapshot ∘ checkout ∘ snapshot` is the identity on the address.
 //! Identical file content deduplicates to one blob.
 
+use crate::ignorerules::Ignore;
 use crate::object::{Object, ObjectId, Tree, TreeEntry};
 use crate::store::{Result, StatEntry, Store, StoreError};
 use std::collections::HashMap;
@@ -20,19 +21,6 @@ pub const MODE_DIR: u32 = 0o040000;
 /// Flush the in-memory object batch once it holds this much blob content, so ingesting a
 /// huge tree bounds memory instead of building every object up front (NEW-1109 #3).
 const FLUSH_BYTES: usize = 256 * 1024 * 1024;
-
-/// Names skipped during snapshot — build artifacts + VCS internals. `.keel` is keel's own
-/// metadata/store dir (the analogue of `.git`); it MUST be skipped or a repo whose store
-/// lives under its own working tree would version its own database. A real ignore policy
-/// (.gitignore / .keelignore) is a follow-up; this is a sane default so snapshotting a repo
-/// root doesn't ingest `node_modules`, `.git`, `.keel`, etc.
-const IGNORED: &[&str] = &[".keel", "node_modules", ".git", "target", "dist", "build"];
-
-/// Whether a path component is skipped by snapshotting (build artifacts + VCS internals). Shared
-/// with [`crate::livestatus`] so the warm status tracker ignores exactly what snapshots ignore.
-pub fn is_ignored(name: &str) -> bool {
-    IGNORED.contains(&name)
-}
 
 /// Snapshot `dir` recursively, returning the root tree's address. Symlinks and other
 /// non-regular files are skipped (a real ignore policy comes later).
@@ -71,7 +59,8 @@ pub fn snapshot_ro(store: &Store, dir: &Path) -> Result<(ObjectId, HashMap<Objec
     let (cache, epoch) = store.load_stat_cache()?;
     let mut trees = HashMap::new();
     let mut updates = Vec::new();
-    let root = build_ro(dir, "", &cache, epoch, &mut trees, &mut updates)?;
+    let ig = Ignore::load(dir);
+    let root = build_ro(dir, "", &ig, &cache, epoch, &mut trees, &mut updates)?;
     // Refresh the stat cache with any files we had to (re)hash — just as `git status`
     // opportunistically rewrites its index's stat info. On a fully clean, warm tree `updates`
     // is empty and `put_stat_cache` is a no-op, so a repeat `status` writes nothing at all.
@@ -82,6 +71,7 @@ pub fn snapshot_ro(store: &Store, dir: &Path) -> Result<(ObjectId, HashMap<Objec
 fn build_ro(
     dir: &Path,
     rel: &str,
+    ig: &Ignore,
     cache: &HashMap<String, StatEntry>,
     epoch: u64,
     trees: &mut HashMap<ObjectId, Tree>,
@@ -96,16 +86,17 @@ fn build_ro(
             continue;
         }
         let name = de.file_name().to_string_lossy().into_owned();
-        if IGNORED.contains(&name.as_str()) {
+        let path = join(&name);
+        if ig.is_ignored(&path, ft.is_dir()) {
             continue;
         }
         if ft.is_dir() {
-            let id = build_ro(&de.path(), &join(&name), cache, epoch, trees, updates)?;
+            let child = ig.descend(&path, &de.path());
+            let id = build_ro(&de.path(), &path, &child, cache, epoch, trees, updates)?;
             entries.push(TreeEntry { name, mode: MODE_DIR, id });
         } else if ft.is_file() {
             let md = de.metadata()?;
             let (mode, size, mtime) = (mode_from_meta(&md), md.len(), mtime_ns(&md));
-            let path = join(&name);
             // Same stat-cache fast path + racy-git guard as `build`, but a miss only hashes the
             // file in memory to learn its id — status never needs to persist the blob, only to
             // remember its stat entry so the next `status` is a stat-only walk.
@@ -135,7 +126,8 @@ fn snapshot_impl(store: &Store, dir: &Path, use_cache: bool) -> Result<ObjectId>
     let (cache, epoch) = if use_cache { store.load_stat_cache()? } else { (HashMap::new(), 0) };
     let mut ctx =
         SnapCtx { store, cache, epoch, use_cache, objs: Vec::new(), pending_bytes: 0, updates: Vec::new() };
-    let root = build(&mut ctx, dir, "")?;
+    let ig = Ignore::load(dir);
+    let root = build(&mut ctx, dir, "", &ig)?;
     if !ctx.objs.is_empty() {
         store.put_many(&ctx.objs)?; // flush the tail
     }
@@ -178,7 +170,7 @@ impl SnapCtx<'_> {
     }
 }
 
-fn build(ctx: &mut SnapCtx, dir: &Path, rel: &str) -> Result<ObjectId> {
+fn build(ctx: &mut SnapCtx, dir: &Path, rel: &str, ig: &Ignore) -> Result<ObjectId> {
     let join = |name: &str| if rel.is_empty() { name.to_string() } else { format!("{rel}/{name}") };
     let mut entries = Vec::new();
     for de in fs::read_dir(dir)? {
@@ -188,16 +180,17 @@ fn build(ctx: &mut SnapCtx, dir: &Path, rel: &str) -> Result<ObjectId> {
             continue;
         }
         let name = de.file_name().to_string_lossy().into_owned();
-        if IGNORED.contains(&name.as_str()) {
+        let path = join(&name);
+        if ig.is_ignored(&path, ft.is_dir()) {
             continue;
         }
         if ft.is_dir() {
-            let id = build(ctx, &de.path(), &join(&name))?;
+            let child = ig.descend(&path, &de.path());
+            let id = build(ctx, &de.path(), &path, &child)?;
             entries.push(TreeEntry { name, mode: MODE_DIR, id });
         } else if ft.is_file() {
             let md = de.metadata()?;
             let (mode, size, mtime) = (mode_from_meta(&md), md.len(), mtime_ns(&md));
-            let path = join(&name);
             // stat-cache fast path: unchanged mtime+size AND the blob is still present →
             // reuse its id, skipping read+hash+store entirely.
             let cached =

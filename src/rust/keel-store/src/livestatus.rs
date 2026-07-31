@@ -7,6 +7,7 @@
 //! path and reclassifies it against head. So a repeat `status` over the socket is O(changed),
 //! not O(tree) — which is what closes the gap to git's index scan on a large repo.
 
+use crate::ignorerules::Ignore;
 use crate::object::{Object, ObjectId};
 use crate::repo::{ChangeKind, PathChange, Repo};
 use crate::snapshot;
@@ -36,7 +37,7 @@ impl LiveStatus {
         }
         let (cache, epoch) = store.load_stat_cache()?;
         let mut work = HashMap::new();
-        walk_work(root, "", &cache, epoch, &mut work)?;
+        walk_work(root, "", &Ignore::load(root), &cache, epoch, &mut work)?;
         let mut ls = LiveStatus { root: root.to_path_buf(), head_id, head, work, dirty: BTreeMap::new() };
         ls.recompute_all();
         Ok(ls)
@@ -83,17 +84,19 @@ impl LiveStatus {
     fn rel_of(&self, abs: &Path) -> Option<String> {
         let rel = abs.strip_prefix(&self.root).ok()?;
         let s = rel.to_string_lossy().replace('\\', "/");
-        if s.is_empty() || s.split('/').any(|c| snapshot::is_ignored(c)) {
+        if s.is_empty() {
             return None;
         }
         Some(s)
     }
 
-    /// Re-stat one working-tree path, update its warm entry, and reclassify it against head.
+    /// Re-stat one working-tree path, update its warm entry, and reclassify it against head. An
+    /// ignored path (`.gitignore`/`.keelignore`) is treated as absent, so a changed build artifact
+    /// never shows up as dirty — matching git.
     fn refresh_path(&mut self, rel: &str) {
         let abs = self.root.join(rel);
         match fs::symlink_metadata(&abs) {
-            Ok(md) if md.is_file() => {
+            Ok(md) if md.is_file() && !Ignore::resolve(&self.root, rel, false) => {
                 let (size, mtime) = (md.len(), mtime_ns(&md));
                 let unchanged = self.work.get(rel).is_some_and(|&(m, s, _)| m == mtime && s == size);
                 if !unchanged {
@@ -103,7 +106,7 @@ impl LiveStatus {
                     }
                 }
             }
-            _ => { self.work.remove(rel); } // deleted, or became a dir/symlink
+            _ => { self.work.remove(rel); } // deleted, ignored, or became a dir/symlink
         }
         self.reclassify(rel);
     }
@@ -160,6 +163,7 @@ fn flatten_head(
 fn walk_work(
     dir: &Path,
     rel: &str,
+    ig: &Ignore,
     cache: &HashMap<String, (u64, u64, ObjectId)>,
     epoch: u64,
     out: &mut HashMap<String, (u64, u64, ObjectId)>,
@@ -172,12 +176,12 @@ fn walk_work(
             continue;
         }
         let name = de.file_name().to_string_lossy().into_owned();
-        if snapshot::is_ignored(&name) {
+        let path = if rel.is_empty() { name } else { format!("{rel}/{name}") };
+        if ig.is_ignored(&path, ft.is_dir()) {
             continue;
         }
-        let path = if rel.is_empty() { name } else { format!("{rel}/{name}") };
         if ft.is_dir() {
-            walk_work(&de.path(), &path, cache, epoch, out)?;
+            walk_work(&de.path(), &path, &ig.descend(&path, &de.path()), cache, epoch, out)?;
         } else if ft.is_file() {
             let md = de.metadata()?;
             let (size, mtime) = (md.len(), mtime_ns(&md));
