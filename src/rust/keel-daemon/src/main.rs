@@ -10,7 +10,12 @@
 //! incrementally (cheap — only changed files) so it stays live to the working tree.
 //!
 //! Ops: `{op:"ping"}` · `{op:"brief", task, file, symbol?, budget?, reserve?}` ·
-//! `{op:"status"}` (warm, O(changed) working-tree status via an fs-watch-fed [`LiveStatus`]).
+//! `{op:"status"}` (warm, O(changed) working-tree status via an fs-watch-fed [`LiveStatus`]) ·
+//! `{op:"announce", event}` (broadcast a coordination event to the fleet).
+//!
+//! With `--quic [host:port]` the daemon also runs a QUIC coordination server (shared store): every
+//! brief broadcasts an "agent working on file X" presence event and `announce` pushes lessons /
+//! landed changes, so remote agents subscribed via `keel net-events` coordinate live over the wire.
 
 use keel_brief::BriefService;
 use keel_store::LiveStatus;
@@ -40,6 +45,55 @@ struct Ctx {
     live: Option<Mutex<LiveStatus>>,
     pending: Arc<Mutex<Pending>>, // shared with the status watcher's callback
     _status_watcher: Mutex<Option<notify::RecommendedWatcher>>,
+    coord: Option<keel_net::Publisher>, // broadcasts fleet-coordination events over QUIC
+}
+
+/// Start a QUIC coordination server on a background tokio runtime and return a synchronous
+/// [`Publisher`](keel_net::Publisher). The server shares the daemon's object store (an Arc clone —
+/// NOT a second LMDB open) so remote agents can fetch objects and subscribe to the same event
+/// stream. `addr` is `host:port` (`0` picks a free port); the runtime thread lives for the
+/// daemon's lifetime.
+fn start_quic(addr: &str, store: keel_store::Store) -> Option<keel_net::Publisher> {
+    // Accept "host:port" or a bare port (bound on all interfaces).
+    let sockaddr: std::net::SocketAddr = addr
+        .parse()
+        .or_else(|_| addr.parse::<u16>().map(|p| ([0, 0, 0, 0], p).into()))
+        .ok()?;
+    let (tx, rx) = sync_channel::<Result<(keel_net::Publisher, std::net::SocketAddr), String>>(1);
+    std::thread::spawn(move || {
+        let rt = match tokio::runtime::Builder::new_multi_thread().enable_all().build() {
+            Ok(rt) => rt,
+            Err(e) => {
+                let _ = tx.send(Err(e.to_string()));
+                return;
+            }
+        };
+        rt.block_on(async move {
+            match keel_net::Server::bind(sockaddr, store).await {
+                Ok(server) => {
+                    let _ = tx.send(Ok((server.publisher(), server.local_addr())));
+                    std::future::pending::<()>().await; // keep the runtime + server alive
+                }
+                Err(e) => {
+                    let _ = tx.send(Err(e.to_string()));
+                }
+            }
+        });
+    });
+    match rx.recv() {
+        Ok(Ok((publisher, bound))) => {
+            eprintln!("keeld: QUIC coordination serving on {bound}");
+            Some(publisher)
+        }
+        Ok(Err(e)) => {
+            eprintln!("keeld: QUIC coordination disabled (bind failed: {e})");
+            None
+        }
+        Err(_) => {
+            eprintln!("keeld: QUIC coordination disabled (runtime did not start)");
+            None
+        }
+    }
 }
 
 /// Max connections served concurrently. Brief handling serializes behind the service mutex,
@@ -131,11 +185,22 @@ fn main() {
     // full with MAX_INFLIGHT tokens; the accept loop takes one before spawning a worker
     // (blocking, so a flood applies back-pressure instead of spawning unbounded threads),
     // and the worker returns it when the connection is done.
+    // Optional QUIC coordination server: `--quic [host:port]` (default 0.0.0.0:0 → a free port).
+    // With it up, every brief broadcasts "an agent is working on file X" and `keel announce`
+    // pushes lessons/commits to the fleet — live coordination over the wire, not just the socket.
+    let coord = if args.iter().any(|a| a == "--quic") {
+        let addr = flag(&args, "--quic").unwrap_or("0.0.0.0:0");
+        start_quic(addr, svc.repo().store().clone())
+    } else {
+        None
+    };
+
     let ctx = Arc::new(Ctx {
         svc: Mutex::new(svc),
         live,
         pending,
         _status_watcher: Mutex::new(status_watcher),
+        coord,
     });
     let (slot_tx, slot_rx) = sync_channel::<()>(MAX_INFLIGHT);
     for _ in 0..MAX_INFLIGHT {
@@ -235,14 +300,42 @@ fn status_response(ctx: &Ctx) -> Value {
     json!({"ok": true, "changes": changes})
 }
 
+/// Wall-clock seconds since the epoch, for stamping coordination events.
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Broadcast a coordination event over QUIC (no-op if the server isn't running / no subscribers).
+fn broadcast(ctx: &Ctx, event: &Value) {
+    if let Some(pubr) = &ctx.coord {
+        if let Ok(bytes) = serde_json::to_vec(event) {
+            pubr.publish(bytes);
+        }
+    }
+}
+
 /// Dispatch one request against the warm service.
 fn handle(ctx: &Ctx, req: &Value) -> Value {
     match req.get("op").and_then(Value::as_str) {
         Some("ping") => json!({"ok": true, "pong": true}),
         Some("status") => status_response(ctx),
+        // Push an arbitrary coordination event to the fleet — e.g. `keel learn` / `keel commit`
+        // announcing a lesson or a landed change so subscribed agents see it live.
+        Some("announce") => {
+            let Some(event) = req.get("event") else {
+                return json!({"ok": false, "error": "event is required"});
+            };
+            let mut event = event.clone();
+            if let Value::Object(m) = &mut event {
+                m.entry("ts").or_insert(json!(now_secs()));
+            }
+            broadcast(ctx, &event);
+            json!({"ok": true, "broadcast": ctx.coord.is_some()})
+        }
         Some("brief") => {
-            let mut svc = ctx.svc.lock().unwrap();
-            let svc = &mut *svc;
             let Some(file) = req.get("file").and_then(Value::as_str) else {
                 return json!({"ok": false, "error": "file is required"});
             };
@@ -250,9 +343,15 @@ fn handle(ctx: &Ctx, req: &Value) -> Value {
             let symbol = req.get("symbol").and_then(Value::as_str);
             let budget = req.get("budget").and_then(Value::as_u64).unwrap_or(8000) as usize;
             let reserve = req.get("reserve").and_then(Value::as_bool).unwrap_or(false);
+            let agent = req.get("agent").and_then(Value::as_str).unwrap_or("local").to_string();
+            // Fleet presence: broadcast that this agent is about to work on `file`, so other
+            // agents/dashboards see who's working where in real time (coordination, not just data).
+            broadcast(ctx, &json!({"kind": "brief", "agent": agent, "file": file, "task": task, "ts": now_secs()}));
+            let mut svc = ctx.svc.lock().unwrap();
+            let svc = &mut *svc;
             // per-request agent id — the shared coordinator evaluates reservations/predictions
             // against THIS agent, so many agents coordinate through the one warm daemon.
-            svc.set_agent(req.get("agent").and_then(Value::as_str).unwrap_or("local"));
+            svc.set_agent(&agent);
             // keep the graph live: incremental refresh (only changed files) before answering
             if let Err(e) = svc.refresh() {
                 return json!({"ok": false, "error": format!("refresh: {e}")});
