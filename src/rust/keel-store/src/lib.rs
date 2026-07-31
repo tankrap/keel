@@ -35,6 +35,27 @@ pub use repo::{ChangeKind, PathChange, Repo};
 pub use textdiff::{diff_lines, DiffLine, Hunk, Tag};
 pub use store::{Store, StoreError};
 
+/// The daemon's Unix socket path for `root`. Normally `<root>/.keel/daemon.sock`, but Unix socket
+/// paths are capped (`sun_path` is 104 bytes on macOS, 108 on Linux); for a deep repo path that
+/// limit is easily exceeded, and `bind()` fails so the daemon silently never comes up. When the
+/// natural path is too long, fall back to a short, stable path under `/tmp` keyed by a hash of the
+/// canonicalized root, so the daemon and every client independently agree on the same socket.
+///
+/// The daemon and CLI MUST both call this so they compute the identical path.
+pub fn daemon_socket_path(root: &std::path::Path) -> std::path::PathBuf {
+    let natural = root.join(".keel/daemon.sock");
+    // Leave headroom below the smaller (macOS) limit for the trailing NUL.
+    const MAX_SUN_PATH: usize = 100;
+    if natural.as_os_str().len() <= MAX_SUN_PATH {
+        return natural;
+    }
+    // Hash the canonical root (fall back to the raw path if canonicalize fails) so the short path
+    // is stable across processes and unique per repo.
+    let canon = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    let digest = blake3::hash(canon.as_os_str().as_encoded_bytes());
+    std::path::PathBuf::from(format!("/tmp/keel-{}.sock", &digest.to_hex()[..16]))
+}
+
 #[cfg(test)]
 pub(crate) mod testutil {
     use std::path::{Path, PathBuf};

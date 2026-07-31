@@ -117,10 +117,8 @@ fn fix_hint(msg: &str) -> Option<String> {
         Some("run `keel commit -m \"…\"` first".into())
     } else if m.contains("not a git repo") || m.contains("no .keel") || m.contains("not a keel repo") {
         Some("run `keel init` in the repository root".into())
-    } else if let Some(rest) = msg.split_once("usage:") {
-        Some(format!("usage:{}", rest.1))
     } else {
-        None
+        msg.split_once("usage:").map(|rest| format!("usage:{}", rest.1))
     }
 }
 
@@ -151,8 +149,28 @@ fn print_usage() {
 
 fn cmd_init(args: &[String]) -> io::Result<()> {
     // git init first (drop-in), passing through any positional dir / git flags, then set up the
-    // keel store alongside so the repo is both git- and keel-tracked from the start.
-    let status = std::process::Command::new("git").arg("init").args(args).status();
+    // keel store alongside so the repo is both git- and keel-tracked from the start. keel's own
+    // flags (--root/--store/--resolver, each with a value) are not git's — strip them, and when
+    // --root names the target without a positional dir, hand git that root as the directory.
+    let mut git_args: Vec<&String> = Vec::new();
+    let mut skip = false;
+    for a in args {
+        if skip {
+            skip = false;
+            continue;
+        }
+        if a == "--root" || a == "--store" || a == "--resolver" {
+            skip = true;
+            continue;
+        }
+        git_args.push(a);
+    }
+    let mut git = std::process::Command::new("git");
+    git.arg("init").args(&git_args);
+    if flag(args, "--root").is_some() && !git_args.iter().any(|a| !a.starts_with('-')) {
+        git.arg(flag(args, "--root").unwrap());
+    }
+    let status = git.status();
     match status {
         Ok(s) if s.success() => {}
         Ok(_) => std::process::exit(1),
@@ -1481,35 +1499,46 @@ fn cmd_import(args: &[String]) -> io::Result<()> {
     let store = PathBuf::from(into).join(".keel/store");
     let repo = Repo::open(&store).map_err(to_io)?;
 
-    // first-parent history, oldest→newest, unit-separator delimited
+    // Full DAG reachable from HEAD, in topological order (parents before children), each line:
+    //   <hash> \x1f <space-separated parent hashes> \x1f <author> \x1f <ts> \x1f <subject>
+    // Preserving every parent (not just the first) keeps merge commits and merged-in branches.
     let log = Command::new("git")
-        .args(["-C", src, "log", "--first-parent", "--reverse", "--format=%H%x1f%an%x1f%at%x1f%s"])
+        .args(["-C", src, "log", "--topo-order", "--reverse", "--format=%H%x1f%P%x1f%an%x1f%at%x1f%s"])
         .output()?;
     if !log.status.success() {
         return Err(io::Error::other(format!("git log failed in {src} (not a git repo?)")));
     }
-    let mut commits: Vec<(String, String, u64, String)> = String::from_utf8_lossy(&log.stdout)
+    let mut commits: Vec<(String, Vec<String>, String, u64, String)> = String::from_utf8_lossy(&log.stdout)
         .lines()
         .filter_map(|l| {
             let mut p = l.split('\u{1f}');
-            Some((
-                p.next()?.to_string(),
-                p.next()?.to_string(),
-                p.next()?.parse().unwrap_or(0),
-                p.next().unwrap_or("").to_string(),
-            ))
+            let hash = p.next()?.to_string();
+            let parents = p.next()?.split_whitespace().map(str::to_string).collect();
+            let author = p.next()?.to_string();
+            let ts = p.next()?.parse().unwrap_or(0);
+            let msg = p.next().unwrap_or("").to_string();
+            Some((hash, parents, author, ts, msg))
         })
         .collect();
     let total = commits.len();
     if commits.len() > limit {
-        commits = commits.split_off(total - limit); // keep the most recent `limit`
+        // Keep the most recent `limit` in topo order; any parent that falls outside the kept set is
+        // dropped when mapped below (that commit becomes a root), so no edge dangles.
+        commits = commits.split_off(total - limit);
         eprintln!("keel import: {total} commits found; importing the most recent {limit} (raise with --limit)");
     }
 
+    // The branch tip to point at when done (keel id of git's HEAD commit).
+    let head_hash = Command::new("git").args(["-C", src, "rev-parse", "HEAD"]).output()?;
+    let head_hash = String::from_utf8_lossy(&head_hash.stdout).trim().to_string();
+
+    // Hold the commit lock across the ENTIRE replay: the changes are stored but unreferenced until
+    // the final `set_branch`, so a concurrent GC in between would sweep them (see Store::gc).
+    let _lock = repo.store().commit_lock().map_err(to_io)?;
     let base = std::env::temp_dir().join(format!("keel-import-{}", std::process::id()));
-    let mut last = None;
+    let mut map: std::collections::HashMap<String, keel_store::ObjectId> = std::collections::HashMap::new();
     let mut n = 0usize;
-    for (hash, author, ts, msg) in &commits {
+    for (hash, parents, author, ts, msg) in &commits {
         // materialize each commit into a FRESH, empty dir (git archive → tar). A reused dir
         // is wrong: tar extracts over stale files first-write-wins, so trees accumulate.
         let work = base.join(n.to_string());
@@ -1522,23 +1551,35 @@ fn cmd_import(args: &[String]) -> io::Result<()> {
             return Err(io::Error::other(format!("could not materialize tree for {}", short(hash))));
         }
         let intent = if msg.is_empty() { "(no message)" } else { msg.as_str() };
-        // uncached: distinct trees at identical paths in rapid succession would racily
+        // Map git parents → keel ids (topo order guarantees parents are already imported); a parent
+        // trimmed by --limit is simply omitted, making this commit a root on the keel side.
+        let mapped: Vec<keel_store::ObjectId> = parents.iter().filter_map(|p| map.get(p).copied()).collect();
+        // uncached snapshot: distinct trees at identical paths in rapid succession would racily
         // false-hit the mtime+size stat cache.
-        last = Some(repo.commit_dir_uncached(&work, intent, author, *ts, None).map_err(to_io)?);
+        let tree = keel_store::snapshot::snapshot_uncached(repo.store(), &work).map_err(to_io)?;
+        let keel_id =
+            repo.commit_tree_with_parents(tree, mapped, intent, author, *ts, None).map_err(to_io)?;
+        map.insert(hash.clone(), keel_id);
         let _ = std::fs::remove_dir_all(&work); // one tree on disk at a time
         n += 1;
     }
     let _ = std::fs::remove_dir_all(&base);
-    match last {
-        Some(id) => println!("imported {n} commits into {} · HEAD {}", store.display(), short(&id.to_hex())),
+    // Advance the branch to the keel id of git's HEAD (fall back to the last imported commit).
+    let head_id = map.get(&head_hash).copied().or_else(|| commits.last().and_then(|c| map.get(&c.0).copied()));
+    match head_id {
+        Some(id) => {
+            repo.set_branch(id).map_err(to_io)?;
+            println!("imported {n} commits into {} · HEAD {}", store.display(), short(&id.to_hex()));
+        }
         None => println!("nothing to import (no commits found)"),
     }
     Ok(())
 }
 
-/// `keel export <git-dir>` — mirror keel's first-parent history INTO a git repo (keel→git),
-/// the removable coexistence bridge for human reviewers on GitHub during transition. keel
-/// stays the system of record; this writes a git *copy*. Preserves author / message / date.
+/// `keel export <git-dir>` — mirror keel's history INTO a git repo (keel→git), the removable
+/// coexistence bridge for human reviewers on GitHub during transition. keel stays the system of
+/// record; this writes a git *copy*. Preserves author / message / date AND the full commit DAG
+/// (merges keep every parent), using `git commit-tree` so the topology round-trips.
 fn cmd_export(args: &[String]) -> io::Result<()> {
     use std::process::Command;
     let dst = args
@@ -1549,47 +1590,113 @@ fn cmd_export(args: &[String]) -> io::Result<()> {
     let (_, store) = root_store(args)?;
     let repo = Repo::open(&store).map_err(to_io)?;
 
-    let mut hist = repo.log().map_err(to_io)?; // newest → oldest
-    hist.reverse(); // oldest → newest
-    if hist.len() > limit {
-        let keep = hist.split_off(hist.len() - limit); // most-recent `limit`
-        eprintln!("keel export: {} commits; exporting the most recent {limit}", hist.len() + keep.len());
-        hist = keep;
+    let Some(head) = repo.head().map_err(to_io)? else {
+        println!("nothing to export (empty repo)");
+        return Ok(());
+    };
+    // All changes reachable from HEAD via every parent edge, topologically ordered (parents before
+    // children) so each commit-tree can reference already-written parents.
+    let mut order = topo_changes(&repo, head)?;
+    if order.len() > limit {
+        let total = order.len();
+        order = order.split_off(total - limit); // keep the most recent `limit` (parents dropped below)
+        eprintln!("keel export: {total} commits; exporting the most recent {limit}");
     }
 
     let dstp = PathBuf::from(dst);
     std::fs::create_dir_all(&dstp)?;
     let git = |a: &[&str]| Command::new("git").arg("-C").arg(&dstp).args(a).status();
     git(&["init", "-q"])?;
-    git(&["config", "user.email", "keel@local"])?;
-    git(&["config", "user.name", "keel-export"])?;
 
     let work = std::env::temp_dir().join(format!("keel-export-{}", std::process::id()));
+    let mut map: std::collections::HashMap<keel_store::ObjectId, String> = std::collections::HashMap::new();
     let mut n = 0usize;
-    for id in &hist {
+    let mut head_git = String::new();
+    for id in &order {
         let c = repo.change(*id).map_err(to_io)?.ok_or_else(|| io::Error::other("missing change"))?;
+        // Stage this change's tree into the git index → a git tree object.
         let _ = std::fs::remove_dir_all(&work);
         std::fs::create_dir_all(&work)?;
-        repo.checkout_change(*id, &work).map_err(to_io)?; // materialize keel tree
-        clear_worktree(&dstp)?; // drop tracked files (keep .git) so deletes propagate
+        repo.checkout_change(*id, &work).map_err(to_io)?;
+        clear_worktree(&dstp)?;
         copy_dir(&work, &dstp)?;
         Command::new("git").arg("-C").arg(&dstp).args(["add", "-A"]).status()?;
-        let author = format!("{} <keel@local>", c.author);
-        let date = format!("@{}", c.timestamp);
-        let intent = if c.intent.is_empty() { "(no message)".to_string() } else { c.intent.clone() };
-        let ok = Command::new("git")
-            .arg("-C").arg(&dstp)
-            .args(["commit", "--allow-empty", "-q", "-m", &intent, "--author", &author, "--date", &date])
-            .env("GIT_COMMITTER_DATE", &date)
-            .status()?;
-        if !ok.success() {
-            return Err(io::Error::other(format!("git commit failed at keel change {}", short(&id.to_hex()))));
+        let tree_out = Command::new("git").arg("-C").arg(&dstp).arg("write-tree").output()?;
+        if !tree_out.status.success() {
+            return Err(io::Error::other(format!("git write-tree failed at keel change {}", short(&id.to_hex()))));
         }
+        let tree_hash = String::from_utf8_lossy(&tree_out.stdout).trim().to_string();
+
+        // commit-tree with every mapped parent (a parent trimmed by --limit is simply omitted).
+        let date = format!("@{} +0000", c.timestamp);
+        let intent = if c.intent.is_empty() { "(no message)".to_string() } else { c.intent.clone() };
+        let mut cmd = Command::new("git");
+        cmd.arg("-C").arg(&dstp).args(["commit-tree", &tree_hash]);
+        for p in &c.parents {
+            if let Some(gp) = map.get(p) {
+                cmd.args(["-p", gp]);
+            }
+        }
+        let commit_out = cmd
+            .args(["-m", &intent])
+            .env("GIT_AUTHOR_NAME", &c.author)
+            .env("GIT_AUTHOR_EMAIL", "keel@local")
+            .env("GIT_AUTHOR_DATE", &date)
+            .env("GIT_COMMITTER_NAME", "keel-export")
+            .env("GIT_COMMITTER_EMAIL", "keel@local")
+            .env("GIT_COMMITTER_DATE", &date)
+            .output()?;
+        if !commit_out.status.success() {
+            return Err(io::Error::other(format!("git commit-tree failed at keel change {}", short(&id.to_hex()))));
+        }
+        let git_hash = String::from_utf8_lossy(&commit_out.stdout).trim().to_string();
+        head_git = git_hash.clone();
+        map.insert(*id, git_hash);
         n += 1;
     }
     let _ = std::fs::remove_dir_all(&work);
+    // Point the branch (and HEAD's tip on disk) at the exported HEAD commit.
+    if let Some(h) = map.get(&head) {
+        head_git = h.clone();
+    }
+    if !head_git.is_empty() {
+        git(&["update-ref", &format!("refs/heads/{}", repo.branch()), &head_git])?;
+        git(&["symbolic-ref", "HEAD", &format!("refs/heads/{}", repo.branch())])?;
+        Command::new("git").arg("-C").arg(&dstp).args(["checkout", "-q", "-f", repo.branch()]).status()?;
+    }
     println!("exported {n} commits to {dst} (git mirror; keel remains the system of record)");
     Ok(())
+}
+
+/// Changes reachable from `head` via every parent edge, in topological order (parents before
+/// children) — the order `git commit-tree` needs so a parent is written before its child.
+fn topo_changes(repo: &Repo, head: keel_store::ObjectId) -> io::Result<Vec<keel_store::ObjectId>> {
+    use std::collections::HashMap;
+    let mut order = Vec::new();
+    let mut state: HashMap<keel_store::ObjectId, bool> = HashMap::new(); // present=visited, true=emitted
+    let mut stack = vec![(head, false)];
+    while let Some((id, processed)) = stack.pop() {
+        if processed {
+            if state.get(&id) != Some(&true) {
+                order.push(id);
+                state.insert(id, true);
+            }
+            continue;
+        }
+        if state.contains_key(&id) {
+            continue;
+        }
+        state.insert(id, false);
+        stack.push((id, true));
+        if let Some(c) = repo.change(id).map_err(to_io)? {
+            for p in c.parents {
+                if !state.contains_key(&p) {
+                    stack.push((p, false));
+                }
+            }
+        }
+    }
+    Ok(order)
 }
 
 /// Remove everything in `dir` except `.git` — so re-materializing a tree over it makes git
@@ -1788,7 +1895,7 @@ fn cmd_log(args: &[String]) -> io::Result<()> {
 // ── daemon client ────────────────────────────────────────────────────────────
 
 fn daemon_request(root: &Path, req: &Value) -> Option<Value> {
-    let sock = root.join(".keel/daemon.sock");
+    let sock = keel_store::daemon_socket_path(root);
     let mut stream = UnixStream::connect(&sock).ok()?;
     stream.write_all(serde_json::to_string(req).ok()?.as_bytes()).ok()?;
     stream.write_all(b"\n").ok()?;

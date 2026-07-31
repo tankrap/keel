@@ -12,7 +12,7 @@ use crate::object::{Object, ObjectId};
 use crate::repo::{ChangeKind, PathChange, Repo};
 use crate::snapshot;
 use crate::store::{Result, StoreError};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -37,7 +37,9 @@ impl LiveStatus {
         }
         let (cache, epoch) = store.load_stat_cache()?;
         let mut work = HashMap::new();
-        walk_work(root, "", &Ignore::load(root), &cache, epoch, &mut work)?;
+        // Tracked paths are exempt from ignore rules (git only ignores untracked); see `tracked_set`.
+        let tracked = tracked_set(&head);
+        walk_work(root, "", &Ignore::load(root), &cache, epoch, &mut work, &tracked)?;
         let mut ls = LiveStatus { root: root.to_path_buf(), head_id, head, work, dirty: BTreeMap::new() };
         ls.recompute_all();
         Ok(ls)
@@ -95,7 +97,9 @@ impl LiveStatus {
     /// never shows up as dirty — matching git.
     fn refresh_path(&mut self, rel: &str) {
         let abs = self.root.join(rel);
-        let ignored = Ignore::resolve(&self.root, rel, false);
+        // A tracked path (present in HEAD) is never ignored — git only ignores untracked paths, so
+        // an edit to a force-added ignored file must still register.
+        let ignored = Ignore::resolve(&self.root, rel, false) && !self.head.contains_key(rel);
         match fs::symlink_metadata(&abs) {
             Ok(md) if md.file_type().is_symlink() && !ignored => {
                 match snapshot::symlink_blob_id(&abs) {
@@ -150,6 +154,19 @@ fn flatten_head(
     prefix: String,
     out: &mut HashMap<String, ObjectId>,
 ) -> Result<()> {
+    flatten_head_depth(store, tree, prefix, out, 0)
+}
+
+fn flatten_head_depth(
+    store: &crate::store::Store,
+    tree: ObjectId,
+    prefix: String,
+    out: &mut HashMap<String, ObjectId>,
+    depth: u32,
+) -> Result<()> {
+    if depth > snapshot::MAX_TREE_DEPTH {
+        return Err(StoreError::Corrupt(tree)); // pathologically deep tree — refuse
+    }
     let entries = match store.get(&tree)? {
         Some(Object::Tree(t)) => t.entries,
         _ => return Ok(()),
@@ -157,7 +174,7 @@ fn flatten_head(
     for e in entries {
         let path = if prefix.is_empty() { e.name.clone() } else { format!("{prefix}/{}", e.name) };
         if e.mode == snapshot::MODE_DIR {
-            flatten_head(store, e.id, path, out)?;
+            flatten_head_depth(store, e.id, path, out, depth + 1)?;
         } else {
             out.insert(path, e.id);
         }
@@ -167,6 +184,23 @@ fn flatten_head(
 
 /// Walk the working tree, populating `path -> (mtime, size, id)` — reusing the stat cache's id
 /// for unchanged files (no hashing), matching the racy-git epoch guard used by snapshots.
+/// Build the set of tracked paths (files + ancestor dirs) from HEAD's flattened file map, so the
+/// working-tree walk can exempt already-tracked paths from ignore rules (git semantics).
+fn tracked_set(head: &HashMap<String, ObjectId>) -> HashSet<String> {
+    let mut set = HashSet::new();
+    for path in head.keys() {
+        let mut idx = 0;
+        while let Some(pos) = path[idx..].find('/') {
+            let end = idx + pos;
+            set.insert(path[..end].to_string());
+            idx = end + 1;
+        }
+        set.insert(path.clone());
+    }
+    set
+}
+
+#[allow(clippy::too_many_arguments)] // recursive walker; args carry the stat cache + tracked set
 fn walk_work(
     dir: &Path,
     rel: &str,
@@ -174,6 +208,7 @@ fn walk_work(
     cache: &HashMap<String, (u64, u64, ObjectId)>,
     epoch: u64,
     out: &mut HashMap<String, (u64, u64, ObjectId)>,
+    tracked: &HashSet<String>,
 ) -> Result<()> {
     let Ok(rd) = fs::read_dir(dir) else { return Ok(()) };
     for de in rd {
@@ -181,7 +216,8 @@ fn walk_work(
         let ft = de.file_type()?;
         let name = de.file_name().to_string_lossy().into_owned();
         let path = if rel.is_empty() { name } else { format!("{rel}/{name}") };
-        if ig.is_ignored(&path, ft.is_dir()) {
+        // git only ignores untracked paths — keep tracked files (and dirs containing them).
+        if ig.is_ignored(&path, ft.is_dir()) && !tracked.contains(&path) {
             continue;
         }
         if ft.is_symlink() {
@@ -190,7 +226,7 @@ fn walk_work(
                 out.insert(path, (0, 0, id));
             }
         } else if ft.is_dir() {
-            walk_work(&de.path(), &path, &ig.descend(&path, &de.path()), cache, epoch, out)?;
+            walk_work(&de.path(), &path, &ig.descend(&path, &de.path()), cache, epoch, out, tracked)?;
         } else if ft.is_file() {
             let md = de.metadata()?;
             let (size, mtime) = (md.len(), mtime_ns(&md));

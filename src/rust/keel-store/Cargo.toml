@@ -12,6 +12,8 @@ heed = "0.20"
 miniz_oxide = "0.8"
 # ripgrep's gitignore matcher — real .gitignore/.keelignore semantics (anchoring, negation, **).
 ignore = "0.4"
+# advisory file locking (flock) so GC and commit are mutually exclusive across processes.
+libc = "0.2"
 
 [dev-dependencies]
 keel-resolve = { path = "../keel-resolve" }

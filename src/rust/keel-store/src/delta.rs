@@ -159,6 +159,9 @@ pub fn sketch(bytes: &[u8], k: usize) -> Vec<u64> {
 /// Reconstruct the target from `base` and an op stream produced by [`compress`]. Returns `None`
 /// on any malformed op or out-of-range COPY (surfaced as store corruption by the caller).
 pub fn expand(base: &[u8], ops: &[u8]) -> Option<Vec<u8>> {
+    // Cap the reconstructed size. A tampered op stream (e.g. repeated full-base COPYs) could
+    // otherwise expand to many gigabytes before the caller re-hashes and rejects it; bail early.
+    const MAX_EXPAND: usize = 4 * 1024 * 1024 * 1024;
     let mut out = Vec::new();
     let mut i = 0usize;
     while i < ops.len() {
@@ -169,11 +172,17 @@ pub fn expand(base: &[u8], ops: &[u8]) -> Option<Vec<u8>> {
                 let off = read_uvarint(ops, &mut i)? as usize;
                 let len = read_uvarint(ops, &mut i)? as usize;
                 let end = off.checked_add(len)?;
+                if out.len().checked_add(len)? > MAX_EXPAND {
+                    return None;
+                }
                 out.extend_from_slice(base.get(off..end)?);
             }
             OP_INSERT => {
                 let len = read_uvarint(ops, &mut i)? as usize;
                 let end = i.checked_add(len)?;
+                if out.len().checked_add(len)? > MAX_EXPAND {
+                    return None;
+                }
                 out.extend_from_slice(ops.get(i..end)?);
                 i = end;
             }
