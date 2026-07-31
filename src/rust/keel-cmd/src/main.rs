@@ -42,6 +42,7 @@ fn main() {
         Some("session") => run(cmd_session(&args[1..])),
         Some("learn") => run(cmd_learn(&args[1..])),
         Some("why") => run(cmd_why(&args[1..])),
+        Some("capture") => run(cmd_capture(&args[1..])),
         Some("native") => run(cmd_native(&args[1..])),
         // ── git-compatible surface ──
         Some("init") => run(cmd_init(&args[1..])),   // git init + keel store
@@ -277,6 +278,12 @@ fn cmd_commit(args: &[String]) -> io::Result<()> {
 fn session_from_file(repo: &Repo, path: &str, msg: &str, lesson_override: Option<&str>) -> io::Result<Session> {
     let raw = std::fs::read_to_string(path)?;
     let v: Value = serde_json::from_str(&raw).map_err(|e| io::Error::other(format!("session json: {e}")))?;
+    session_from_value(repo, &v, msg, lesson_override)
+}
+
+/// Build a [`Session`] from an already-parsed universal capture object (see [`session_from_file`]
+/// for the shape). Shared by `commit --session` and the `capture` adapters.
+fn session_from_value(repo: &Repo, v: &Value, msg: &str, lesson_override: Option<&str>) -> io::Result<Session> {
     let s = |k: &str| v.get(k).and_then(Value::as_str);
     let blob = |text: &str| -> io::Result<ObjectId> {
         repo.store().put(&Object::Blob(text.as_bytes().to_vec())).map_err(to_io)
@@ -310,6 +317,175 @@ fn session_from_file(repo: &Repo, path: &str, msg: &str, lesson_override: Option
         tokens_in: v.get("tokens_in").and_then(Value::as_u64).unwrap_or(0),
         tokens_out: v.get("tokens_out").and_then(Value::as_u64).unwrap_or(0),
     })
+}
+
+/// `keel capture <session-log> [--tool auto|claude|aider] [--task T] [--lesson L] [-o file.json]
+/// [--commit] [--json]` — the NEW-1088 adapters: turn a coding agent's native transcript (Claude
+/// Code JSONL, Aider chat history) into keel's universal session capture, then either print/emit it
+/// or commit it as a provenance change so `keel sessions` / `why` / `brief` treat it as first-class.
+fn cmd_capture(args: &[String]) -> io::Result<()> {
+    let log = args
+        .iter()
+        .find(|a| !a.starts_with('-'))
+        .cloned()
+        .ok_or_else(|| io::Error::other("usage: keel capture <session-log> [--tool claude|aider] [--commit] (a Claude Code .jsonl or Aider chat history)"))?;
+    let text = std::fs::read_to_string(&log)?;
+    let tool = match flag(args, "--tool").unwrap_or("auto") {
+        "auto" => detect_tool(&log, &text),
+        t => t.to_string(),
+    };
+    let mut universal = match tool.as_str() {
+        "claude" => capture_claude(&text),
+        "aider" => capture_aider(&text),
+        other => return Err(io::Error::other(format!("unknown --tool {other:?} (use claude or aider)"))),
+    };
+    // CLI overrides
+    if let Some(t) = flag(args, "--task") {
+        universal["task"] = json!(t);
+    }
+    if let Some(l) = flag(args, "--lesson") {
+        universal["lesson"] = json!(l);
+    }
+    let task = universal.get("task").and_then(Value::as_str).unwrap_or("(captured session)").to_string();
+
+    // Emit the universal JSON to a file if asked (feeds `keel commit --session <file>`).
+    if let Some(out) = flag(args, "-o").or_else(|| flag(args, "--out")) {
+        std::fs::write(out, render_json(&universal))?;
+    }
+
+    if has(args, "--commit") {
+        let (root, store) = root_store(args)?;
+        let repo = Repo::open(&store).map_err(to_io)?;
+        let session = session_from_value(&repo, &universal, &task, flag(args, "--lesson"))?;
+        let sid = repo.store().put(&Object::Session(session)).map_err(to_io)?;
+        let author = flag(args, "--author").unwrap_or("capture");
+        let ts = now_secs();
+        let cid = repo.commit_dir(&root, &task, author, ts, Some(sid)).map_err(to_io)?;
+        if let Some(lesson) = flag(args, "--lesson") {
+            repo.store().set_lesson(&cid, &task, lesson).map_err(to_io)?;
+        }
+        if has(args, "--json") {
+            println!("{}", render_json(&json!({ "ok": true, "change": cid.to_hex(), "session": sid.to_hex(), "tool": tool })));
+        } else {
+            println!("captured {} session → change {} (session {})", tool, short(&cid.to_hex()), short(&sid.to_hex()));
+        }
+        return Ok(());
+    }
+
+    // No --commit: report the parsed session (and/or the emitted file). Agents can pipe this on.
+    let summary = json!({
+        "ok": true, "tool": tool,
+        "task": universal.get("task"), "model": universal.get("model"),
+        "tokens_in": universal.get("tokens_in"), "tokens_out": universal.get("tokens_out"),
+        "tool_calls": universal.get("tool_calls").and_then(Value::as_array).map(|a| a.len()).unwrap_or(0),
+    });
+    if has(args, "--json") {
+        println!("{}", render_json(&summary));
+    } else {
+        println!(
+            "captured {} session: task={:?} model={} tools={} (add --commit to record it, or -o file.json)",
+            tool,
+            universal.get("task").and_then(Value::as_str).unwrap_or(""),
+            universal.get("model").and_then(Value::as_str).unwrap_or("?"),
+            universal.get("tool_calls").and_then(Value::as_array).map(|a| a.len()).unwrap_or(0),
+        );
+    }
+    Ok(())
+}
+
+/// Guess the source tool from the filename/content when `--tool auto`.
+fn detect_tool(path: &str, text: &str) -> String {
+    if path.ends_with(".jsonl") || text.contains("\"type\":\"assistant\"") || text.contains("\"type\": \"assistant\"") {
+        "claude".into()
+    } else if path.contains("aider") || path.ends_with(".md") {
+        "aider".into()
+    } else {
+        "claude".into() // JSONL is the most common; parser tolerates non-matching lines
+    }
+}
+
+/// Extract the visible text from a Claude message's `content` (a string, or blocks with `text`).
+fn message_text(msg: &Value) -> Option<String> {
+    match msg.get("content")? {
+        Value::String(s) => Some(s.clone()),
+        Value::Array(a) => {
+            let joined: String = a
+                .iter()
+                .filter(|b| b.get("type").and_then(Value::as_str) == Some("text"))
+                .filter_map(|b| b.get("text").and_then(Value::as_str))
+                .collect::<Vec<_>>()
+                .join(" ");
+            (!joined.is_empty()).then_some(joined)
+        }
+        _ => None,
+    }
+}
+
+/// Claude Code transcript (`~/.claude/projects/**/<id>.jsonl`) → universal capture.
+fn capture_claude(text: &str) -> Value {
+    let (mut task, mut model) = (String::new(), String::new());
+    let (mut tin, mut tout) = (0u64, 0u64);
+    let mut tools: Vec<String> = Vec::new();
+    for line in text.lines() {
+        let Ok(d) = serde_json::from_str::<Value>(line) else { continue };
+        let ty = d.get("type").and_then(Value::as_str).unwrap_or("");
+        let msg = d.get("message");
+        if task.is_empty() && ty == "user" {
+            if let Some(t) = msg.and_then(message_text) {
+                task = t;
+            }
+        }
+        if let Some(m) = msg.and_then(|m| m.get("model")).and_then(Value::as_str) {
+            if !m.is_empty() {
+                model = m.to_string();
+            }
+        }
+        if let Some(u) = msg.and_then(|m| m.get("usage")) {
+            tin += u.get("input_tokens").and_then(Value::as_u64).unwrap_or(0);
+            tout += u.get("output_tokens").and_then(Value::as_u64).unwrap_or(0);
+        }
+        if let Some(arr) = msg.and_then(|m| m.get("content")).and_then(Value::as_array) {
+            for b in arr {
+                if b.get("type").and_then(Value::as_str) == Some("tool_use") {
+                    if let Some(n) = b.get("name").and_then(Value::as_str) {
+                        if !tools.contains(&n.to_string()) {
+                            tools.push(n.to_string()); // dedup: distinct tools used, not every call
+                        }
+                    }
+                }
+            }
+        }
+    }
+    json!({
+        "task": truncate_task(&task), "model": model,
+        "tokens_in": tin, "tokens_out": tout, "tool_calls": tools, "prompts": text,
+    })
+}
+
+/// Aider chat history (`.aider.chat.history.md`) → universal capture. User turns are `#### ` lines.
+fn capture_aider(text: &str) -> Value {
+    let task = text
+        .lines()
+        .find_map(|l| l.strip_prefix("#### ").map(str::trim))
+        .or_else(|| text.lines().find(|l| !l.trim().is_empty()).map(str::trim))
+        .unwrap_or("")
+        .to_string();
+    json!({ "task": truncate_task(&task), "model": "", "tokens_in": 0, "tokens_out": 0, "prompts": text })
+}
+
+/// Wall-clock seconds since the epoch (commit timestamp for a captured session).
+fn now_secs() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+}
+
+/// First line of a task, bounded — a transcript's opening prompt can be long.
+fn truncate_task(t: &str) -> String {
+    let first = t.lines().next().unwrap_or("").trim();
+    if first.chars().count() > 200 {
+        format!("{}…", first.chars().take(199).collect::<String>())
+    } else {
+        first.to_string()
+    }
 }
 
 fn cmd_status(args: &[String]) -> io::Result<()> {
