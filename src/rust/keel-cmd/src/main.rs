@@ -38,6 +38,7 @@ fn main() {
         Some("sessions") => run(cmd_sessions(&args[1..])),
         Some("session") => run(cmd_session(&args[1..])),
         Some("learn") => run(cmd_learn(&args[1..])),
+        Some("why") => run(cmd_why(&args[1..])),
         Some("native") => run(cmd_native(&args[1..])),
         // ── git-compatible surface ──
         Some("init") => run(cmd_init(&args[1..])),   // git init + keel store
@@ -786,6 +787,112 @@ fn decode_chunked(raw: &[u8]) -> Option<Vec<u8>> {
 /// `keel learn --lesson <text> [--task <text>]` — record the non-obvious thing this change taught,
 /// attached to the current keel change (a post-hoc side-table annotation, so it works on git-driven
 /// history). A later `keel brief` on this file or its neighbors surfaces the lesson — the flywheel.
+/// `keel why <path> [--limit N] [--json]` — provenance for a file: the changes that touched it,
+/// newest first, each with its intent, author, verification status, and (if the change carried an
+/// agent session) the task and the lesson that session recorded. Answers "why is this code here,
+/// what task produced it, and was it verified" — the agentic change model, queryable.
+fn cmd_why(args: &[String]) -> io::Result<()> {
+    let raw = args
+        .iter()
+        .find(|a| !a.starts_with("--"))
+        .cloned()
+        .ok_or_else(|| io::Error::other("usage: keel why <path> [--limit N] [--json]"))?;
+    // Tolerate a `path:line` suffix; line-level blame is a follow-up, so resolve to the file.
+    let path = raw.split(':').next().unwrap_or(&raw).to_string();
+    let limit: usize = flag(args, "--limit").and_then(|s| s.parse().ok()).unwrap_or(10);
+    let (_root, store) = root_store(args)?;
+    let repo = Repo::open(&store).map_err(to_io)?;
+
+    let mut recs: Vec<Value> = Vec::new();
+    for (cid, c) in repo.history_touching(&path).map_err(to_io)?.iter().take(limit) {
+        // Authoritative verification is the side-table (set by `keel verify`), not the change's
+        // commit-time field which stays Unverified.
+        let verif = match repo.store().verification(cid).map_err(to_io)? {
+            Verification::Green => "green",
+            Verification::Red => "red",
+            Verification::Unverified => "unverified",
+        };
+        let mut rec = json!({
+            "change": cid.to_hex(), "verified": verif,
+            "intent": c.intent, "author": c.author, "timestamp": c.timestamp,
+        });
+        // Lesson + task: prefer the recorded agent session, else the post-hoc `keel learn` lesson.
+        if let Some(sid) = c.session {
+            if let Some(Object::Session(s)) = repo.store().get(&sid).map_err(to_io)? {
+                rec["task"] = json!(s.task);
+                if !s.model.is_empty() {
+                    rec["model"] = json!(s.model);
+                }
+                if !s.lesson.is_empty() {
+                    rec["lesson"] = json!(s.lesson);
+                }
+            }
+        }
+        if rec.get("lesson").is_none() {
+            if let Some((task, lesson)) = repo.store().lesson(cid).map_err(to_io)? {
+                if !lesson.is_empty() {
+                    rec["lesson"] = json!(lesson);
+                    rec.as_object_mut().unwrap().entry("task").or_insert(json!(task));
+                }
+            }
+        }
+        recs.push(rec);
+    }
+
+    if has(args, "--json") {
+        println!("{}", render_json(&json!({ "path": path, "history": recs })));
+        return Ok(());
+    }
+    if recs.is_empty() {
+        println!("no recorded history for {path} (never committed, or outside keel history)");
+        return Ok(());
+    }
+    println!("why {path} — {} change(s), newest first:", recs.len());
+    for r in &recs {
+        let v = r["verified"].as_str().unwrap_or("");
+        let mark = match v {
+            "green" => "✓",
+            "red" => "✗",
+            _ => "·",
+        };
+        println!(
+            "  {mark} {} [{v}]  {}",
+            short(r["change"].as_str().unwrap_or("")),
+            r["intent"].as_str().unwrap_or("")
+        );
+        println!(
+            "      by {} · {}",
+            r["author"].as_str().unwrap_or(""),
+            rel_time(r["timestamp"].as_u64().unwrap_or(0))
+        );
+        if let Some(task) = r.get("task").and_then(Value::as_str) {
+            println!("      task: {task}");
+        }
+        if let Some(lesson) = r.get("lesson").and_then(Value::as_str) {
+            println!("      lesson: {lesson}");
+        }
+    }
+    Ok(())
+}
+
+/// Coarse relative time for human output (`3d ago`). 0 → unknown.
+fn rel_time(ts: u64) -> String {
+    if ts == 0 {
+        return "unknown time".into();
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let d = now.saturating_sub(ts);
+    match d {
+        0..=59 => format!("{d}s ago"),
+        60..=3599 => format!("{}m ago", d / 60),
+        3600..=86399 => format!("{}h ago", d / 3600),
+        _ => format!("{}d ago", d / 86400),
+    }
+}
+
 fn cmd_learn(args: &[String]) -> io::Result<()> {
     let lesson = flag(args, "--lesson").ok_or_else(|| io::Error::other("usage: keel learn --lesson <text> [--task <text>]"))?;
     let task = flag(args, "--task").unwrap_or("");
