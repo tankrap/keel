@@ -43,13 +43,14 @@ With the daemon running, keel keeps a warm index and does work proportional to w
 
 git was built for people sending each other patches. Its unit is the diff, and everything under it exists to move diffs between humans. That model has nothing to say about what now writes most of the code: an agent that has to rebuild the full context of a codebase before it can make a single correct change.
 
-keel is built for that reader. It records each work session as a first-class object in the history, which turns version control from a log of diffs into a source of context and memory. Three differences follow from that, and none of them is something git can be extended into.
+keel is built for that reader. It records each work session as a first-class object in the history, which turns version control from a log of diffs into a source of context and memory. Four differences follow from that, and none of them is something git can be extended into.
 
 - **Context in one read.** A single fetch returns everything an agent needs for a task: the relevant code, the dependency graph, who wrote what, and the sessions that touched it. In git you assemble that yourself, from diff, blame, and log, across many commands.
 - **Memory across sessions.** A convention learned in one session is recorded and surfaced automatically on the next related task. In the benchmark above that raises how often an agent follows a real project rule from 64% to 93% across four languages, and the control run shows the gain is the specific rule, not extra prompt text. git has no equivalent, so an agent starts every task cold.
 - **Sessions as history.** keel records how a change was made, the task, the model, the prompts, the tool calls, and whether the result verified, as an object you can query later. git records the commit and an author name, and nothing about how the change was produced.
+- **Reviews are objects too.** A review of a session is stored in the repo with its verdict, labels, and findings, so you can query across reviews: every security review, every disagreement, every change approved without a human. git keeps reviews outside the repository, so it cannot answer those.
 
-The middle one is the point. A convention learned once and applied automatically is version control that gets better at your codebase as it is used, and the benchmark measures one turn of that loop. That is a different data model, not a git extension.
+The second of these is the point. A convention learned once and applied automatically is version control that gets better at your codebase as it is used, and the benchmark measures one turn of that loop. That is a different data model, not a git extension.
 
 ### Where git wins
 

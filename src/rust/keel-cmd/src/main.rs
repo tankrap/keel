@@ -7,7 +7,10 @@
 //! `keel commit` / `keel log` are the write/history side.
 
 use keel_brief::BriefService;
-use keel_store::{diff_lines, ChangeKind, Object, ObjectId, Repo, Session, StoreError, Tag, Verification};
+use keel_store::{
+    diff_lines, ChangeKind, Object, ObjectId, Repo, Review, Session, StoreError, Tag, Verdict,
+    Verification,
+};
 use serde_json::{json, Value};
 use std::io::{self, BufRead, Write};
 use std::os::unix::net::UnixStream;
@@ -41,6 +44,8 @@ fn main() {
         Some("sessions") => run(cmd_sessions(&args[1..])),
         Some("session") => run(cmd_session(&args[1..])),
         Some("learn") => run(cmd_learn(&args[1..])),
+        Some("review") => run(cmd_review(&args[1..])),
+        Some("reviews") => run(cmd_reviews(&args[1..])),
         Some("why") => run(cmd_why(&args[1..])),
         Some("capture") => run(cmd_capture(&args[1..])),
         Some("native") => run(cmd_native(&args[1..])),
@@ -133,6 +138,8 @@ fn print_usage() {
          \x20 keel pin <symbol> --lesson <text>   ·   keel pins\n\
          \x20 keel learn --lesson <text> [--task <text>]   record what a change taught (flywheel)\n\
          \x20 keel sessions [--file <path>]       ·   keel session <change>\n\
+         \x20 keel review --target <id> --verdict <approve|request-changes|reject|comment> [--label <l>]\n\
+         \x20 keel reviews [--target <id>] [--label <l>] [--mentions <t>] [--no-human] [--disagreements] [--json]\n\
          \x20 keel repack [--json]                delta-compress history + GC (like `git gc`)\n\
          \x20 keel size   [--json]                logical bytes / object counts\n\
          \x20 keel mirror-in <git-repo>  ·  keel mirror-out <dir>  ·  keel import/export\n\
@@ -1129,6 +1136,130 @@ fn rel_time(ts: u64) -> String {
         3600..=86399 => format!("{}h ago", d / 3600),
         _ => format!("{}d ago", d / 86400),
     }
+}
+
+/// Every value that follows a repeated flag (`--label a --label b` → ["a","b"]).
+fn flag_all(args: &[String], name: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        if args[i] == name {
+            if let Some(v) = args.get(i + 1) {
+                out.push(v.clone());
+                i += 2;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    out
+}
+
+/// `keel review --target <id> --verdict <approve|request-changes|reject|comment> [--reviewer <who>]
+/// [--human] [--summary <text>] [--label <l> ...] [--finding <blob-id> ...]`
+///
+/// Record a review of a session or change as a first-class object (peer to a session). Several
+/// reviews of one target with different verdicts express disagreement.
+fn cmd_review(args: &[String]) -> io::Result<()> {
+    let target = flag(args, "--target").and_then(ObjectId::from_hex).ok_or_else(|| {
+        fail_fix("missing or invalid --target", "pass the session/change id as 64 hex chars")
+    })?;
+    let verdict = Verdict::from_name(flag(args, "--verdict").unwrap_or("comment"))
+        .ok_or_else(|| fail_fix("invalid --verdict", "one of: approve, request-changes, reject, comment"))?;
+    let reviewer = flag(args, "--reviewer").unwrap_or("agent").to_string();
+    let by_human = has(args, "--human");
+    let summary = flag(args, "--summary").unwrap_or("").to_string();
+    let labels = flag_all(args, "--label");
+    let findings: Vec<ObjectId> =
+        flag_all(args, "--finding").iter().filter_map(|s| ObjectId::from_hex(s)).collect();
+
+    let (_, store) = root_store(args)?;
+    let repo = Repo::open(&store).map_err(to_io)?;
+    let target_known = repo.store().has(&target).map_err(to_io)?;
+    let review = Review { target, reviewer, by_human, verdict, summary, labels, findings };
+    let id = repo.store().record_review(&review).map_err(to_io)?;
+    println!(
+        "{}",
+        render_json(&json!({
+            "ok": true, "review": id.to_hex(), "target": target.to_hex(),
+            "verdict": verdict.name(), "by_human": by_human, "target_known": target_known,
+        }))
+    );
+    Ok(())
+}
+
+/// `keel reviews [--target <id>] [--label <l>] [--mentions <text>] [--verdict <v>] [--no-human]
+/// [--disagreements] [--json]`
+///
+/// Query recorded reviews. Because reviews are first-class objects, questions git can't express
+/// become filters here: reviews mentioning a topic, security-critical reviews, changes approved
+/// without a human, and targets where reviewers disagreed.
+fn cmd_reviews(args: &[String]) -> io::Result<()> {
+    let (_, store) = root_store(args)?;
+    let repo = Repo::open(&store).map_err(to_io)?;
+    let mut reviews = repo.store().reviews().map_err(to_io)?;
+
+    if let Some(t) = flag(args, "--target").and_then(ObjectId::from_hex) {
+        reviews.retain(|(_, r)| r.target == t);
+    }
+    if let Some(l) = flag(args, "--label") {
+        reviews.retain(|(_, r)| r.labels.iter().any(|x| x == l));
+    }
+    if let Some(m) = flag(args, "--mentions") {
+        let m = m.to_lowercase();
+        reviews.retain(|(_, r)| r.summary.to_lowercase().contains(&m));
+    }
+    if let Some(v) = flag(args, "--verdict").and_then(Verdict::from_name) {
+        reviews.retain(|(_, r)| r.verdict == v);
+    }
+    if has(args, "--no-human") {
+        reviews.retain(|(_, r)| !r.by_human);
+    }
+    if has(args, "--disagreements") {
+        // keep only reviews whose target carries more than one distinct verdict
+        use std::collections::{HashMap, HashSet};
+        let mut by_target: HashMap<[u8; 32], HashSet<u8>> = HashMap::new();
+        for (_, r) in repo.store().reviews().map_err(to_io)? {
+            by_target.entry(r.target.0).or_default().insert(r.verdict.tag());
+        }
+        reviews.retain(|(_, r)| by_target.get(&r.target.0).is_some_and(|s| s.len() >= 2));
+    }
+    // stable output order: by target, then verdict
+    reviews.sort_by(|a, b| {
+        a.1.target.0.cmp(&b.1.target.0).then(a.1.verdict.tag().cmp(&b.1.verdict.tag()))
+    });
+
+    if has(args, "--json") {
+        let arr: Vec<Value> = reviews
+            .iter()
+            .map(|(id, r)| {
+                json!({
+                    "id": id.to_hex(), "target": r.target.to_hex(), "reviewer": r.reviewer,
+                    "by_human": r.by_human, "verdict": r.verdict.name(),
+                    "summary": r.summary, "labels": r.labels,
+                })
+            })
+            .collect();
+        println!("{}", render_json(&json!({ "ok": true, "count": arr.len(), "reviews": arr })));
+    } else if reviews.is_empty() {
+        println!("(no reviews)");
+    } else {
+        for (id, r) in &reviews {
+            let h = if r.by_human { " human" } else { "" };
+            let labels =
+                if r.labels.is_empty() { String::new() } else { format!(" [{}]", r.labels.join(",")) };
+            println!(
+                "{} {} {}{}{} — {}",
+                short(&id.to_hex()),
+                short(&r.target.to_hex()),
+                r.verdict.name(),
+                h,
+                labels,
+                r.summary
+            );
+        }
+    }
+    Ok(())
 }
 
 fn cmd_learn(args: &[String]) -> io::Result<()> {
