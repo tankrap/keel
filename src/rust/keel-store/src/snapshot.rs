@@ -17,6 +17,15 @@ use std::time::UNIX_EPOCH;
 pub const MODE_FILE: u32 = 0o100644;
 pub const MODE_EXEC: u32 = 0o100755;
 pub const MODE_DIR: u32 = 0o040000;
+/// A symlink, stored git-style: the blob content IS the link target path.
+pub const MODE_SYMLINK: u32 = 0o120000;
+
+/// The blob id for a symlink at `path` — its content is the raw link target, exactly as git stores
+/// it. Returns `None` if the link can't be read. Shared with [`crate::livestatus`].
+pub(crate) fn symlink_blob_id(path: &Path) -> Option<ObjectId> {
+    let target = fs::read_link(path).ok()?;
+    Some(Object::Blob(target.as_os_str().as_encoded_bytes().to_vec()).id())
+}
 
 /// Flush the in-memory object batch once it holds this much blob content, so ingesting a
 /// huge tree bounds memory instead of building every object up front (NEW-1109 #3).
@@ -82,15 +91,16 @@ fn build_ro(
     for de in fs::read_dir(dir)? {
         let de = de?;
         let ft = de.file_type()?;
-        if ft.is_symlink() {
-            continue;
-        }
         let name = de.file_name().to_string_lossy().into_owned();
         let path = join(&name);
         if ig.is_ignored(&path, ft.is_dir()) {
             continue;
         }
-        if ft.is_dir() {
+        if ft.is_symlink() {
+            if let Some(id) = symlink_blob_id(&de.path()) {
+                entries.push(TreeEntry { name, mode: MODE_SYMLINK, id });
+            }
+        } else if ft.is_dir() {
             let child = ig.descend(&path, &de.path());
             let id = build_ro(&de.path(), &path, &child, cache, epoch, trees, updates)?;
             entries.push(TreeEntry { name, mode: MODE_DIR, id });
@@ -176,15 +186,20 @@ fn build(ctx: &mut SnapCtx, dir: &Path, rel: &str, ig: &Ignore) -> Result<Object
     for de in fs::read_dir(dir)? {
         let de = de?;
         let ft = de.file_type()?;
-        if ft.is_symlink() {
-            continue;
-        }
         let name = de.file_name().to_string_lossy().into_owned();
         let path = join(&name);
         if ig.is_ignored(&path, ft.is_dir()) {
             continue;
         }
-        if ft.is_dir() {
+        if ft.is_symlink() {
+            // Store git-style: the blob content is the link target. Skip if unreadable.
+            if let Ok(target) = fs::read_link(de.path()) {
+                let blob = Object::Blob(target.as_os_str().as_encoded_bytes().to_vec());
+                let id = blob.id();
+                ctx.push(blob, 0)?;
+                entries.push(TreeEntry { name, mode: MODE_SYMLINK, id });
+            }
+        } else if ft.is_dir() {
             let child = ig.descend(&path, &de.path());
             let id = build(ctx, &de.path(), &path, &child)?;
             entries.push(TreeEntry { name, mode: MODE_DIR, id });
@@ -241,10 +256,30 @@ pub fn checkout(store: &Store, tree_id: ObjectId, dir: &Path) -> Result<()> {
                 Object::Blob(b) => b,
                 _ => return Err(StoreError::Corrupt(e.id)),
             };
-            fs::write(&p, &content)?;
-            set_exec(&p, e.mode)?;
+            if e.mode == MODE_SYMLINK {
+                let _ = fs::remove_file(&p); // replace any stale entry before linking
+                make_symlink(&content, &p)?;
+            } else {
+                fs::write(&p, &content)?;
+                set_exec(&p, e.mode)?;
+            }
         }
     }
+    Ok(())
+}
+
+/// Create a symlink at `p` pointing at the stored target bytes. Unix creates a real symlink; on
+/// other platforms (no cheap symlink) we fall back to writing the target as a regular file so a
+/// checkout still round-trips the content.
+#[cfg(unix)]
+fn make_symlink(target: &[u8], p: &Path) -> Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    std::os::unix::fs::symlink(std::ffi::OsStr::from_bytes(target), p)?;
+    Ok(())
+}
+#[cfg(not(unix))]
+fn make_symlink(target: &[u8], p: &Path) -> Result<()> {
+    fs::write(p, target)?;
     Ok(())
 }
 
@@ -310,6 +345,36 @@ mod tests {
         checkout(&s, id1, out.path()).unwrap();
         let id2 = snapshot(&s, out.path()).unwrap();
         assert_eq!(id1, id2, "snapshot∘checkout∘snapshot must be identity on the address");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn symlinks_are_tracked_and_round_trip() {
+        let sd = TmpDir::new();
+        let work = TmpDir::new();
+        let out = TmpDir::new();
+        let s = Store::open(sd.path()).unwrap();
+        write(work.path(), "real.txt", b"hi\n");
+        std::os::unix::fs::symlink("real.txt", work.path().join("link.txt")).unwrap();
+
+        // the symlink is captured with MODE_SYMLINK and its target as content
+        let id1 = snapshot(&s, work.path()).unwrap();
+        let tree = match s.get(&id1).unwrap().unwrap() {
+            Object::Tree(t) => t,
+            _ => panic!("root is a tree"),
+        };
+        let link = tree.entries.iter().find(|e| e.name == "link.txt").expect("symlink tracked");
+        assert_eq!(link.mode, MODE_SYMLINK);
+        match s.get(&link.id).unwrap().unwrap() {
+            Object::Blob(b) => assert_eq!(b, b"real.txt"),
+            _ => panic!("symlink blob is its target"),
+        }
+
+        // checkout recreates a real symlink, and re-snapshot is identical (address stable)
+        checkout(&s, id1, out.path()).unwrap();
+        assert!(std::fs::symlink_metadata(out.path().join("link.txt")).unwrap().file_type().is_symlink());
+        assert_eq!(std::fs::read_link(out.path().join("link.txt")).unwrap().to_str(), Some("real.txt"));
+        assert_eq!(id1, snapshot(&s, out.path()).unwrap(), "symlink round-trips to the same address");
     }
 
     #[test]

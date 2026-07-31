@@ -95,8 +95,15 @@ impl LiveStatus {
     /// never shows up as dirty — matching git.
     fn refresh_path(&mut self, rel: &str) {
         let abs = self.root.join(rel);
+        let ignored = Ignore::resolve(&self.root, rel, false);
         match fs::symlink_metadata(&abs) {
-            Ok(md) if md.is_file() && !Ignore::resolve(&self.root, rel, false) => {
+            Ok(md) if md.file_type().is_symlink() && !ignored => {
+                match snapshot::symlink_blob_id(&abs) {
+                    Some(id) => { self.work.insert(rel.to_string(), (0, 0, id)); }
+                    None => { self.work.remove(rel); }
+                }
+            }
+            Ok(md) if md.is_file() && !ignored => {
                 let (size, mtime) = (md.len(), mtime_ns(&md));
                 let unchanged = self.work.get(rel).is_some_and(|&(m, s, _)| m == mtime && s == size);
                 if !unchanged {
@@ -106,7 +113,7 @@ impl LiveStatus {
                     }
                 }
             }
-            _ => { self.work.remove(rel); } // deleted, ignored, or became a dir/symlink
+            _ => { self.work.remove(rel); } // deleted, ignored, or became a dir
         }
         self.reclassify(rel);
     }
@@ -172,15 +179,17 @@ fn walk_work(
     for de in rd {
         let de = de?;
         let ft = de.file_type()?;
-        if ft.is_symlink() {
-            continue;
-        }
         let name = de.file_name().to_string_lossy().into_owned();
         let path = if rel.is_empty() { name } else { format!("{rel}/{name}") };
         if ig.is_ignored(&path, ft.is_dir()) {
             continue;
         }
-        if ft.is_dir() {
+        if ft.is_symlink() {
+            // Symlink content is its target; no stat cache (rare + cheap), so size/mtime are 0.
+            if let Some(id) = snapshot::symlink_blob_id(&de.path()) {
+                out.insert(path, (0, 0, id));
+            }
+        } else if ft.is_dir() {
             walk_work(&de.path(), &path, &ig.descend(&path, &de.path()), cache, epoch, out)?;
         } else if ft.is_file() {
             let md = de.metadata()?;
