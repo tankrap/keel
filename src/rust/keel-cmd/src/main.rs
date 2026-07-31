@@ -16,6 +16,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    // Machine-readable failures when the caller asked for JSON — set before dispatch so the global
+    // error path in `run` emits {ok:false, error, message, fix} instead of prose.
+    JSON_MODE.store(has(&args, "--json"), std::sync::atomic::Ordering::Relaxed);
     // keel is a drop-in for git: its own value-add verbs (below) take precedence, `init`/`clone`
     // are git + keel-mirror, and every other verb passes straight through to the real git binary
     // (with a mirror re-sync after mutating commands). So `keel <anything git understands>` works.
@@ -48,10 +51,69 @@ fn main() {
     }
 }
 
+/// Set once in `main` from `--json`, so the global error path in [`run`] can emit a machine-
+/// readable failure (agents parse stdout as JSON on both success and error) instead of prose.
+static JSON_MODE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Build an error carrying an explicit fix hint, surfaced as the `fix` field under `--json` and
+/// `(fix: …)` in prose. Encoded with a unit separator so it rides through `io::Error` unchanged.
+fn fail_fix(message: impl std::fmt::Display, fix: impl std::fmt::Display) -> io::Error {
+    io::Error::other(format!("{message}\u{1f}{fix}"))
+}
+
 fn run(r: io::Result<()>) {
     if let Err(e) = r {
-        eprintln!("keel: {e}");
+        let full = e.to_string();
+        // An explicit fix (from `fail_fix`) rides after a unit separator; otherwise infer one.
+        let (message, fix) = match full.split_once('\u{1f}') {
+            Some((m, f)) => (m.to_string(), Some(f.to_string())),
+            None => (full.clone(), fix_hint(&full)),
+        };
+        if JSON_MODE.load(std::sync::atomic::Ordering::Relaxed) {
+            let mut o = json!({ "ok": false, "error": err_kind(&message), "message": message });
+            if let Some(fix) = fix {
+                o["fix"] = json!(fix);
+            }
+            println!("{}", render_json(&o));
+        } else {
+            eprint!("keel: {message}");
+            if let Some(fix) = fix {
+                eprint!("  (fix: {fix})");
+            }
+            eprintln!();
+        }
         std::process::exit(1);
+    }
+}
+
+/// A short, stable machine code for an error message — so an agent can branch on `error` without
+/// parsing prose. Falls back to `"error"`.
+fn err_kind(msg: &str) -> &'static str {
+    let m = msg.to_lowercase();
+    if m.contains("no keel history") || m.contains("commit first") {
+        "no_history"
+    } else if m.contains("not a git repo") || m.contains("not a keel repo") || m.contains("no .keel") {
+        "not_a_repo"
+    } else if m.starts_with("usage:") || m.contains("usage:") {
+        "usage"
+    } else if m.contains("no such") || m.contains("not found") || m.contains("does not exist") {
+        "not_found"
+    } else {
+        "error"
+    }
+}
+
+/// Infer a fix hint for common failures whose messages didn't carry one explicitly.
+fn fix_hint(msg: &str) -> Option<String> {
+    let m = msg.to_lowercase();
+    if m.contains("no keel history") || m.contains("commit first") {
+        Some("run `keel commit -m \"…\"` first".into())
+    } else if m.contains("not a git repo") || m.contains("no .keel") || m.contains("not a keel repo") {
+        Some("run `keel init` in the repository root".into())
+    } else if let Some(rest) = msg.split_once("usage:") {
+        Some(format!("usage:{}", rest.1))
+    } else {
+        None
     }
 }
 
