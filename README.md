@@ -38,18 +38,24 @@ With the daemon running, keel keeps a warm index and does work proportional to w
 
 ## keel vs git
 
-keel adds three things git does not have.
+git was built for people sending each other patches. Its unit is the diff, and everything under it exists to move diffs between humans. That model has nothing to say about what now writes most of the code: an agent that has to rebuild the full context of a codebase before it can make a single correct change.
 
-- A single fetch returns the full context for a task: the relevant code, the dependency graph, who wrote what, and past sessions. git returns diffs and leaves you to assemble the rest.
-- Memory across sessions. A convention recorded once is surfaced automatically on later tasks, worth the gains in the table above. git has no equivalent.
-- Sessions are first-class history. keel records how a change was made, including the task, the model, the prompts, the tool calls, and whether the result verified, as an object in the history. git records the commit and an author name, and nothing about how the change was produced.
+keel is built for that reader. It records each work session as a first-class object in the history, which turns version control from a log of diffs into a source of context and memory. Three differences follow from that, and none of them is something git can be extended into.
 
-git still wins in four places.
+- **Context in one read.** A single fetch returns everything an agent needs for a task: the relevant code, the dependency graph, who wrote what, and the sessions that touched it. In git you assemble that yourself, from diff, blame, and log, across many commands.
+- **Memory across sessions.** A convention learned in one session is recorded and surfaced automatically on the next related task. In the benchmark above that raises how often an agent follows a real project rule from 66% to 92% across three languages, and the control run shows the gain is the specific rule, not extra prompt text. git has no equivalent, so an agent starts every task cold.
+- **Sessions as history.** keel records how a change was made, the task, the model, the prompts, the tool calls, and whether the result verified, as an object you can query later. git records the commit and an author name, and nothing about how the change was produced.
+
+The middle one is the point. A convention learned once and applied automatically is version control that gets better at your codebase as it is used, and the benchmark measures one turn of that loop. That is a different data model, not a git extension.
+
+### Where git wins
+
+keel is new, and git is not going anywhere for a lot of work.
 
 - Shallow clones are faster.
 - git repos are smaller on disk. keel's repack cuts its own size by 36% on a 300-commit import, and git is still smaller than that.
-- git has twenty years of tooling and near-universal support, and keel is new.
-- For human-only work, where no agent ever reads the history, git is simpler.
+- git has twenty years of tooling and near-universal support.
+- For human-only work, where no agent ever reads the history, git is simpler, and you need none of the above.
 
 ## Benchmark your own repo
 
