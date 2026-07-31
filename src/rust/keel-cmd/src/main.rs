@@ -30,6 +30,7 @@ fn main() {
         Some("mirror-out") => run(cmd_mirror_out(&args[1..])),
         Some("reindex") => run(cmd_reindex(&args[1..])),
         Some("serve") => run(cmd_serve(&args[1..])),
+        Some("net-serve") => run(cmd_net_serve(&args[1..])),
         Some("verify") => run(cmd_verify(&args[1..])),
         Some("pin") => run(cmd_pin(&args[1..])),
         Some("pins") => run(cmd_pins(&args[1..])),
@@ -756,6 +757,25 @@ fn decode_chunked(raw: &[u8]) -> Option<Vec<u8>> {
         out.extend_from_slice(&raw[i..i + size]);
         i += size + 2; // data + trailing CRLF
     }
+}
+
+/// `keel net-serve [--port N]` — serve this repo's objects + a coordination event channel over
+/// QUIC, so remote agents can fetch objects and subscribe to fleet events (content-addressed,
+/// verifiable). This is keel's multi-machine transport (NEW-1102).
+fn cmd_net_serve(args: &[String]) -> io::Result<()> {
+    let (_, store_path) = root_store(args)?;
+    let port: u16 = flag(args, "--port").and_then(|s| s.parse().ok()).unwrap_or(9420);
+    let store = keel_store::store::Store::open(&store_path).map_err(to_io)?;
+    let rt = tokio::runtime::Runtime::new()?;
+    rt.block_on(async move {
+        let addr = format!("0.0.0.0:{port}").parse().map_err(|e| io::Error::other(format!("{e}")))?;
+        let server = keel_net::Server::bind(addr, store).await.map_err(|e| io::Error::other(e.to_string()))?;
+        println!("keel net-serve: QUIC on {} · objects + event channel (store {})", server.local_addr(), store_path.display());
+        println!("  a peer fetches with keel_net::Client::connect(addr).get(oid); events via .subscribe()");
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+        }
+    })
 }
 
 /// `keel size` — logical content bytes held + object/chunk/delta counts.

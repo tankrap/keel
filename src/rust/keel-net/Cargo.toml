@@ -1,0 +1,18 @@
+[package]
+name = "keel-net"
+version.workspace = true
+edition.workspace = true
+
+# keel's QUIC transport: content-addressed chunk transfer + a live event channel, so keel can run
+# across machines (remote briefs, object fetch, fleet coordination) rather than only over a local
+# Unix socket. QUIC gives us multiplexed streams + low-latency datagrams over one connection.
+
+[dependencies]
+quinn = "0.11"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+rcgen = "0.13"
+tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "sync", "macros", "time"] }
+keel-store = { path = "../keel-store" }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "sync", "macros", "time"] }
