@@ -17,37 +17,12 @@ solve a task set in that module WITHOUT the brief and WITH it, T trials each; a 
 
 Env: CORPUS_SRC (a vscode checkout, default ~/keel-vscode-demo), TRIALS (3), WORKERS (6).
 """
-import json, math, os, subprocess, tempfile, shutil, urllib.request, urllib.error, pathlib, time, random
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import json, os, subprocess, tempfile, shutil, pathlib
 
-KEEL = os.environ.get("KEEL_BIN", str(pathlib.Path.home() / "keel/src/rust/target/release/keel"))
+from bench_common import (api, judge, sh, wilson, run_trials, build_summary,
+                          SOLVER, JUDGE, KEEL, TRIALS, WORKERS)
+
 CORPUS = os.environ.get("CORPUS_SRC", str(pathlib.Path.home() / "keel-vscode-demo"))
-SOLVER = "claude-opus-4-8"
-JUDGE = "claude-sonnet-5"
-API = "https://api.anthropic.com/v1/messages"
-KEY = (pathlib.Path.home() / ".claude-token").read_text().strip()
-TRIALS = int(os.environ.get("TRIALS", "3"))
-WORKERS = int(os.environ.get("WORKERS", "6"))
-
-def api(system, user, model, max_tokens=1600):
-    body = json.dumps({"model": model, "max_tokens": max_tokens, "system": system,
-                       "messages": [{"role": "user", "content": user}]}).encode()
-    for attempt in range(6):
-        req = urllib.request.Request(API, data=body, headers={
-            "x-api-key": KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"})
-        try:
-            with urllib.request.urlopen(req, timeout=180) as r:
-                d = json.load(r)
-            return "".join(b.get("text", "") for b in d.get("content", []) if b.get("type") == "text")
-        except urllib.error.HTTPError as e:
-            if e.code in (429, 500, 529) and attempt < 5:
-                time.sleep((2 ** attempt) + random.random()); continue
-            raise
-        except Exception:
-            if attempt < 5:
-                time.sleep((2 ** attempt) + random.random()); continue
-            raise
-    return ""
 
 # (real vscode file, module hint, task, real grounded convention, judge compliance-criterion)
 SCEN = [
@@ -117,8 +92,6 @@ SCEN = [
   "reads via configurationService.getValue('editor.tabSize'), not env or a hardcoded global"),
 ]
 
-def sh(a, cwd=None): return subprocess.run([KEEL] + a, cwd=cwd, capture_output=True, text=True)
-
 def build_and_retrieve(path, lesson):
     """Give each REAL vscode file its own keel repo, commit it (real path + real content), attach
     its real convention via `keel learn`, and retrieve it with `keel brief`. One file per repo so
@@ -152,61 +125,54 @@ def solve(path, hint, task, lesson):
         user += f"\n\nRetrieved from this codebase's history (a convention that applies here):\n\"{lesson}\""
     return api(sysmsg, user, SOLVER, max_tokens=1800)
 
-def judge(path, code, crit):
-    q = (f"Compliance check: the code {crit}.\n\nCode for `{path}`:\n```\n{code}\n```\n\n"
-         "Does the code satisfy the check? Answer with exactly one word: YES or NO.")
-    votes = 0
-    for _ in range(2):
-        a = api("You are a strict code reviewer. Judge only the stated compliance check.", q, JUDGE, max_tokens=600).strip().upper()
-        toks = a.split()
-        if (toks and toks[-1].startswith("YES")) or a.startswith("YES"):
-            votes += 1
-    return votes >= 2
-
 def trial(item):
     (si, cond, _t) = item
     path, hint, task, lesson, crit, got = si
     code = solve(path, hint, task, (got or lesson) if cond == "with" else None)
     return (path, cond, judge(path, code, crit))
 
-def wilson(k, n, z=1.96):
-    if n == 0: return (0.0, 0.0)
-    p = k / n; d = 1 + z*z/n
-    c = (p + z*z/(2*n)) / d
-    h = (z * math.sqrt(p*(1-p)/n + z*z/(4*n*n))) / d
-    return (max(0, c-h), min(1, c+h))
-
-def main():
+def run(trials=None, workers=None, verbose=True):
+    """Run the real-corpus (VS Code) flywheel benchmark and return a standard summary dict."""
+    trials = TRIALS if trials is None else trials
+    workers = WORKERS if workers is None else workers
     if not pathlib.Path(CORPUS, "src/vs/base/common/lifecycle.ts").exists():
         raise SystemExit(f"corpus not found at {CORPUS} (set CORPUS_SRC to a vscode checkout)")
     scen, retr_ok = [], 0
     for s in SCEN:
         got = build_and_retrieve(s[0], s[3]); retr_ok += 1 if (got and s[3][:24] in got) else 0
         scen.append(s + (got,))
-    items = [(si, cond, t) for si in scen for cond in ("without","with") for t in range(TRIALS)]
-    print(f"corpus=vscode scenarios={len(SCEN)} trials={TRIALS} solver={SOLVER} judge={JUDGE} · {len(items)} solves…")
-    results = {}
-    with ThreadPoolExecutor(max_workers=WORKERS) as ex:
-        futs = {ex.submit(trial, it): it for it in items}
-        for f in as_completed(futs):
-            path, cond, ok = f.result()
-            results.setdefault((path, cond), []).append(ok)
     n = len(SCEN)
-    print(f"\n{'convention (real vscode file)':<44} {'WITHOUT':>9} {'WITH':>7}")
-    print("-"*62)
-    wo = wi = 0
+    if verbose:
+        print(f"corpus=vscode scenarios={n} trials={trials} solver={SOLVER} judge={JUDGE} · {n*2*trials} solves…")
+    _items, results = run_trials(scen, trial, trials, workers)
+
+    per, wo, wi = [], 0, 0
     for s in SCEN:
-        rw = results.get((s[0],"without"),[]); ri = results.get((s[0],"with"),[])
+        rw = results.get((s[0], "without"), []); ri = results.get((s[0], "with"), [])
         wo += sum(rw); wi += sum(ri)
-        short = s[0].replace("src/vs/","").replace("common/","")
-        print(f"{short:<44} {f'{sum(rw)}/{len(rw)}':>9} {f'{sum(ri)}/{len(ri)}':>7}")
-    tot = n*TRIALS
-    lw, hw = wilson(wo, tot); li, hi = wilson(wi, tot)
-    print("-"*62)
-    print(f"real conventions retrieved by keel brief: {retr_ok}/{n}")
-    print(f"WITHOUT keel brief: {wo}/{tot} = {100*wo/tot:.0f}%   (95% CI {100*lw:.0f}-{100*hw:.0f}%)")
-    print(f"WITH    keel brief: {wi}/{tot} = {100*wi/tot:.0f}%   (95% CI {100*li:.0f}-{100*hi:.0f}%)")
-    print(f"LIFT: +{100*(wi-wo)/tot:.0f} points")
+        per.append({"scenario": s[0], "without": f"{sum(rw)}/{len(rw)}", "with": f"{sum(ri)}/{len(ri)}"})
+    summary = build_summary("corpus-vscode", n, trials, retr_ok, wo, wi, per)
+
+    if verbose:
+        tot = summary["samples_per_condition"]
+        lw, hw = summary["without"]["ci95_pct"]; li, hi = summary["with"]["ci95_pct"]
+        print(f"\n{'convention (real vscode file)':<44} {'WITHOUT':>9} {'WITH':>7}")
+        print("-"*62)
+        for s in SCEN:
+            p = next(x for x in per if x["scenario"] == s[0])
+            short = s[0].replace("src/vs/", "").replace("common/", "")
+            print(f"{short:<44} {p['without']:>9} {p['with']:>7}")
+        print("-"*62)
+        print(f"real conventions retrieved by keel brief: {retr_ok}/{n}")
+        print(f"WITHOUT keel brief: {wo}/{tot} = {100*wo/tot:.0f}%   (95% CI {lw:.0f}-{hw:.0f}%)")
+        print(f"WITH    keel brief: {wi}/{tot} = {100*wi/tot:.0f}%   (95% CI {li:.0f}-{hi:.0f}%)")
+        print(f"LIFT: +{100*(wi-wo)/tot:.0f} points")
+    return summary
+
+
+def main():
+    run()
+
 
 if __name__ == "__main__":
     main()
