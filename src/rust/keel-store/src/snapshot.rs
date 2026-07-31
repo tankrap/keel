@@ -66,6 +66,12 @@ pub fn snapshot_uncached(store: &Store, dir: &Path) -> Result<ObjectId> {
 /// write-txn overhead, not the walk, is what made a clean `status` slower than git's index scan.
 pub fn snapshot_ro(store: &Store, dir: &Path) -> Result<(ObjectId, HashMap<ObjectId, Tree>)> {
     let (cache, epoch) = store.load_stat_cache()?;
+    // Stamp the new epoch BEFORE the walk. The guard trusts a cached entry only when its mtime is
+    // strictly below the epoch, so the epoch must predate every stat we take this pass — otherwise
+    // a file edited during (or right after) the walk, in the same mtime tick, has mtime < epoch and
+    // is wrongly trusted next time. Stamping at the start makes any concurrently-modified file
+    // racy (mtime >= epoch) so it is re-hashed. (git's index-timestamp semantics.)
+    let walk_epoch = now_ns();
     let mut trees = HashMap::new();
     let mut updates = Vec::new();
     let ig = Ignore::load(dir);
@@ -73,7 +79,7 @@ pub fn snapshot_ro(store: &Store, dir: &Path) -> Result<(ObjectId, HashMap<Objec
     // Refresh the stat cache with any files we had to (re)hash — just as `git status`
     // opportunistically rewrites its index's stat info. On a fully clean, warm tree `updates`
     // is empty and `put_stat_cache` is a no-op, so a repeat `status` writes nothing at all.
-    store.put_stat_cache(&updates, now_ns())?;
+    store.put_stat_cache(&updates, walk_epoch)?;
     Ok((root, trees))
 }
 
@@ -134,6 +140,9 @@ fn build_ro(
 
 fn snapshot_impl(store: &Store, dir: &Path, use_cache: bool) -> Result<ObjectId> {
     let (cache, epoch) = if use_cache { store.load_stat_cache()? } else { (HashMap::new(), 0) };
+    // Epoch stamped before the walk so a file modified during the snapshot is racy next pass and
+    // gets re-hashed rather than trusted by stat alone (see `snapshot_ro` for the full rationale).
+    let walk_epoch = now_ns();
     let mut ctx =
         SnapCtx { store, cache, epoch, use_cache, objs: Vec::new(), pending_bytes: 0, updates: Vec::new() };
     let ig = Ignore::load(dir);
@@ -142,7 +151,7 @@ fn snapshot_impl(store: &Store, dir: &Path, use_cache: bool) -> Result<ObjectId>
         store.put_many(&ctx.objs)?; // flush the tail
     }
     if use_cache {
-        store.put_stat_cache(&ctx.updates, now_ns())?;
+        store.put_stat_cache(&ctx.updates, walk_epoch)?;
     }
     Ok(root)
 }
@@ -240,6 +249,19 @@ fn build(ctx: &mut SnapCtx, dir: &Path, rel: &str, ig: &Ignore) -> Result<Object
     Ok(id)
 }
 
+/// Reject a tree entry name that could escape its parent directory on checkout. Tree objects can
+/// come from untrusted remotes (via the git bridge), so a name containing a path separator, a `..`
+/// / `.` component, or an absolute/empty path must never be joined onto the checkout dir — that
+/// would let crafted content write anywhere the process can (`../../.bashrc`, `/etc/...`).
+fn is_safe_entry_name(name: &str) -> bool {
+    !name.is_empty()
+        && name != "."
+        && name != ".."
+        && !name.contains('/')
+        && !name.contains('\\')
+        && !name.contains('\0')
+}
+
 /// Materialize `tree_id` onto `dir` (created if needed).
 pub fn checkout(store: &Store, tree_id: ObjectId, dir: &Path) -> Result<()> {
     fs::create_dir_all(dir)?;
@@ -248,6 +270,9 @@ pub fn checkout(store: &Store, tree_id: ObjectId, dir: &Path) -> Result<()> {
         _ => return Err(StoreError::Corrupt(tree_id)),
     };
     for e in &tree.entries {
+        if !is_safe_entry_name(&e.name) {
+            return Err(StoreError::Corrupt(tree_id)); // unsafe entry name — refuse to escape `dir`
+        }
         let p = dir.join(&e.name);
         if e.mode == MODE_DIR {
             checkout(store, e.id, &p)?;
@@ -329,6 +354,45 @@ mod tests {
             fs::create_dir_all(par).unwrap();
         }
         fs::write(p, content).unwrap();
+    }
+
+    #[test]
+    fn checkout_rejects_traversal_entry_names() {
+        // A tree carrying a `..` entry name (constructable from an untrusted remote via the git
+        // bridge) must NOT let checkout write outside the target dir. Regression for the path-
+        // traversal / arbitrary-write bug.
+        let sd = TmpDir::new();
+        let base = TmpDir::new();
+        let s = Store::open(sd.path()).unwrap();
+        let blob = s.put(&Object::Blob(b"pwned\n".to_vec())).unwrap();
+        let evil = s
+            .put(&Object::Tree(Tree {
+                entries: vec![TreeEntry { name: "../escaped.txt".to_string(), mode: MODE_FILE, id: blob }],
+            }))
+            .unwrap();
+        let target = base.path().join("checkout");
+        let escaped = base.path().join("escaped.txt");
+        let res = checkout(&s, evil, &target);
+        assert!(!escaped.exists(), "checkout escaped the target dir: {}", escaped.display());
+        assert!(res.is_err(), "checkout must reject a traversal entry name");
+    }
+
+    #[test]
+    fn checkout_rejects_absolute_entry_names() {
+        let sd = TmpDir::new();
+        let base = TmpDir::new();
+        let s = Store::open(sd.path()).unwrap();
+        let blob = s.put(&Object::Blob(b"x\n".to_vec())).unwrap();
+        // An absolute name would make `dir.join(name)` discard `dir` entirely.
+        let abs = base.path().join("abs_pwned.txt");
+        let evil = s
+            .put(&Object::Tree(Tree {
+                entries: vec![TreeEntry { name: abs.to_string_lossy().into_owned(), mode: MODE_FILE, id: blob }],
+            }))
+            .unwrap();
+        let res = checkout(&s, evil, &base.path().join("checkout"));
+        assert!(!abs.exists(), "checkout honored an absolute entry name");
+        assert!(res.is_err(), "checkout must reject an absolute entry name");
     }
 
     #[test]

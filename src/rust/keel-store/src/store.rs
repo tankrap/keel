@@ -31,7 +31,20 @@ use heed::types::Bytes;
 use heed::{Database, Env, EnvOpenOptions, RoTxn, RwTxn};
 use std::collections::HashSet;
 use std::fmt;
+use std::os::unix::io::AsRawFd;
 use std::path::Path;
+
+/// Advisory-lock guard held on the store's `gc.lock` file; releases (unlocks) on drop. Commit takes
+/// it shared, GC takes it exclusive, so GC can never run in the window between a commit writing its
+/// blobs/trees and advancing the ref — which would otherwise let GC sweep the not-yet-referenced
+/// objects and leave a committed change pointing at missing blobs (data loss).
+pub struct FlockGuard(std::fs::File);
+
+impl Drop for FlockGuard {
+    fn drop(&mut self) {
+        unsafe { libc::flock(self.0.as_raw_fd(), libc::LOCK_UN) };
+    }
+}
 
 /// Default LMDB map size (address-space reservation; the file is sparse).
 const DEFAULT_MAP_SIZE: usize = 64 * 1024 * 1024 * 1024; // 64 GiB
@@ -162,6 +175,31 @@ impl Store {
             deltas,
             aux,
         })
+    }
+
+    /// Open (creating if needed) the `gc.lock` file and take an advisory `flock`. `exclusive`
+    /// selects `LOCK_EX` (GC) vs `LOCK_SH` (commit); the call blocks until the lock is granted.
+    fn flock(&self, exclusive: bool) -> Result<FlockGuard> {
+        let path = self.env.path().join("gc.lock");
+        let file = std::fs::OpenOptions::new().create(true).write(true).truncate(false).open(&path)?;
+        let op = if exclusive { libc::LOCK_EX } else { libc::LOCK_SH };
+        // Retry on EINTR; any other error is a real lock failure.
+        loop {
+            let rc = unsafe { libc::flock(file.as_raw_fd(), op) };
+            if rc == 0 {
+                return Ok(FlockGuard(file));
+            }
+            let err = std::io::Error::last_os_error();
+            if err.raw_os_error() != Some(libc::EINTR) {
+                return Err(StoreError::Io(err));
+            }
+        }
+    }
+
+    /// Take the shared commit lock — held across a commit's snapshot-write and ref-advance so GC
+    /// (which takes it exclusive) cannot sweep the objects in between. Multiple commits share it.
+    pub fn commit_lock(&self) -> Result<FlockGuard> {
+        self.flock(false)
     }
 
     /// Store an object, returning its content address. Idempotent.
@@ -774,6 +812,10 @@ impl Store {
     /// commit cannot interleave between mark and sweep and re-reference (e.g. via dedup) an
     /// object we're about to delete; other writers simply queue for GC's duration.
     pub fn gc(&self) -> Result<GcStats> {
+        // Exclude concurrent commits: a commit writes its blobs/trees and then advances the ref in
+        // a separate transaction, so without this a GC in that gap would sweep the new-but-unrooted
+        // objects and corrupt the committed change. Held for the whole mark+sweep.
+        let _lock = self.flock(true)?;
         let mut w = self.env.write_txn()?;
         let mut reach_obj: HashSet<[u8; 32]> = HashSet::new();
         let mut reach_chunk: HashSet<[u8; 32]> = HashSet::new();
@@ -1021,6 +1063,27 @@ mod tests {
 
     fn oid(b: u8) -> ObjectId {
         ObjectId([b; 32])
+    }
+
+    #[test]
+    fn gc_is_excluded_while_a_commit_lock_is_held() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        let d = TmpDir::new();
+        let s = Store::open(&d.0).unwrap();
+        let held = s.commit_lock().unwrap(); // shared — as a commit would hold across snapshot+ref
+        let s2 = s.clone();
+        let done = Arc::new(AtomicBool::new(false));
+        let d2 = Arc::clone(&done);
+        let h = std::thread::spawn(move || {
+            s2.gc().unwrap(); // exclusive — must block until `held` is dropped
+            d2.store(true, Ordering::SeqCst);
+        });
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert!(!done.load(Ordering::SeqCst), "gc ran while the commit lock was held");
+        drop(held);
+        h.join().unwrap();
+        assert!(done.load(Ordering::SeqCst), "gc should complete once the commit lock releases");
     }
 
     #[test]

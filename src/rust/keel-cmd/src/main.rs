@@ -117,10 +117,8 @@ fn fix_hint(msg: &str) -> Option<String> {
         Some("run `keel commit -m \"…\"` first".into())
     } else if m.contains("not a git repo") || m.contains("no .keel") || m.contains("not a keel repo") {
         Some("run `keel init` in the repository root".into())
-    } else if let Some(rest) = msg.split_once("usage:") {
-        Some(format!("usage:{}", rest.1))
     } else {
-        None
+        msg.split_once("usage:").map(|rest| format!("usage:{}", rest.1))
     }
 }
 
@@ -151,8 +149,28 @@ fn print_usage() {
 
 fn cmd_init(args: &[String]) -> io::Result<()> {
     // git init first (drop-in), passing through any positional dir / git flags, then set up the
-    // keel store alongside so the repo is both git- and keel-tracked from the start.
-    let status = std::process::Command::new("git").arg("init").args(args).status();
+    // keel store alongside so the repo is both git- and keel-tracked from the start. keel's own
+    // flags (--root/--store/--resolver, each with a value) are not git's — strip them, and when
+    // --root names the target without a positional dir, hand git that root as the directory.
+    let mut git_args: Vec<&String> = Vec::new();
+    let mut skip = false;
+    for a in args {
+        if skip {
+            skip = false;
+            continue;
+        }
+        if a == "--root" || a == "--store" || a == "--resolver" {
+            skip = true;
+            continue;
+        }
+        git_args.push(a);
+    }
+    let mut git = std::process::Command::new("git");
+    git.arg("init").args(&git_args);
+    if flag(args, "--root").is_some() && !git_args.iter().any(|a| !a.starts_with('-')) {
+        git.arg(flag(args, "--root").unwrap());
+    }
+    let status = git.status();
     match status {
         Ok(s) if s.success() => {}
         Ok(_) => std::process::exit(1),
@@ -1481,6 +1499,20 @@ fn cmd_import(args: &[String]) -> io::Result<()> {
     let store = PathBuf::from(into).join(".keel/store");
     let repo = Repo::open(&store).map_err(to_io)?;
 
+    // NOTE: this replays FIRST-PARENT history only, so merge commits are linearized and any commit
+    // reachable only through a merge's second+ parent is not imported (see issue #34 for the full
+    // DAG-preserving fix). Warn loudly rather than dropping history silently.
+    if let Ok(out) = Command::new("git").args(["-C", src, "rev-list", "--all", "--merges", "--count"]).output() {
+        let merges: u64 = String::from_utf8_lossy(&out.stdout).trim().parse().unwrap_or(0);
+        if merges > 0 {
+            eprintln!(
+                "keel import: warning — {merges} merge commit(s) present; import follows first-parent \
+                 only, so merged-in branch history will NOT be imported. Use `keel mirror-in` to \
+                 preserve the full commit graph."
+            );
+        }
+    }
+
     // first-parent history, oldest→newest, unit-separator delimited
     let log = Command::new("git")
         .args(["-C", src, "log", "--first-parent", "--reverse", "--format=%H%x1f%an%x1f%at%x1f%s"])
@@ -1788,7 +1820,7 @@ fn cmd_log(args: &[String]) -> io::Result<()> {
 // ── daemon client ────────────────────────────────────────────────────────────
 
 fn daemon_request(root: &Path, req: &Value) -> Option<Value> {
-    let sock = root.join(".keel/daemon.sock");
+    let sock = keel_store::daemon_socket_path(root);
     let mut stream = UnixStream::connect(&sock).ok()?;
     stream.write_all(serde_json::to_string(req).ok()?.as_bytes()).ok()?;
     stream.write_all(b"\n").ok()?;

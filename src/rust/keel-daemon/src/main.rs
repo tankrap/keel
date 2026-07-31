@@ -21,7 +21,7 @@ use keel_brief::BriefService;
 use keel_store::LiveStatus;
 use notify::{RecursiveMode, Watcher};
 use serde_json::{json, Value};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::sync_channel;
@@ -54,10 +54,10 @@ struct Ctx {
 /// stream. `addr` is `host:port` (`0` picks a free port); the runtime thread lives for the
 /// daemon's lifetime.
 fn start_quic(addr: &str, store: keel_store::Store) -> Option<keel_net::Publisher> {
-    // Accept "host:port" or a bare port (bound on all interfaces).
+    // Accept "host:port" or a bare port (bound on loopback — a public bind needs an explicit host).
     let sockaddr: std::net::SocketAddr = addr
         .parse()
-        .or_else(|_| addr.parse::<u16>().map(|p| ([0, 0, 0, 0], p).into()))
+        .or_else(|_| addr.parse::<u16>().map(|p| ([127, 0, 0, 1], p).into()))
         .ok()?;
     let (tx, rx) = sync_channel::<Result<(keel_net::Publisher, std::net::SocketAddr), String>>(1);
     std::thread::spawn(move || {
@@ -102,6 +102,26 @@ fn start_quic(addr: &str, store: keel_store::Store) -> Option<keel_net::Publishe
 /// in the OS backlog) until a slot frees.
 const MAX_INFLIGHT: usize = 128;
 
+/// Hard cap on a single request read off the socket. `read_line` grows until a newline, so an
+/// unbounded stream with no `\n` would let one client OOM the whole daemon; requests are small
+/// JSON objects, so 1 MiB is generous.
+const MAX_REQUEST_BYTES: u64 = 1024 * 1024;
+
+/// Returns a concurrency slot to the semaphore when dropped — even on a worker panic/unwind.
+struct SlotGuard(std::sync::mpsc::SyncSender<()>);
+impl Drop for SlotGuard {
+    fn drop(&mut self) {
+        let _ = self.0.send(());
+    }
+}
+
+/// Lock a mutex, tolerating poisoning. A panic while a lock is held would otherwise poison it and
+/// make every later `.lock().unwrap()` panic — turning one bad request into a permanent daemon DoS.
+/// The protected state is plain data (graph/status caches), so recovering the inner value is safe.
+fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let root = flag(&args, "--root")
@@ -121,7 +141,8 @@ fn main() {
         None => PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../keel-resolve/sidecar")),
     };
 
-    let sock = root.join(".keel/daemon.sock");
+    // Shared with the CLI so both agree on the path even when it falls back off the long repo path.
+    let sock = keel_store::daemon_socket_path(&root);
     if let Some(parent) = sock.parent() {
         std::fs::create_dir_all(parent).ok();
     }
@@ -185,11 +206,12 @@ fn main() {
     // full with MAX_INFLIGHT tokens; the accept loop takes one before spawning a worker
     // (blocking, so a flood applies back-pressure instead of spawning unbounded threads),
     // and the worker returns it when the connection is done.
-    // Optional QUIC coordination server: `--quic [host:port]` (default 0.0.0.0:0 → a free port).
-    // With it up, every brief broadcasts "an agent is working on file X" and `keel announce`
-    // pushes lessons/commits to the fleet — live coordination over the wire, not just the socket.
+    // Optional QUIC coordination server: `--quic [host:port]`. Defaults to loopback (127.0.0.1:0):
+    // the server is currently unauthenticated (no client auth / cert pinning), so binding all
+    // interfaces by default would expose the fleet event stream and object fetch to the network.
+    // An explicit `--quic 0.0.0.0:PORT` still opts into a public bind.
     let coord = if args.iter().any(|a| a == "--quic") {
-        let addr = flag(&args, "--quic").unwrap_or("0.0.0.0:0");
+        let addr = flag(&args, "--quic").unwrap_or("127.0.0.1:0");
         start_quic(addr, svc.repo().store().clone())
     } else {
         None
@@ -219,13 +241,21 @@ fn main() {
             break; // semaphore closed — shutting down
         }
         let ctx = Arc::clone(&ctx);
-        let slot_tx = slot_tx.clone();
+        // Release the slot from a Drop guard, so it is returned even if the worker *panics*.
+        // Without this, a panicking handler would leak its slot; after MAX_INFLIGHT panics the
+        // accept loop would block forever on `slot_rx.recv()` and the daemon would wedge.
+        let slot = SlotGuard(slot_tx.clone());
         std::thread::spawn(move || {
+            let _slot = slot; // dropped (slot released) on any exit, including unwind
             let _ = stream.set_read_timeout(Some(Duration::from_secs(30)));
-            if let Err(e) = serve_one(&ctx, stream) {
-                eprintln!("keeld: connection dropped: {e}");
+            // Contain a handler panic to this connection instead of poisoning shared state and
+            // tearing down the thread mid-response; the slot still releases via `_slot`.
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| serve_one(&ctx, stream)));
+            match result {
+                Ok(Err(e)) => eprintln!("keeld: connection dropped: {e}"),
+                Err(_) => eprintln!("keeld: connection handler panicked (contained)"),
+                Ok(Ok(())) => {}
             }
-            let _ = slot_tx.send(()); // release the slot
         });
     }
     let _ = std::fs::remove_file(&sock);
@@ -237,7 +267,7 @@ fn main() {
 fn start_status_watch(root: &Path, pending: &Arc<Mutex<Pending>>) -> notify::Result<notify::RecommendedWatcher> {
     let sink = Arc::clone(pending);
     let mut watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
-        let mut p = sink.lock().unwrap();
+        let mut p = lock(&sink);
         match res {
             Ok(ev) if ev.need_rescan() => p.full_rescan = true,
             Ok(ev) => p.paths.extend(ev.paths),
@@ -251,7 +281,8 @@ fn start_status_watch(root: &Path, pending: &Arc<Mutex<Pending>>) -> notify::Res
 fn serve_one(ctx: &Ctx, stream: UnixStream) -> std::io::Result<()> {
     let mut reader = BufReader::new(stream.try_clone()?);
     let mut line = String::new();
-    if reader.read_line(&mut line)? == 0 {
+    // Bound the read: a client that never sends `\n` can't grow `line` past the cap and OOM us.
+    if reader.by_ref().take(MAX_REQUEST_BYTES).read_line(&mut line)? == 0 {
         return Ok(()); // client closed (or timed out) without a request
     }
     let req: Value = serde_json::from_str(line.trim()).unwrap_or_else(|_| json!({}));
@@ -269,12 +300,12 @@ fn status_response(ctx: &Ctx) -> Value {
         return json!({"ok": false, "error": "status unavailable on this daemon"});
     };
     let (paths, rescan) = {
-        let mut p = ctx.pending.lock().unwrap();
+        let mut p = lock(&ctx.pending);
         (std::mem::take(&mut p.paths), std::mem::replace(&mut p.full_rescan, false))
     };
     {
-        let svc = ctx.svc.lock().unwrap();
-        let mut l = live.lock().unwrap();
+        let svc = lock(&ctx.svc);
+        let mut l = lock(live);
         if rescan {
             match LiveStatus::seed(svc.repo(), svc.root()) {
                 Ok(fresh) => *l = fresh,
@@ -347,7 +378,7 @@ fn handle(ctx: &Ctx, req: &Value) -> Value {
             // Fleet presence: broadcast that this agent is about to work on `file`, so other
             // agents/dashboards see who's working where in real time (coordination, not just data).
             broadcast(ctx, &json!({"kind": "brief", "agent": agent, "file": file, "task": task, "ts": now_secs()}));
-            let mut svc = ctx.svc.lock().unwrap();
+            let mut svc = lock(&ctx.svc);
             let svc = &mut *svc;
             // per-request agent id — the shared coordinator evaluates reservations/predictions
             // against THIS agent, so many agents coordinate through the one warm daemon.

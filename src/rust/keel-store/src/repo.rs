@@ -105,6 +105,9 @@ impl Repo {
         timestamp: u64,
         session: Option<ObjectId>,
     ) -> Result<ObjectId> {
+        // Hold the shared commit lock across snapshot + ref-advance so a concurrent GC can't sweep
+        // the just-written objects before they're referenced (see `Store::gc`).
+        let _lock = self.store.commit_lock()?;
         let tree = snapshot::snapshot(&self.store, work_dir)?;
         self.commit_tree(tree, intent, author, timestamp, session)
     }
@@ -120,6 +123,7 @@ impl Repo {
         timestamp: u64,
         session: Option<ObjectId>,
     ) -> Result<ObjectId> {
+        let _lock = self.store.commit_lock()?; // see `commit_dir`
         let tree = snapshot::snapshot_uncached(&self.store, work_dir)?;
         self.commit_tree(tree, intent, author, timestamp, session)
     }

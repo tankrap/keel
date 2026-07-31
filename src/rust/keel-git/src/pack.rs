@@ -12,6 +12,12 @@ use sha1::{Digest, Sha1};
 use std::collections::HashMap;
 use std::io;
 
+/// Upper bound on a single object's declared uncompressed size (and on a delta's target size).
+/// Object headers and delta streams carry these as unbounded varints; a crafted value would make
+/// us pre-allocate an enormous buffer and abort the process, so reject anything past this cap
+/// before allocating. 4 GiB is well above any real source object while keeping allocations sane.
+const MAX_OBJECT_SIZE: usize = 4 * 1024 * 1024 * 1024;
+
 /// git pack object type numbers (non-delta): commit=1, tree=2, blob=3, tag=4.
 fn type_num(k: Kind) -> u8 {
     match k {
@@ -258,7 +264,10 @@ pub fn read(
     let mut pos = 12;
     let mut by_offset: HashMap<usize, (Kind, Vec<u8>)> = HashMap::new();
     let mut by_oid: HashMap<[u8; 20], (Kind, Vec<u8>)> = HashMap::new();
-    let mut out = Vec::with_capacity(count);
+    // The header's object count is attacker-controlled (up to 4.29B). Each object costs at least a
+    // few bytes on the wire, so a legitimate `count` can't exceed the remaining pack length — cap
+    // the capacity hint by it so a bogus count can't drive a huge up-front reservation.
+    let mut out = Vec::with_capacity(count.min(pack.len()));
 
     for _ in 0..count {
         let obj_offset = pos;
@@ -320,6 +329,10 @@ fn parse_obj_header(buf: &[u8]) -> Option<(u8, usize, usize)> {
     let mut i = 1;
     let mut b = b0;
     while b & 0x80 != 0 {
+        // Bound the varint: past 64 bits the shift overflows (panic in debug, garbage in release).
+        if shift >= usize::BITS as usize {
+            return None;
+        }
         b = *buf.get(i)?;
         size |= ((b & 0x7f) as usize) << shift;
         shift += 7;
@@ -336,7 +349,9 @@ fn parse_ofs(buf: &[u8]) -> Option<(usize, usize)> {
     while c & 0x80 != 0 {
         c = *buf.get(i)?;
         i += 1;
-        off = ((off + 1) << 7) | (c & 0x7f) as usize;
+        // A valid ofs-delta offset fits in usize; reject an over-long varint rather than overflow.
+        // `(off + 1) << 7 | low7` == `(off + 1) * 128 + low7` since the low 7 bits are clear.
+        off = off.checked_add(1).and_then(|o| o.checked_mul(128))? | (c & 0x7f) as usize;
     }
     Some((off, i))
 }
@@ -350,6 +365,11 @@ fn inflate(input: &[u8], expected: usize) -> io::Result<(Vec<u8>, usize)> {
     use miniz_oxide::inflate::core::{decompress, DecompressorOxide};
     use miniz_oxide::inflate::TINFLStatus;
 
+    // `expected` is an attacker-controlled object-size varint; `vec![0u8; expected]` commits pages
+    // immediately, so a huge value aborts the process. Reject oversized objects before allocating.
+    if expected > MAX_OBJECT_SIZE {
+        return Err(bad("pack object exceeds size limit"));
+    }
     let mut out = vec![0u8; expected];
     let mut d = DecompressorOxide::new();
     let flags = TINFL_FLAG_PARSE_ZLIB_HEADER | TINFL_FLAG_USING_NON_WRAPPING_OUTPUT_BUF;
@@ -365,6 +385,10 @@ fn apply_delta(base: &[u8], delta: &[u8]) -> io::Result<Vec<u8>> {
     let mut i = 0;
     let _base_size = read_delta_varint(delta, &mut i).ok_or_else(|| bad("delta base size"))?;
     let target_size = read_delta_varint(delta, &mut i).ok_or_else(|| bad("delta target size"))?;
+    // Bound the attacker-controlled target size before reserving (mirrors the `inflate` cap).
+    if target_size > MAX_OBJECT_SIZE {
+        return Err(bad("delta target exceeds size limit"));
+    }
     let mut out = Vec::with_capacity(target_size);
     while i < delta.len() {
         let op = delta[i];
@@ -411,6 +435,9 @@ fn read_delta_varint(buf: &[u8], i: &mut usize) -> Option<usize> {
     let mut v = 0usize;
     let mut shift = 0;
     loop {
+        if shift >= usize::BITS as usize {
+            return None; // varint longer than usize — reject rather than overflow the shift
+        }
         let b = *buf.get(*i)?;
         *i += 1;
         v |= ((b & 0x7f) as usize) << shift;
@@ -431,6 +458,25 @@ mod tests {
 
     fn no_base(_: &Oid) -> Option<(Kind, Vec<u8>)> {
         None
+    }
+
+    #[test]
+    fn malicious_headers_error_instead_of_crashing() {
+        // A tiny packfile whose object-size varint declares a ~2^60-byte object must be rejected
+        // before allocating (regression for the unauthenticated receive-pack allocation abort).
+        let mut p = b"PACK".to_vec();
+        p.extend_from_slice(&2u32.to_be_bytes());
+        p.extend_from_slice(&1u32.to_be_bytes());
+        p.push(0x90); // continuation | type=commit(1) | low4 size=0
+        p.extend_from_slice(&[0xff; 7]); // seven continuation bytes → a ~2^60 declared size
+        p.push(0x7f);
+        assert!(read(&p, &no_base).is_err(), "oversized object size must be a clean error");
+
+        // A header claiming 0xFFFF_FFFF objects but carrying none must not pre-reserve or hang.
+        let mut q = b"PACK".to_vec();
+        q.extend_from_slice(&2u32.to_be_bytes());
+        q.extend_from_slice(&0xFFFF_FFFFu32.to_be_bytes());
+        assert!(read(&q, &no_base).is_err(), "bogus object count must be a clean error");
     }
 
     #[test]
@@ -485,6 +531,6 @@ mod tests {
         assert_eq!(&pack[0..4], b"PACK");
         assert_eq!(&pack[4..8], &2u32.to_be_bytes());
         assert_eq!(&pack[8..12], &1u32.to_be_bytes());
-        assert_eq!(pack.len() >= 12 + 20, true); // header + at least the trailer
+        assert!(pack.len() >= 12 + 20); // header + at least the trailer
     }
 }

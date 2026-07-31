@@ -37,7 +37,7 @@ mkdir -p "$TMP/repo"
 printf 'export function helper(x: number): number { return x * 2; }\n' > "$TMP/repo/util.ts"
 printf 'import { helper } from "./util.js";\nexport function doA(): number { return helper(21); }\n' > "$TMP/repo/a.ts"
 "$KEEL" init --root "$TMP/repo" >/dev/null 2>&1
-"$KEEL" commit --root "$TMP/repo" -m init >/dev/null 2>&1
+"$KEEL" native commit --root "$TMP/repo" -m init >/dev/null 2>&1
 
 section "relevance — cross-file symbol slice (bar: ≥2 defs incl cross-file callee)"
 BJSON=$("$KEEL" brief --root "$TMP/repo" --file a.ts --symbol doA --json 2>/dev/null)
@@ -51,7 +51,7 @@ DEPS=$("$KEEL" brief --root "$TMP/repo" --file b.ts --json 2>/dev/null | python3
 if print -r -- "$DEPS" | grep -q "util.ts"; then pass "uncommitted b.ts → dep util.ts (live)"; else fail "liveness (deps=$DEPS)"; fi
 
 section "feedback — verify + pin surface in the brief"
-CH=$("$KEEL" log --root "$TMP/repo" 2>/dev/null | head -1 | awk '{print $1}')
+CH=$("$KEEL" native log --root "$TMP/repo" 2>/dev/null | head -1 | awk '{print $1}')
 "$KEEL" verify "$CH" --green --root "$TMP/repo" >/dev/null 2>&1
 "$KEEL" pin doA --lesson "always settle first" --root "$TMP/repo" >/dev/null 2>&1
 VJSON=$("$KEEL" brief --root "$TMP/repo" --file a.ts --symbol doA --json 2>/dev/null)
@@ -63,14 +63,14 @@ G="$TMP/gitsrc"; mkdir -p "$G"; ( cd "$G" && git init -q && git config user.emai
   && printf 'x1\n' > f.txt && git add -A && git commit -qm c1 \
   && printf 'x2\n' > f.txt && printf 'y\n' > g.txt && git add -A && git commit -qm c2 ) >/dev/null 2>&1
 "$KEEL" import "$G" --into "$G" >/dev/null 2>&1
-IC=$("$KEEL" log --root "$G" 2>/dev/null | wc -l | tr -d ' ')
+IC=$("$KEEL" native log --root "$G" 2>/dev/null | wc -l | tr -d ' ')
 "$KEEL" export "$TMP/gitout" --store "$G/.keel/store" >/dev/null 2>&1
 EC=$(git -C "$TMP/gitout" log --oneline 2>/dev/null | wc -l | tr -d ' ')
 if [ "$IC" = "2" ] && [ "$EC" = "2" ]; then pass "import 2 → export 2 commits"; else fail "on-ramp (import=$IC export=$EC)"; fi
 
 section "status/diff correctness"
 printf 'export function helper(x: number): number { return x * 3; }\n' > "$TMP/repo/util.ts"
-ST=$("$KEEL" status --root "$TMP/repo" 2>/dev/null)
+ST=$("$KEEL" native status --root "$TMP/repo" 2>/dev/null)
 if print -r -- "$ST" | grep -q "util.ts"; then pass "status detects the edit"; else fail "status ($ST)"; fi
 
 rm -rf "$TMP"
