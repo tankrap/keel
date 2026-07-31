@@ -263,11 +263,12 @@
           </tr>
           <tr>
             <td>linux kernel</td>
-            <td class="n" id="git-linux-status"><span class="win">0.26 s</span></td>
-            <td class="n col-keel">0.42 s</td>
-            <td>read-only status now writes no objects (was re-persisting ~5k unchanged trees in a
-                write txn every call); a genuinely-clean tree short-circuits the diff. git's index
-                still edges it; the fs-watch daemon (O(changed)) is the path to parity</td>
+            <td class="n" id="git-linux-status">0.26 s</td>
+            <td class="n col-keel"><span class="win">~0.00 s</span></td>
+            <td>standalone the read-only walk is 0.42&nbsp;s (writes no objects; clean tree
+                short-circuits the diff). With <code>keeld</code> up, an fs-watch-fed LiveStatus
+                answers in <b>O(changed)</b> — a repeat status is <b>&lt;10&nbsp;ms</b>, beating
+                git's 0.26&nbsp;s index scan</td>
           </tr>
         </tbody>
       </table>

@@ -250,30 +250,43 @@ fn session_from_file(repo: &Repo, path: &str, msg: &str, lesson_override: Option
 
 fn cmd_status(args: &[String]) -> io::Result<()> {
     let (root, store) = root_store(args)?;
-    let repo = Repo::open(&store).map_err(to_io)?;
-    let changes = repo.status(&root).map_err(to_io)?;
+
+    // Prefer the warm daemon: its fs-watched LiveStatus answers in O(changed) instead of walking
+    // the whole tree. Fall back to a local walk if no daemon is up (or it can't serve status).
+    let rows: Vec<Value> = match daemon_request(&root, &json!({ "op": "status" }))
+        .filter(|r| r.get("ok").and_then(Value::as_bool) == Some(true))
+        .and_then(|r| r.get("changes").and_then(Value::as_array).cloned())
+    {
+        Some(rows) => rows,
+        None => {
+            let repo = Repo::open(&store).map_err(to_io)?;
+            repo.status(&root)
+                .map_err(to_io)?
+                .iter()
+                .map(|c| json!({ "path": c.path, "status": c.kind.marker().to_string() }))
+                .collect()
+        }
+    };
 
     if has(args, "--json") {
-        let rows: Vec<Value> = changes
-            .iter()
-            .map(|c| json!({ "path": c.path, "status": c.kind.marker().to_string() }))
-            .collect();
         println!("{}", render_json(&json!({ "changes": rows })));
         return Ok(());
     }
 
-    if changes.is_empty() {
+    if rows.is_empty() {
         println!("working tree clean (matches HEAD)");
         return Ok(());
     }
     let (mut a, mut m, mut d) = (0, 0, 0);
-    for c in &changes {
-        match c.kind {
-            keel_store::ChangeKind::Added => a += 1,
-            keel_store::ChangeKind::Modified => m += 1,
-            keel_store::ChangeKind::Deleted => d += 1,
+    for c in &rows {
+        let marker = c.get("status").and_then(Value::as_str).unwrap_or("?");
+        match marker {
+            "A" => a += 1,
+            "M" => m += 1,
+            "D" => d += 1,
+            _ => {}
         }
-        println!("  {} {}", c.kind.marker(), c.path);
+        println!("  {} {}", marker, c.get("path").and_then(Value::as_str).unwrap_or(""));
     }
     println!("{a} added, {m} modified, {d} deleted");
     Ok(())

@@ -28,6 +28,12 @@ const FLUSH_BYTES: usize = 256 * 1024 * 1024;
 /// root doesn't ingest `node_modules`, `.git`, `.keel`, etc.
 const IGNORED: &[&str] = &[".keel", "node_modules", ".git", "target", "dist", "build"];
 
+/// Whether a path component is skipped by snapshotting (build artifacts + VCS internals). Shared
+/// with [`crate::livestatus`] so the warm status tracker ignores exactly what snapshots ignore.
+pub fn is_ignored(name: &str) -> bool {
+    IGNORED.contains(&name)
+}
+
 /// Snapshot `dir` recursively, returning the root tree's address. Symlinks and other
 /// non-regular files are skipped (a real ignore policy comes later).
 ///

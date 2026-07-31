@@ -10,4 +10,6 @@ path = "src/main.rs"
 
 [dependencies]
 keel-brief = { path = "../keel-brief" }
+keel-store = { path = "../keel-store" }
 serde_json = "1"
+notify = "6"
