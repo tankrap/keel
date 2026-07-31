@@ -314,6 +314,19 @@ fn ingest_repo(
     use std::io::Write;
     use std::process::{Command, Stdio};
 
+    // Native path (no git binary): read the repo's loose objects + packfiles + refs directly.
+    // Used for a full ingest; the incremental re-sync still uses `git cat-file` to cheaply list
+    // only-new oids.
+    if !incremental {
+        if let Some(git_dir) = keel_git::gitdir::locate(Path::new(repo)) {
+            let objs = keel_git::gitdir::read_all_objects(&git_dir)?;
+            let stats = keel_git::mirror::ingest_objects(store, &objs)?;
+            let refs = keel_git::gitdir::read_refs(&git_dir)?;
+            keel_git::mirror::ingest_refs(store, &refs)?;
+            return Ok(stats);
+        }
+    }
+
     let stats = if incremental {
         // list every oid, keep only the ones we don't already hold
         let check = Command::new("git")

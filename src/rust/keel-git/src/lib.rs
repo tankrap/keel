@@ -12,6 +12,7 @@
 //! built on top (mirror, server, client) can be trusted — so it is fuzzed against real repos.
 
 pub mod bridge;
+pub mod gitdir;
 pub mod loose;
 pub mod mirror;
 pub mod oid;

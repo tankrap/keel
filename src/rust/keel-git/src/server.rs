@@ -65,7 +65,21 @@ pub fn pack_for(store: &Store, wants: &[Oid]) -> io::Result<Vec<u8>> {
             objects.push(obj);
         }
     }
-    Ok(crate::pack::write(&objects))
+    Ok(pack_bytes(&objects))
+}
+
+/// Pack a set of objects, delta-compressing when it's affordable. On a very large repo, full LZ
+/// delta over every object would stall the request, so fall back to the fast undeltified writer
+/// (the client repacks locally either way).
+pub fn pack_bytes(objects: &[(Kind, Vec<u8>)]) -> Vec<u8> {
+    const DELTA_BUDGET_OBJS: usize = 20_000;
+    const DELTA_BUDGET_BYTES: usize = 128 * 1024 * 1024;
+    let total: usize = objects.iter().map(|(_, p)| p.len()).sum();
+    if objects.len() <= DELTA_BUDGET_OBJS && total <= DELTA_BUDGET_BYTES {
+        crate::pack::write_deltified(objects)
+    } else {
+        crate::pack::write(objects)
+    }
 }
 
 /// The direct (non-symbolic) refs to advertise, as `(name, oid)`. Symbolic refs like HEAD are
