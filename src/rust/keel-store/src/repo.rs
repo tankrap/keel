@@ -63,6 +63,30 @@ impl Repo {
         self.store.get_ref(&self.branch)
     }
 
+    /// Paths tracked in HEAD — every file, plus each ancestor directory. The snapshot/status walk
+    /// uses this to exempt already-tracked paths from `.gitignore` (git only ignores untracked
+    /// paths), so a force-added ignored file isn't dropped or reported as a spurious deletion.
+    fn tracked_paths(&self) -> Result<HashSet<String>> {
+        let mut set = HashSet::new();
+        let head_tree = match self.head()? {
+            Some(h) => self.change(h)?.ok_or(StoreError::Corrupt(h))?.tree,
+            None => return Ok(set),
+        };
+        let mut files = Vec::new();
+        self.tree_files(head_tree, "", &mut files)?;
+        for (path, _) in files {
+            // insert every ancestor directory prefix, then the file itself
+            let mut idx = 0;
+            while let Some(pos) = path[idx..].find('/') {
+                let end = idx + pos;
+                set.insert(path[..end].to_string());
+                idx = end + 1;
+            }
+            set.insert(path);
+        }
+        Ok(set)
+    }
+
     /// Commit an already-snapshotted `tree` as a new change, advancing the branch.
     /// Parents are the current tip (empty for the first commit).
     pub fn commit_tree(
@@ -108,7 +132,8 @@ impl Repo {
         // Hold the shared commit lock across snapshot + ref-advance so a concurrent GC can't sweep
         // the just-written objects before they're referenced (see `Store::gc`).
         let _lock = self.store.commit_lock()?;
-        let tree = snapshot::snapshot(&self.store, work_dir)?;
+        let tracked = self.tracked_paths()?;
+        let tree = snapshot::snapshot_tracked(&self.store, work_dir, &tracked)?;
         self.commit_tree(tree, intent, author, timestamp, session)
     }
 
@@ -124,7 +149,8 @@ impl Repo {
         session: Option<ObjectId>,
     ) -> Result<ObjectId> {
         let _lock = self.store.commit_lock()?; // see `commit_dir`
-        let tree = snapshot::snapshot_uncached(&self.store, work_dir)?;
+        let tracked = self.tracked_paths()?;
+        let tree = snapshot::snapshot_uncached_tracked(&self.store, work_dir, &tracked)?;
         self.commit_tree(tree, intent, author, timestamp, session)
     }
 
@@ -219,7 +245,8 @@ impl Repo {
     /// real commit and are reclaimed by GC — `status` never advances a ref.
     pub fn status(&self, work_dir: &Path) -> Result<Vec<PathChange>> {
         // Read-only snapshot: compute the work root + its trees in memory, writing nothing.
-        let (work_root, work_trees) = snapshot::snapshot_ro(&self.store, work_dir)?;
+        let tracked = self.tracked_paths()?;
+        let (work_root, work_trees) = snapshot::snapshot_ro_tracked(&self.store, work_dir, &tracked)?;
         let head_tree = match self.head()? {
             Some(h) => Some(self.change(h)?.ok_or(StoreError::Corrupt(h))?.tree),
             None => None,
@@ -680,6 +707,28 @@ mod tests {
         let repo2 = Repo::open(sd2.path()).unwrap();
         let b = repo2.commit_tree(tree, "msg", "acct", 42, None).unwrap();
         assert_eq!(a, b);
+    }
+
+    #[test]
+    fn tracked_file_is_not_ignored_by_a_later_gitignore() {
+        // git only ignores UNtracked paths: once a file is committed, adding a .gitignore that
+        // matches it must not make status treat it as deleted (regression for the force-added /
+        // vendored-file data-loss bug).
+        let sd = TmpDir::new();
+        let work = TmpDir::new();
+        let repo = Repo::open(sd.path()).unwrap();
+        fs::write(work.path().join("app.min.js"), b"vendored\n").unwrap();
+        repo.commit_dir(work.path(), "add vendored", "acct", 1, None).unwrap();
+        // now introduce an ignore rule that would match the already-tracked file
+        fs::write(work.path().join(".gitignore"), b"*.min.js\n").unwrap();
+        repo.commit_dir(work.path(), "add gitignore", "acct", 2, None).unwrap();
+
+        // the tracked file is present and unmodified → status must be clean, not "deleted"
+        let st = repo.status(work.path()).unwrap();
+        assert!(st.is_empty(), "tracked-but-ignored file wrongly reported: {st:?}");
+        // and it must still be tracked in HEAD
+        let head = repo.head().unwrap().unwrap();
+        assert!(repo.file_at(head, "app.min.js").unwrap().is_some(), "tracked file dropped from HEAD");
     }
 
     #[test]

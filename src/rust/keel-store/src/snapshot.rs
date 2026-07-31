@@ -9,7 +9,7 @@
 use crate::ignorerules::Ignore;
 use crate::object::{Object, ObjectId, Tree, TreeEntry};
 use crate::store::{Result, StatEntry, Store, StoreError};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::Path;
 use std::time::UNIX_EPOCH;
@@ -43,7 +43,15 @@ const FLUSH_BYTES: usize = 256 * 1024 * 1024;
 ///    root; the commit's ref advance (in `Repo`) is the atomic step, so a crash mid-flush
 ///    only leaves unreachable objects for GC — never a dangling HEAD.
 pub fn snapshot(store: &Store, dir: &Path) -> Result<ObjectId> {
-    snapshot_impl(store, dir, true)
+    snapshot_impl(store, dir, true, &HashSet::new())
+}
+
+/// Like [`snapshot`] but `tracked` names the paths already committed in HEAD (files and their
+/// ancestor dirs). git only ignores *untracked* paths, so an ignored path that is already tracked
+/// must still be snapshotted; without this, a force-added ignored file (`git add -f`) is dropped
+/// from the tree and shows as a spurious deletion.
+pub fn snapshot_tracked(store: &Store, dir: &Path, tracked: &HashSet<String>) -> Result<ObjectId> {
+    snapshot_impl(store, dir, true, tracked)
 }
 
 /// Like [`snapshot`] but ignores the stat cache — always reads + hashes every file. Use when
@@ -52,7 +60,12 @@ pub fn snapshot(store: &Store, dir: &Path) -> Result<ObjectId> {
 /// files written within one mtime tick at the same path would false-hit ("racy git"). Slower,
 /// but always correct.
 pub fn snapshot_uncached(store: &Store, dir: &Path) -> Result<ObjectId> {
-    snapshot_impl(store, dir, false)
+    snapshot_impl(store, dir, false, &HashSet::new())
+}
+
+/// Like [`snapshot_uncached`] but honors HEAD's `tracked` paths (see [`snapshot_tracked`]).
+pub fn snapshot_uncached_tracked(store: &Store, dir: &Path, tracked: &HashSet<String>) -> Result<ObjectId> {
+    snapshot_impl(store, dir, false, tracked)
 }
 
 /// Read-only snapshot for `status`: compute the work-tree root id and every tree object it
@@ -65,6 +78,16 @@ pub fn snapshot_uncached(store: &Store, dir: &Path) -> Result<ObjectId> {
 /// unchanged trees and opened a write transaction on every call (each tree a skip-lookup) — that
 /// write-txn overhead, not the walk, is what made a clean `status` slower than git's index scan.
 pub fn snapshot_ro(store: &Store, dir: &Path) -> Result<(ObjectId, HashMap<ObjectId, Tree>)> {
+    snapshot_ro_tracked(store, dir, &HashSet::new())
+}
+
+/// Like [`snapshot_ro`] but honors HEAD's `tracked` paths so a tracked-but-ignored file is not
+/// treated as deleted (see [`snapshot_tracked`]).
+pub fn snapshot_ro_tracked(
+    store: &Store,
+    dir: &Path,
+    tracked: &HashSet<String>,
+) -> Result<(ObjectId, HashMap<ObjectId, Tree>)> {
     let (cache, epoch) = store.load_stat_cache()?;
     // Stamp the new epoch BEFORE the walk. The guard trusts a cached entry only when its mtime is
     // strictly below the epoch, so the epoch must predate every stat we take this pass — otherwise
@@ -75,7 +98,7 @@ pub fn snapshot_ro(store: &Store, dir: &Path) -> Result<(ObjectId, HashMap<Objec
     let mut trees = HashMap::new();
     let mut updates = Vec::new();
     let ig = Ignore::load(dir);
-    let root = build_ro(dir, "", &ig, &cache, epoch, &mut trees, &mut updates)?;
+    let root = build_ro(dir, "", &ig, &cache, epoch, &mut trees, &mut updates, tracked)?;
     // Refresh the stat cache with any files we had to (re)hash — just as `git status`
     // opportunistically rewrites its index's stat info. On a fully clean, warm tree `updates`
     // is empty and `put_stat_cache` is a no-op, so a repeat `status` writes nothing at all.
@@ -83,6 +106,7 @@ pub fn snapshot_ro(store: &Store, dir: &Path) -> Result<(ObjectId, HashMap<Objec
     Ok((root, trees))
 }
 
+#[allow(clippy::too_many_arguments)] // recursive walker; args carry the stat cache + tracked set
 fn build_ro(
     dir: &Path,
     rel: &str,
@@ -91,6 +115,7 @@ fn build_ro(
     epoch: u64,
     trees: &mut HashMap<ObjectId, Tree>,
     updates: &mut Vec<(String, StatEntry)>,
+    tracked: &HashSet<String>,
 ) -> Result<ObjectId> {
     let join = |name: &str| if rel.is_empty() { name.to_string() } else { format!("{rel}/{name}") };
     let mut entries = Vec::new();
@@ -99,7 +124,9 @@ fn build_ro(
         let ft = de.file_type()?;
         let name = de.file_name().to_string_lossy().into_owned();
         let path = join(&name);
-        if ig.is_ignored(&path, ft.is_dir()) {
+        // git only ignores UNtracked paths: an ignored path already tracked in HEAD (or an ignored
+        // dir that contains one) is still walked, so force-added files don't vanish.
+        if ig.is_ignored(&path, ft.is_dir()) && !tracked.contains(&path) {
             continue;
         }
         if ft.is_symlink() {
@@ -108,7 +135,7 @@ fn build_ro(
             }
         } else if ft.is_dir() {
             let child = ig.descend(&path, &de.path());
-            let id = build_ro(&de.path(), &path, &child, cache, epoch, trees, updates)?;
+            let id = build_ro(&de.path(), &path, &child, cache, epoch, trees, updates, tracked)?;
             entries.push(TreeEntry { name, mode: MODE_DIR, id });
         } else if ft.is_file() {
             let md = de.metadata()?;
@@ -138,13 +165,21 @@ fn build_ro(
     Ok(id)
 }
 
-fn snapshot_impl(store: &Store, dir: &Path, use_cache: bool) -> Result<ObjectId> {
+fn snapshot_impl(store: &Store, dir: &Path, use_cache: bool, tracked: &HashSet<String>) -> Result<ObjectId> {
     let (cache, epoch) = if use_cache { store.load_stat_cache()? } else { (HashMap::new(), 0) };
     // Epoch stamped before the walk so a file modified during the snapshot is racy next pass and
     // gets re-hashed rather than trusted by stat alone (see `snapshot_ro` for the full rationale).
     let walk_epoch = now_ns();
-    let mut ctx =
-        SnapCtx { store, cache, epoch, use_cache, objs: Vec::new(), pending_bytes: 0, updates: Vec::new() };
+    let mut ctx = SnapCtx {
+        store,
+        cache,
+        epoch,
+        use_cache,
+        objs: Vec::new(),
+        pending_bytes: 0,
+        updates: Vec::new(),
+        tracked,
+    };
     let ig = Ignore::load(dir);
     let root = build(&mut ctx, dir, "", &ig)?;
     if !ctx.objs.is_empty() {
@@ -173,6 +208,8 @@ struct SnapCtx<'a> {
     objs: Vec<Object>,
     pending_bytes: usize,
     updates: Vec<(String, StatEntry)>,
+    /// paths tracked in HEAD (files + ancestor dirs); ignore rules don't apply to these.
+    tracked: &'a HashSet<String>,
 }
 
 impl SnapCtx<'_> {
@@ -197,7 +234,9 @@ fn build(ctx: &mut SnapCtx, dir: &Path, rel: &str, ig: &Ignore) -> Result<Object
         let ft = de.file_type()?;
         let name = de.file_name().to_string_lossy().into_owned();
         let path = join(&name);
-        if ig.is_ignored(&path, ft.is_dir()) {
+        // git only ignores UNtracked paths: an ignored path already tracked in HEAD (or an ignored
+        // dir that contains one) is still walked, so force-added files don't vanish from the tree.
+        if ig.is_ignored(&path, ft.is_dir()) && !ctx.tracked.contains(&path) {
             continue;
         }
         if ft.is_symlink() {
