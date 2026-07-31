@@ -18,11 +18,12 @@ keel can record a project convention from one session and surface it automatical
 | vs code, typescript | 73% | 94% | +20 |
 | django, python | 62% | 92% | +29 |
 | prometheus, go | 58% | 90% | +31 |
-| all real repos, 3 languages | 66% | 92% | +26 |
+| tokio, rust | 60% | 98% | +38 |
+| all real repos, 4 languages | 64% | 93% | +29 |
 
 As a control, we gave the model a wrong convention instead of the right one. It did no better than with nothing at all, a 0% gain, which means the improvement comes from the specific rule and not from simply adding text to the prompt.
 
-The effect holds across three languages, and it grows as the model knows less about a language's conventions to begin with.
+The effect holds across four languages, and it concentrates on the conventions a model hasn't already memorized: the largest lift is on tokio (Rust, +38), whose codebase leans hard on repo-local idioms a general model rarely internalizes.
 
 ### Read speed
 
@@ -43,7 +44,7 @@ git was built for people sending each other patches. Its unit is the diff, and e
 keel is built for that reader. It records each work session as a first-class object in the history, which turns version control from a log of diffs into a source of context and memory. Three differences follow from that, and none of them is something git can be extended into.
 
 - **Context in one read.** A single fetch returns everything an agent needs for a task: the relevant code, the dependency graph, who wrote what, and the sessions that touched it. In git you assemble that yourself, from diff, blame, and log, across many commands.
-- **Memory across sessions.** A convention learned in one session is recorded and surfaced automatically on the next related task. In the benchmark above that raises how often an agent follows a real project rule from 66% to 92% across three languages, and the control run shows the gain is the specific rule, not extra prompt text. git has no equivalent, so an agent starts every task cold.
+- **Memory across sessions.** A convention learned in one session is recorded and surfaced automatically on the next related task. In the benchmark above that raises how often an agent follows a real project rule from 64% to 93% across four languages, and the control run shows the gain is the specific rule, not extra prompt text. git has no equivalent, so an agent starts every task cold.
 - **Sessions as history.** keel records how a change was made, the task, the model, the prompts, the tool calls, and whether the result verified, as an object you can query later. git records the commit and an author name, and nothing about how the change was produced.
 
 The middle one is the point. A convention learned once and applied automatically is version control that gets better at your codebase as it is used, and the benchmark measures one turn of that loop. That is a different data model, not a git extension.
