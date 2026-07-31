@@ -5,3 +5,5 @@ __pycache__/
 report-flywheel.json
 report-vscode.json
 report-django.json
+report-go.json
+report-adversarial.json

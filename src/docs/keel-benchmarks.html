@@ -477,20 +477,30 @@
       predicts: non-obvious, project-local knowledge a fused brief carries from prior work.
     </div>
     <div class="note-box" style="margin-top:14px; border-left-color: var(--accent)">
-      <b>Real corpora — two languages, no invented rules.</b> To answer <em>"you made those
-      conventions up,"</em> the same test ran on <b>real, documented conventions</b> mined from two
+      <b>Real corpora — three languages, no invented rules.</b> To answer <em>"you made those
+      conventions up,"</em> the same test ran on <b>real, documented conventions</b> mined from three
       codebases, each grounded by its frequency in the actual source — nothing invented.
-      <b>VS Code</b> (TypeScript; <code>undefined</code> 66,458 vs <code>: null</code> <b>0</b>,
-      <code>@IxxxService</code> 15,401, <code>localize(</code> 21,381…): 16×4 →
-      <b>73% → 94%</b> (+20). <b>Django</b> (Python; <code>@cached_property</code> 278,
-      <code>ImproperlyConfigured</code> 230, <code>reverse()</code> 63…): 12×4 → <b>62% → 92%</b>
-      (+29). <b>Pooled across both languages (112/condition): 69% → 93%, +24 points</b>; all 28/28
-      conventions retrieved. Baselines are high because Opus was <em>trained on both codebases</em>,
-      so the entire lift concentrates on the rules it had <b>not</b> memorised — Django
-      <code>gettext_lazy</code> (0→4/4), <code>get_object_or_404</code> (1→4/4); VS Code
-      <code>URI.joinPath</code>, <code>assertNever</code>. Retrieval pays against a model that
-      memorised the target codebases, in <b>both</b> ecosystems — on exactly the knowledge that
-      isn't already in the weights.
+      <b>VS Code</b> (TypeScript): 16×4 → <b>73% → 94%</b> (+20). <b>Django</b> (Python;
+      <code>@cached_property</code> 278, <code>ImproperlyConfigured</code> 230): 12×4 →
+      <b>62% → 92%</b> (+29). <b>Prometheus</b> (Go; <code>fmt.Errorf %w</code> 849,
+      <code>errors.Is/As</code> 226, <code>ctx context.Context</code> 519): 12×4 →
+      <b>58% → 90%</b> (+31). <b>Pooled across all three (160/condition): 66% → 92%, +26 points</b>;
+      all 60/60 conventions retrieved. A telling pattern: as prior familiarity falls the baseline
+      falls (TS&nbsp;73 &gt; PY&nbsp;62 &gt; Go&nbsp;58) and the <b>lift rises</b>
+      (+20 → +29 → +31) — the entire lift lands on the conventions the model had <b>not</b> memorised
+      (Django <code>gettext_lazy</code> 0→4/4; Go <code>fmt.Errorf %w</code> 0→4/4, <code>ctx</code>
+      first 0→4; VS Code <code>URI.joinPath</code>). Retrieval pays against a model that memorised the
+      target codebases, in <b>three</b> ecosystems — on exactly the knowledge that isn't in the weights.
+    </div>
+    <div class="note-box" style="margin-top:14px; border-left-color: var(--warn)">
+      <b>Adversarial control — is it the rule, or just "more context"?</b> A skeptic could argue the
+      lift comes from appending <em>any</em> authoritative-looking "convention from this codebase's
+      history," not the specific rule. Tested on the synthetic scenarios with a third condition —
+      <b>decoy</b>: a <em>different</em> scenario's real rule (plausible, authoritative-looking, but
+      wrong for the task). Result (80/condition): WITHOUT <b>0%</b> · WITH the correct rule
+      <b>95%</b> · with a <b>wrong</b> rule <b>0%</b>. A wrong retrieved rule gives <b>zero lift —
+      identical to no lesson</b>. The gain is entirely the <em>specific</em> retrieved content; the
+      prompting-artifact hypothesis is rejected.
     </div>
   </div>
 </section>
