@@ -7,7 +7,7 @@
 //! ref advances; a crash mid-snapshot leaves only unreachable objects (future GC), never a
 //! dangling HEAD.
 
-use crate::object::{Change, Object, ObjectId, TreeEntry, Verification};
+use crate::object::{Change, Object, ObjectId, Tree, TreeEntry, Verification};
 use crate::snapshot;
 use crate::store::{Applied, Result, Store, StoreError};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -214,13 +214,19 @@ impl Repo {
     /// so re-runs are near-free via dedup); the snapshot objects are unreferenced until a
     /// real commit and are reclaimed by GC — `status` never advances a ref.
     pub fn status(&self, work_dir: &Path) -> Result<Vec<PathChange>> {
-        let work_tree = snapshot::snapshot(&self.store, work_dir)?;
+        // Read-only snapshot: compute the work root + its trees in memory, writing nothing.
+        let (work_root, work_trees) = snapshot::snapshot_ro(&self.store, work_dir)?;
         let head_tree = match self.head()? {
             Some(h) => Some(self.change(h)?.ok_or(StoreError::Corrupt(h))?.tree),
             None => None,
         };
+        // Clean fast path: identical roots ⇒ no changes, so skip the diff (and every tree read)
+        // entirely. This is the common `status` on an unmodified checkout.
+        if head_tree == Some(work_root) {
+            return Ok(Vec::new());
+        }
         let mut out = Vec::new();
-        self.diff_trees(head_tree, Some(work_tree), "", &mut out)?;
+        self.diff_trees(head_tree, Some(work_root), &work_trees, "", &mut out)?;
         out.sort_by(|a, b| a.path.cmp(&b.path));
         Ok(out)
     }
@@ -236,39 +242,55 @@ impl Repo {
         }
     }
 
+    /// Like [`Self::tree_entries`] but resolves work-side trees from an in-memory map first
+    /// (the unpersisted trees from [`snapshot::snapshot_ro`]), falling back to the store for
+    /// head-side trees. Ids are content-addressed, so a given id lives in exactly one place.
+    fn tree_entries_src(
+        &self,
+        tree: Option<ObjectId>,
+        extra: &HashMap<ObjectId, Tree>,
+    ) -> Result<Vec<TreeEntry>> {
+        match tree {
+            Some(id) if extra.contains_key(&id) => Ok(extra[&id].entries.clone()),
+            other => self.tree_entries(other),
+        }
+    }
+
     /// Recursively diff two (optional) trees, appending per-file changes under `prefix`.
+    /// `extra` supplies the work-side trees that `status` never persisted.
     fn diff_trees(
         &self,
         old: Option<ObjectId>,
         new: Option<ObjectId>,
+        extra: &HashMap<ObjectId, Tree>,
         prefix: &str,
         out: &mut Vec<PathChange>,
     ) -> Result<()> {
         // name → (in old?, in new?), each carrying (id, is_dir)
         type Side = Option<(ObjectId, bool)>;
         let mut map: BTreeMap<String, (Side, Side)> = BTreeMap::new();
-        for e in self.tree_entries(old)? {
+        for e in self.tree_entries_src(old, extra)? {
             map.entry(e.name).or_default().0 = Some((e.id, e.mode == snapshot::MODE_DIR));
         }
-        for e in self.tree_entries(new)? {
+        for e in self.tree_entries_src(new, extra)? {
             map.entry(e.name).or_default().1 = Some((e.id, e.mode == snapshot::MODE_DIR));
         }
         for (name, (o, n)) in map {
             let path = if prefix.is_empty() { name } else { format!("{prefix}/{name}") };
             match (o, n) {
-                (None, Some((id, is_dir))) => self.emit_side(id, is_dir, &path, ChangeKind::Added, out)?,
-                (Some((id, is_dir)), None) => self.emit_side(id, is_dir, &path, ChangeKind::Deleted, out)?,
+                (None, Some((id, is_dir))) => self.emit_side(id, is_dir, extra, &path, ChangeKind::Added, out)?,
+                (Some((id, is_dir)), None) => self.emit_side(id, is_dir, extra, &path, ChangeKind::Deleted, out)?,
                 (Some((oid, od)), Some((nid, nd))) => {
                     if oid == nid {
                         continue; // identical subtree/blob — content-addressing makes this exact
                     }
                     match (od, nd) {
-                        (true, true) => self.diff_trees(Some(oid), Some(nid), &path, out)?,
+                        (true, true) => self.diff_trees(Some(oid), Some(nid), extra, &path, out)?,
                         (false, false) => out.push(PathChange { path, kind: ChangeKind::Modified }),
                         // a file replaced a directory (or vice-versa): delete one side, add the other
                         _ => {
-                            self.emit_side(oid, od, &path, ChangeKind::Deleted, out)?;
-                            self.emit_side(nid, nd, &path, ChangeKind::Added, out)?;
+                            self.emit_side(oid, od, extra, &path, ChangeKind::Deleted, out)?;
+                            self.emit_side(nid, nd, extra, &path, ChangeKind::Added, out)?;
                         }
                     }
                 }
@@ -283,6 +305,7 @@ impl Repo {
         &self,
         id: ObjectId,
         is_dir: bool,
+        extra: &HashMap<ObjectId, Tree>,
         path: &str,
         kind: ChangeKind,
         out: &mut Vec<PathChange>,
@@ -291,9 +314,9 @@ impl Repo {
             out.push(PathChange { path: path.to_string(), kind });
             return Ok(());
         }
-        for e in self.tree_entries(Some(id))? {
+        for e in self.tree_entries_src(Some(id), extra)? {
             let child = format!("{path}/{}", e.name);
-            self.emit_side(e.id, e.mode == snapshot::MODE_DIR, &child, kind, out)?;
+            self.emit_side(e.id, e.mode == snapshot::MODE_DIR, extra, &child, kind, out)?;
         }
         Ok(())
     }

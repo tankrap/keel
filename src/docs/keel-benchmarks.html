@@ -264,8 +264,10 @@
           <tr>
             <td>linux kernel</td>
             <td class="n" id="git-linux-status"><span class="win">0.26 s</span></td>
-            <td class="n col-keel">0.50 s</td>
-            <td>git's index wins; keel's fs-watch daemon makes repeat refresh O(changed)</td>
+            <td class="n col-keel">0.42 s</td>
+            <td>read-only status now writes no objects (was re-persisting ~5k unchanged trees in a
+                write txn every call); a genuinely-clean tree short-circuits the diff. git's index
+                still edges it; the fs-watch daemon (O(changed)) is the path to parity</td>
           </tr>
         </tbody>
       </table>

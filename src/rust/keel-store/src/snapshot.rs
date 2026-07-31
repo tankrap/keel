@@ -52,6 +52,79 @@ pub fn snapshot_uncached(store: &Store, dir: &Path) -> Result<ObjectId> {
     snapshot_impl(store, dir, false)
 }
 
+/// Read-only snapshot for `status`: compute the work-tree root id and every tree object it
+/// contains WITHOUT writing anything to the store — no blobs, no trees, no stat-cache update.
+/// Unchanged files reuse their cached blob id (stat only); changed files are hashed in memory
+/// and discarded. Returns `(root_id, trees)` mapping each built tree's id → its `Tree`, so the
+/// caller can diff the (unpersisted) work tree against head.
+///
+/// `status` must not mutate the store. The persisting [`snapshot`] re-serialized ~thousands of
+/// unchanged trees and opened a write transaction on every call (each tree a skip-lookup) — that
+/// write-txn overhead, not the walk, is what made a clean `status` slower than git's index scan.
+pub fn snapshot_ro(store: &Store, dir: &Path) -> Result<(ObjectId, HashMap<ObjectId, Tree>)> {
+    let (cache, epoch) = store.load_stat_cache()?;
+    let mut trees = HashMap::new();
+    let mut updates = Vec::new();
+    let root = build_ro(dir, "", &cache, epoch, &mut trees, &mut updates)?;
+    // Refresh the stat cache with any files we had to (re)hash — just as `git status`
+    // opportunistically rewrites its index's stat info. On a fully clean, warm tree `updates`
+    // is empty and `put_stat_cache` is a no-op, so a repeat `status` writes nothing at all.
+    store.put_stat_cache(&updates, now_ns())?;
+    Ok((root, trees))
+}
+
+fn build_ro(
+    dir: &Path,
+    rel: &str,
+    cache: &HashMap<String, StatEntry>,
+    epoch: u64,
+    trees: &mut HashMap<ObjectId, Tree>,
+    updates: &mut Vec<(String, StatEntry)>,
+) -> Result<ObjectId> {
+    let join = |name: &str| if rel.is_empty() { name.to_string() } else { format!("{rel}/{name}") };
+    let mut entries = Vec::new();
+    for de in fs::read_dir(dir)? {
+        let de = de?;
+        let ft = de.file_type()?;
+        if ft.is_symlink() {
+            continue;
+        }
+        let name = de.file_name().to_string_lossy().into_owned();
+        if IGNORED.contains(&name.as_str()) {
+            continue;
+        }
+        if ft.is_dir() {
+            let id = build_ro(&de.path(), &join(&name), cache, epoch, trees, updates)?;
+            entries.push(TreeEntry { name, mode: MODE_DIR, id });
+        } else if ft.is_file() {
+            let md = de.metadata()?;
+            let (mode, size, mtime) = (mode_from_meta(&md), md.len(), mtime_ns(&md));
+            let path = join(&name);
+            // Same stat-cache fast path + racy-git guard as `build`, but a miss only hashes the
+            // file in memory to learn its id — status never needs to persist the blob, only to
+            // remember its stat entry so the next `status` is a stat-only walk.
+            // No `store.has` probe here (unlike the persisting `build`): status only needs a
+            // stable id to compare against head, and trusting mtime+size — with the racy-git
+            // epoch guard — is exactly how git's index avoids re-reading unchanged files. This
+            // also lets the cache hit on a mirror-built repo whose native blobs were never
+            // materialized as objects.
+            let id = match cache.get(&path).copied() {
+                Some((cm, cs, cid)) if cm == mtime && cs == size && cm < epoch => cid,
+                _ => {
+                    let id = Object::Blob(fs::read(de.path())?).id();
+                    updates.push((path, (mtime, size, id)));
+                    id
+                }
+            };
+            entries.push(TreeEntry { name, mode, id });
+        }
+    }
+    let tree = Tree { entries };
+    let id = Object::Tree(tree.clone()).id();
+    trees.insert(id, tree);
+    Ok(id)
+}
+
 fn snapshot_impl(store: &Store, dir: &Path, use_cache: bool) -> Result<ObjectId> {
     let (cache, epoch) = if use_cache { store.load_stat_cache()? } else { (HashMap::new(), 0) };
     let mut ctx =
