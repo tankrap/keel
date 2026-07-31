@@ -2,7 +2,9 @@
 
 keel is version control for AI-written code. It is git-compatible, so a plain `git push` to a keel repo lands as a normal keel commit, and clone, fetch, pull, and push all work unchanged.
 
-The difference from git is what a read gives you back. keel treats each agent session as a first-class piece of history, and a single fetch returns everything an agent needs for a task: the relevant code, the dependency graph, a record of who wrote what, and lessons from past sessions. git returns diffs and leaves you to assemble the rest.
+git records what changed: a commit, a message, and a diff, and leaves the rest for you to reconstruct. keel records the work session that produced the change, and keeps git underneath as the compatibility layer.
+
+The difference shows up on read. git hands you a diff. keel answers a different question, what an agent needs to do the next task, and returns it in one fetch: the relevant code, the dependency graph, a record of who wrote what, and the lessons earlier sessions learned in this repo. git leaves you to assemble that from diff, blame, and log.
 
 ## Benchmarks that matter
 
@@ -96,7 +98,7 @@ The Rust workspace lives under `src/rust`.
 - keel-cmd · the `keel` binary, a drop-in for git.
 - keel-core · shared types.
 
-Benchmarks live in `src/keel-bench`, and design notes in `src/docs`.
+Benchmarks live in `src/keel-bench`, and design notes in `src/docs`, including the [positioning](src/docs/positioning.md) for why keel exists and what is shipped versus planned.
 
 ## Build
 
