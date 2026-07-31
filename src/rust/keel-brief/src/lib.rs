@@ -298,31 +298,53 @@ impl BriefService {
         let mut neighborhood = vec![file.to_string()];
         neighborhood.extend(deps.iter().cloned());
         neighborhood.extend(rdeps.iter().cloned());
-        let mut seen = HashSet::new();
-        let mut sessions = Vec::new();
+        let mut seen: HashSet<ObjectId> = HashSet::new();
+        // (verified, help, timestamp, session) so we RANK by feedback: a lesson that INFORMED a
+        // verified-green change (help score, the flywheel's learned signal) leads, then verified,
+        // then most recent — the confirmed-useful lesson is what an agent should see first.
+        let mut cand: Vec<(bool, i64, u64, RelevantSession)> = Vec::new();
         for f in &neighborhood {
             for (cid, c) in self.repo.history_touching(f).map_err(to_io)? {
-                let Some(sid) = c.session else { continue };
-                if !seen.insert(sid) {
-                    continue;
+                if !seen.insert(cid) {
+                    continue; // one session per change
                 }
-                if let Some(Object::Session(s)) = self.repo.store().get(&sid).map_err(to_io)? {
-                    if !s.lesson.is_empty() {
-                        // "verified" reflects whether THIS session's own work passed — the
-                        // change is Unverified until tests run; the session carries the result.
-                        let verified = matches!(s.verification, Verification::Green);
-                        sessions.push(RelevantSession {
+                let help = self.repo.store().lesson_help(&cid).map_err(to_io)?;
+                // (a) a keel-native session object linked to the change
+                if let Some(sid) = c.session {
+                    if let Some(Object::Session(s)) = self.repo.store().get(&sid).map_err(to_io)? {
+                        if !s.lesson.is_empty() {
+                            let verified = matches!(s.verification, Verification::Green)
+                                || matches!(verify_of(&cid, c.verification), Verification::Green);
+                            cand.push((verified, help, c.timestamp, RelevantSession {
+                                change: cid.to_hex(),
+                                task: s.task,
+                                lesson: s.lesson,
+                                verified,
+                                has_context: s.context_served.is_some(),
+                            }));
+                            continue;
+                        }
+                    }
+                }
+                // (b) a post-hoc lesson attached via `keel learn` — the path that works on
+                // git-driven history (immutable changes can't carry a session, so it's a side-table)
+                if let Some((task, lesson)) = self.repo.store().lesson(&cid).map_err(to_io)? {
+                    if !lesson.is_empty() {
+                        let verified = matches!(verify_of(&cid, c.verification), Verification::Green);
+                        cand.push((verified, help, c.timestamp, RelevantSession {
                             change: cid.to_hex(),
-                            task: s.task,
-                            lesson: s.lesson,
+                            task,
+                            lesson,
                             verified,
-                            has_context: s.context_served.is_some(),
-                        });
+                            has_context: false,
+                        }));
                     }
                 }
             }
         }
-        sessions.truncate(5);
+        // rank: help score first (learned value), then verified, then recency
+        cand.sort_by(|a, b| b.1.cmp(&a.1).then(b.0.cmp(&a.0)).then(b.2.cmp(&a.2)));
+        let sessions: Vec<RelevantSession> = cand.into_iter().take(5).map(|(_, _, _, s)| s).collect();
 
         // pinned invariants for the symbols in play (target + sliced defs) — always served,
         // regardless of history, so a single curated pin steers every relevant future brief.

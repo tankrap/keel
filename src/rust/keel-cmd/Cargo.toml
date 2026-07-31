@@ -12,5 +12,7 @@ path = "src/main.rs"
 keel-brief = { path = "../keel-brief" }
 keel-store = { path = "../keel-store" }
 keel-git = { path = "../keel-git" }
+keel-net = { path = "../keel-net" }
 serde_json = "1"
 miniz_oxide = "0.8"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }

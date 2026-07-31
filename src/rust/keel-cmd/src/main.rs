@@ -30,11 +30,13 @@ fn main() {
         Some("mirror-out") => run(cmd_mirror_out(&args[1..])),
         Some("reindex") => run(cmd_reindex(&args[1..])),
         Some("serve") => run(cmd_serve(&args[1..])),
+        Some("net-serve") => run(cmd_net_serve(&args[1..])),
         Some("verify") => run(cmd_verify(&args[1..])),
         Some("pin") => run(cmd_pin(&args[1..])),
         Some("pins") => run(cmd_pins(&args[1..])),
         Some("sessions") => run(cmd_sessions(&args[1..])),
         Some("session") => run(cmd_session(&args[1..])),
+        Some("learn") => run(cmd_learn(&args[1..])),
         Some("native") => run(cmd_native(&args[1..])),
         // ── git-compatible surface ──
         Some("init") => run(cmd_init(&args[1..])),   // git init + keel store
@@ -64,6 +66,7 @@ fn print_usage() {
          KEEL VALUE-ADD (the fused graph + git mirror):\n\
          \x20 keel brief  --file <path> [--symbol <name>] [--task <t>] [--json] [--reserve]\n\
          \x20 keel pin <symbol> --lesson <text>   ·   keel pins\n\
+         \x20 keel learn --lesson <text> [--task <text>]   record what a change taught (flywheel)\n\
          \x20 keel sessions [--file <path>]       ·   keel session <change>\n\
          \x20 keel repack [--json]                delta-compress history + GC (like `git gc`)\n\
          \x20 keel size   [--json]                logical bytes / object counts\n\
@@ -135,10 +138,18 @@ fn cmd_brief(args: &[String]) -> io::Result<()> {
 
 /// Persist the context this brief served to `<root>/.keel/last_brief.json` (overwrites).
 fn record_last_brief(root: &Path, value: &Value) {
+    // Also record WHICH lessons this brief served (by the change each is attached to), so a
+    // following `keel learn` can attribute the resulting work to them — the flywheel's feedback edge.
+    let served: Vec<Value> = value
+        .get("sessions")
+        .and_then(Value::as_array)
+        .map(|a| a.iter().filter_map(|s| s.get("change").cloned()).collect())
+        .unwrap_or_default();
     let rec = json!({
         "task": value.get("task").cloned().unwrap_or(Value::Null),
         "file": value.get("file").cloned().unwrap_or(Value::Null),
         "context": value.get("context").cloned().unwrap_or(Value::Null),
+        "served_lessons": served,
     });
     let dir = root.join(".keel");
     let _ = std::fs::create_dir_all(&dir);
@@ -531,7 +542,14 @@ fn sync_after(verb: &str) {
     }
     let synced = keel_store::store::Store::open(&store_path)
         .map_err(|e| io::Error::other(e.to_string()))
-        .and_then(|store| ingest_repo(&store, &top, true));
+        .and_then(|store| {
+            ingest_repo(&store, &top, true)?;
+            // Rebuild keel-native history for any new commits (incremental — only new ones), so
+            // `keel brief` / provenance see work done through the git surface without a manual
+            // `keel reindex`. Best-effort; a failure here never fails the git command.
+            keel_git::bridge::bridge(&store)?;
+            Ok(())
+        });
     if let Err(e) = synced {
         eprintln!("keel: mirror sync skipped ({e})");
     }
@@ -749,6 +767,65 @@ fn decode_chunked(raw: &[u8]) -> Option<Vec<u8>> {
         out.extend_from_slice(&raw[i..i + size]);
         i += size + 2; // data + trailing CRLF
     }
+}
+
+/// `keel learn --lesson <text> [--task <text>]` — record the non-obvious thing this change taught,
+/// attached to the current keel change (a post-hoc side-table annotation, so it works on git-driven
+/// history). A later `keel brief` on this file or its neighbors surfaces the lesson — the flywheel.
+fn cmd_learn(args: &[String]) -> io::Result<()> {
+    let lesson = flag(args, "--lesson").ok_or_else(|| io::Error::other("usage: keel learn --lesson <text> [--task <text>]"))?;
+    let task = flag(args, "--task").unwrap_or("");
+    let (_root, store_path) = root_store(args)?;
+    let repo = Repo::open(&store_path).map_err(to_io)?;
+    let head = repo
+        .head()
+        .map_err(to_io)?
+        .ok_or_else(|| io::Error::other("no keel history yet — commit first (e.g. `keel commit -m …`)"))?;
+    repo.store().set_lesson(&head, task, lesson).map_err(to_io)?;
+    // Attribute this work to the lessons the last brief served — so when this change is verified
+    // green, those lessons earn a helpfulness bump (the flywheel's feedback edge).
+    let informed = served_lessons(&_root);
+    if !informed.is_empty() {
+        repo.store().set_informed(&head, &informed).map_err(to_io)?;
+    }
+    println!("learned on {} — future briefs on this file or its neighbors will surface it", short(&head.to_hex()));
+    Ok(())
+}
+
+/// The lessons the most recent `keel brief` served, from `.keel/last_brief.json` (each identified
+/// by the change it's attached to).
+fn served_lessons(root: &Path) -> Vec<ObjectId> {
+    let raw = match std::fs::read_to_string(root.join(".keel/last_brief.json")) {
+        Ok(r) => r,
+        Err(_) => return Vec::new(),
+    };
+    let v: Value = match serde_json::from_str(&raw) {
+        Ok(v) => v,
+        Err(_) => return Vec::new(),
+    };
+    v.get("served_lessons")
+        .and_then(Value::as_array)
+        .map(|a| a.iter().filter_map(|s| s.as_str()).filter_map(ObjectId::from_hex).collect())
+        .unwrap_or_default()
+}
+
+/// `keel net-serve [--port N]` — serve this repo's objects + a coordination event channel over
+/// QUIC, so remote agents can fetch objects and subscribe to fleet events (content-addressed,
+/// verifiable). This is keel's multi-machine transport (NEW-1102).
+fn cmd_net_serve(args: &[String]) -> io::Result<()> {
+    let (_, store_path) = root_store(args)?;
+    let port: u16 = flag(args, "--port").and_then(|s| s.parse().ok()).unwrap_or(9420);
+    let store = keel_store::store::Store::open(&store_path).map_err(to_io)?;
+    let rt = tokio::runtime::Runtime::new()?;
+    rt.block_on(async move {
+        let addr = format!("0.0.0.0:{port}").parse().map_err(|e| io::Error::other(format!("{e}")))?;
+        let server = keel_net::Server::bind(addr, store).await.map_err(|e| io::Error::other(e.to_string()))?;
+        println!("keel net-serve: QUIC on {} · objects + event channel (store {})", server.local_addr(), store_path.display());
+        println!("  a peer fetches with keel_net::Client::connect(addr).get(oid); events via .subscribe()");
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+        }
+    })
 }
 
 /// `keel size` — logical content bytes held + object/chunk/delta counts.
@@ -1038,8 +1115,16 @@ fn cmd_verify(args: &[String]) -> io::Result<()> {
     let repo = Repo::open(&store).map_err(to_io)?;
     let id = resolve_change(&repo, change)?; // accepts a full id or a short prefix (git-style)
     repo.store().set_verification(&id, v).map_err(to_io)?;
+    // Feedback: reward/penalize the lessons that INFORMED this change (the flywheel learns which
+    // retrieved lessons actually lead to green outcomes, and ranks them up for the next brief).
+    let delta = if matches!(v, Verification::Green) { 1 } else { -1 };
+    let informed = repo.store().informed(&id).map_err(to_io)?;
+    for lesson in &informed {
+        let _ = repo.store().bump_lesson_help(lesson, delta);
+    }
     let mark = if matches!(v, Verification::Green) { "green ✓" } else { "red ✗" };
-    println!("verified {} · {mark}", short(&id.to_hex()));
+    let credited = if informed.is_empty() { String::new() } else { format!(" · {} lesson(s) {}", informed.len(), if delta > 0 { "credited" } else { "penalized" }) };
+    println!("verified {} · {mark}{credited}", short(&id.to_hex()));
     Ok(())
 }
 

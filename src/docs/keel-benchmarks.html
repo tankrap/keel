@@ -460,6 +460,34 @@
         </div>
       </div>
     </div>
+    <div class="note-box" style="margin-top:18px">
+      <b>Live end-to-end (Rust keel + a real LLM).</b> The strongest proof isn't retrieval accuracy
+      — it's agent <em>correctness</em>. On <b>20 tasks &times; 3 trials (60 samples/condition)</b>,
+      each governed by an <b>arbitrary project convention</b> a capable model can't guess a priori
+      (<code>audit()</code> not <code>console.log</code>; integer <code>utcMillis()</code>;
+      <code>assertTenant(ctx)</code> first; integer-Cents <code>fmtMoney</code>;
+      <code>flag('name', ctx)</code>…), the convention was recorded with <code>keel learn</code> and
+      retrieved by <code>keel brief</code>. Rule-compliance went from <b>0/60 WITHOUT</b> the brief
+      (95% CI 0–6%) to <b>57/60 WITH</b> it (95% CI 86–98%) — <b>+95 points</b>, and the two
+      intervals don't overlap. Solver = Claude Opus&nbsp;4.8, strict dual judge = Claude
+      Sonnet&nbsp;5; all <b>20/20</b> lessons retrieved. The lift lands exactly where the thesis
+      predicts: non-obvious, project-local knowledge a fused brief carries from prior work.
+    </div>
+    <div class="note-box" style="margin-top:14px; border-left-color: var(--accent)">
+      <b>Real corpus — VS Code, no invented rules.</b> To answer <em>"you made those conventions
+      up"</em>, the same test was run on <b>16 real, documented VS Code conventions</b>, each
+      grounded by its frequency in a fresh <code>microsoft/vscode</code> checkout
+      (<code>undefined</code> 66,458 vs <code>: null</code> <b>0</b>; <code>this._register</code>
+      12,787; <code>@IxxxService</code> 15,401; <code>localize(</code> 21,381…), attached to the real
+      file it governs and retrieved by <code>keel brief</code>. Across <b>16 × 3 trials</b>,
+      compliance went <b>75% → 94%</b> (36/48 → 45/48), <b>+19 points</b>, all 16 retrieved. The
+      baseline is high because Opus was <em>trained on VS Code</em> and already knows its famous
+      idioms — so the entire lift concentrates on the rules it had <b>not</b> memorised:
+      <code>URI.joinPath</code> (0/3→3/3), <code>assertNever</code> exhaustiveness (0/3→3/3),
+      <code>IConfigurationService.getValue</code> (1/3→3/3). Retrieval still pays against a model
+      that memorised the codebase — on exactly the knowledge that isn't already in the weights
+      (4 conventions improved, 0 regressed; McNemar p&nbsp;≈&nbsp;0.004).
+    </div>
   </div>
 </section>
 
