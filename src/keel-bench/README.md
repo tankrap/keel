@@ -23,9 +23,10 @@ Solver `claude-opus-4-8`, judge `claude-sonnet-5`, 4 trials per scenario per con
 | vs code, typescript | `corpus_bench.py` | 73% | 94% | +20 |
 | django, python | `corpus_bench_django.py` | 62% | 92% | +29 |
 | prometheus, go | `corpus_bench_go.py` | 58% | 90% | +31 |
-| pooled real corpus, 3 languages | | 66% | 92% | +26 |
+| tokio, rust | `corpus_bench_rust.py` | 60% | 98% | +38 |
+| pooled real corpus, 4 languages | | 64% | 93% | +29 |
 
-The synthetic run isolates the mechanism at maximum headroom, where the model can't guess and the baseline is near zero. The three real corpora show it still pays against a model that already knows the language, on the subset of conventions it hadn't memorized, which is the only subset retrieval can help. Every convention was retrieved: 60 of 60 across the real corpora, 20 of 20 synthetic. As the model's prior familiarity with a language falls, the baseline falls and the lift rises. The full write-up, including the conventions that don't move even with the lesson (model ceilings, not retrieval misses), is in [SUITE-RESULTS.md](./SUITE-RESULTS.md).
+The synthetic run isolates the mechanism at maximum headroom, where the model can't guess and the baseline is near zero. The four real corpora show it still pays against a model that already knows the language, on the subset of conventions it hadn't memorized, which is the only subset retrieval can help. Every convention was retrieved: 72 of 72 across the real corpora, 20 of 20 synthetic. The lift concentrates on repo-local idioms the model rarely internalizes, so the largest is on tokio (Rust, +38), the language keel itself is written in. The full write-up, including the conventions that don't move even with the lesson (model ceilings, not retrieval misses), is in [SUITE-RESULTS.md](./SUITE-RESULTS.md).
 
 ### Adversarial control
 
@@ -52,6 +53,7 @@ python3 flywheel_bench.py          # synthetic
 python3 corpus_bench.py            # vs code
 python3 corpus_bench_django.py     # django
 python3 corpus_bench_go.py         # prometheus / go
+python3 corpus_bench_rust.py       # tokio / rust
 python3 flywheel_adversarial.py    # adversarial control (standalone)
 ```
 
@@ -61,7 +63,7 @@ Prerequisites for a live run:
 
 - An Anthropic key at `~/.claude-token`, read lazily and never printed or logged.
 - The keel release binary at `~/keel/src/rust/target/release/keel` (override with `KEEL_BIN`), built with `cargo build --release` in `src/rust`.
-- For the real corpora, a checkout of each repo. vs code defaults to `~/keel-vscode-demo`, django to `~/keel-django-demo`, prometheus to `~/keel-go-demo`. Point at your own with `CORPUS_SRC`.
+- For the real corpora, a checkout of each repo. vs code defaults to `~/keel-vscode-demo`, django to `~/keel-django-demo`, prometheus to `~/keel-go-demo`, tokio to `~/keel-rust-demo`. Point at your own with `CORPUS_SRC`.
 
 ### Pinned config
 
@@ -86,6 +88,7 @@ Each condition reports a Wilson score interval, the range the true success rate 
 | `corpus_bench.py` | vs code, 16 scenarios |
 | `corpus_bench_django.py` | django, 12 scenarios |
 | `corpus_bench_go.py` | prometheus / go, 12 scenarios |
+| `corpus_bench_rust.py` | tokio / rust, 12 scenarios |
 | `flywheel_adversarial.py` | the without / with / decoy control (standalone) |
 | `SUITE-RESULTS.md` | the results of record, with the full write-up |
 | `flywheel-result.md`, `corpus-result.md` | earlier single-run write-ups |

@@ -82,6 +82,22 @@
         "lift_points": 31,
         "retrieved": "12/12"
       }
+    },
+    {
+      "id": "corpus-rust",
+      "module": "corpus_bench_rust",
+      "scenarios": 12,
+      "scenario_arity": 5,
+      "measures": "Real-corpus flywheel retrieval-lift on Tokio (Rust): 12 real, idiomatic tokio-rs/tokio conventions attached to their real files and retrieved via `keel brief`. Rust is the language keel itself is written in.",
+      "requires": "keel binary (KEEL_BIN) + a tokio-rs/tokio checkout (CORPUS_SRC, default ~/keel-rust-demo)",
+      "reference": {
+        "without": "29/48 (60%)",
+        "without_ci95_pct": [46, 73],
+        "with": "47/48 (98%)",
+        "with_ci95_pct": [89, 100],
+        "lift_points": 38,
+        "retrieved": "12/12"
+      }
     }
   ]
 }
