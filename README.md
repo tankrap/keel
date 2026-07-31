@@ -8,28 +8,45 @@ The difference shows up on read. git hands you a diff. keel answers a different 
 
 ## Benchmarks that matter
 
-The numbers below are measured, with 95% confidence intervals, and you can reproduce them from `src/keel-bench`.
+Everything here is measured on real repositories and reproducible from `src/keel-bench`. Full numbers, with 95% confidence intervals, are in [SUITE-RESULTS.md](src/keel-bench/SUITE-RESULTS.md).
 
 ### Does it make agents more correct?
 
-keel can record a project convention from one session and surface it automatically on the next. To test whether that actually helps, we measured how often a model followed a rule with and without the retrieved convention. The solver was claude-opus-4-8, the judge was claude-sonnet-5, and each case ran four trials.
+keel records a convention discovered in one session and surfaces it automatically on the next related task. To test whether that helps, we measured how often a model follows a project's own rule with and without the retrieved convention. Solver claude-opus-4-8, judge claude-sonnet-5, four trials per case.
 
-| test set | without keel | with keel | gain |
-|---|---|---|---|
-| synthetic, invented rules | 0% | 95% | +95 |
-| vs code, typescript | 73% | 94% | +20 |
-| django, python | 62% | 92% | +29 |
-| prometheus, go | 58% | 90% | +31 |
-| tokio, rust | 60% | 98% | +38 |
-| all real repos, 4 languages | 64% | 93% | +29 |
+```text
+how often an agent follows the project's own convention
+   ░ the model on its own        █ what keel's retrieved lesson adds
 
-As a control, we gave the model a wrong convention instead of the right one. It did no better than with nothing at all, a 0% gain, which means the improvement comes from the specific rule and not from simply adding text to the prompt.
+synthetic   ██████████████████████████████████████     0 → 95   +95
+vs code     ░░░░░░░░░░░░░░░░░░░░░░░░░░░░░█████████    73 → 94   +20
+django      ░░░░░░░░░░░░░░░░░░░░░░░░░████████████     62 → 92   +29
+prometheus  ░░░░░░░░░░░░░░░░░░░░░░░█████████████      58 → 90   +31
+tokio       ░░░░░░░░░░░░░░░░░░░░░░░░███████████████   60 → 98   +38
+──────────────────────────────────────────────────────────────────
+pooled      ░░░░░░░░░░░░░░░░░░░░░░░░░░███████████     64 → 93   +29
+```
 
-The effect holds across four languages, and it concentrates on the conventions a model hasn't already memorized: the largest lift is on tokio (Rust, +38), whose codebase leans hard on repo-local idioms a general model rarely internalizes.
+Pooled across four languages, retrieval takes an agent from 64% to 93%, a +29 point gain. It concentrates on the conventions a model has not already memorized, so the largest lift is on tokio (Rust, +38), whose codebase leans hard on repo-local idioms a general model rarely internalizes.
+
+To rule out "any authoritative-looking text helps," a control retrieves a deliberately wrong convention instead of the right one. It adds nothing, so the gain is the specific rule and not extra tokens in the prompt.
+
+```text
+adversarial control, synthetic scenarios
+no lesson                                                0%   baseline
+correct rule  ██████████████████████████████████████    95%   +95
+a wrong rule                                             0%   +0
+```
+
+Every convention was retrieved: 72 of 72 across the real corpora, 20 of 20 synthetic.
+
+### Does it pull the right context?
+
+A brief is only useful if it holds what the task actually needs and stays small enough to hand a model. On a 100-symbol sample of VS Code, `keel brief` pulled in the correct cross-file definitions 97% of the time, at a median of about 310 tokens per brief, small enough to drop into a prompt without spending the context window.
 
 ### Read speed
 
-This is `keel status` on the linux kernel, 80,000 files, as the median of five runs.
+`keel status` on the linux kernel, 80,000 files, median of five runs:
 
 | | time |
 |---|---|
@@ -38,6 +55,16 @@ This is `keel status` on the linux kernel, 80,000 files, as the median of five r
 | git status | 0.26s |
 
 With the daemon running, keel keeps a warm index and does work proportional to what changed rather than to the size of the repo. Without it, git is faster. With it, keel is.
+
+### Holds up at scale
+
+The store and the dependency graph on the full linux kernel, single machine (Apple Silicon, release build), directional:
+
+| | |
+|---|---|
+| full ingest, 94,500 files | 37.5s |
+| on-disk store, share of the input size | 71% |
+| dependency graph, 337,000 edges | 25.7s |
 
 ## keel vs git
 
