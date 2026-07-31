@@ -1,44 +1,33 @@
-# keel — Rust (the compiled core + CLI)
+# keel — the Rust workspace
 
-The production language, chosen for the reasons that actually matter here (not
-raw arithmetic — every compiled language ties there): compiled **startup**
-(~2ms vs Node's ~20ms floor), **memory safety** on untrusted input (chunks,
-cert chains, server responses), and an **ecosystem that is exactly keel's
-shape** — `blake3`, `ed25519-dalek`, `biscuit-auth` (bsmnt's own auth model),
-`gix`/gitoxide (drop the git subprocess), `jj-lib` (link the substrate directly).
+This builds the two binaries keel ships:
 
-## Layout
+- `keel` (from keel-cmd), the command-line tool, a drop-in for git.
+- `keeld` (from keel-daemon), the daemon that keeps the store, graph, and status warm so reads stay fast.
 
-- **`keel-core`** — the byte-identical primitives shared by CLI *and* server:
-  FastCDC chunking, BLAKE2b-256 addressing, canonical signing JSON. Content
-  addressing REQUIRES every peer compute these identically, so there is exactly
-  one implementation. Differential-tested against the Node reference
-  (`keel-server/src/store.mjs`) — hashes and chunk boundaries match byte-for-byte.
-- **`keel-cli`** — the `keel` binary. v0 ports the hot read path (`st`); output
-  is the same stable-key JSON contract as `keel.mjs`, verified equal.
-
-## Strategy: incremental port, Node stays the oracle
-
-`keel.mjs` remains the reference implementation and test oracle while commands
-port over one at a time. A ported command must (a) match the Node output
-contract and (b) pass the same behavior. This banks 15 waves of proven
-correctness instead of risking a big-bang rewrite. BLAKE2b today; `blake3` is a
-drop-in the day tree-parallelism is worth a native dep.
+Rust is the production language here for the reasons that matter for this workload: fast startup (a couple of milliseconds, versus a runtime floor an order of magnitude higher), memory safety on untrusted input (chunks, cert chains, server responses), and an ecosystem that fits keel's shape (`blake3`, `ed25519-dalek`, `biscuit-auth`, gitoxide).
 
 ## Build
 
 ```
-cargo build --release      # target/release/keel
-cargo test                 # unit + differential-vs-Node
+cargo build --release    # target/release/keel and target/release/keeld
+cargo test --release     # 20 test suites, including a differential test against git
 ```
 
-## Measured (200-file repo, p50)
+## Crates
 
-| | startup | keel st |
-|---|---|---|
-| node keel.mjs | 20ms | 54.7ms |
-| **keel (rust)** | **2.2ms** | **26.8ms** |
-| git status (floor) | — | 6.4ms |
+- keel-core — shared types and the canonical encoding every peer must agree on.
+- keel-store — the object store: content-addressed, BLAKE3, FastCDC chunking, delta compression, on LMDB. Also the warm live-status index, ignore rules, and read-only snapshots.
+- keel-resolve — language resolvers that build import and symbol graphs, one sidecar process per language.
+- keel-graph — the dependency graph, kept warm.
+- keel-brief — assembles the per-task context that a single fetch returns.
+- keel-coord — coordination across concurrent sessions: reservations and conflict prediction.
+- keel-git — git compatibility: byte-identical objects, packfiles, a smart-HTTP server, and a two-way mirror.
+- keel-net — transport over QUIC, for fetching objects by hash and streaming live events.
+- keel-daemon — keeld.
+- keel-cmd — the `keel` binary.
+- keel-cli — an earlier CLI, still built as `keel-legacy`, kept for reference.
 
-Rust `st` cold already matches Node's batch-warm speed. The remaining gap to
-git is the git subprocess spawns (status + numstat); `gix` erases those next.
+## Speed
+
+The release profile is tuned for small binaries and fast startup: LTO, one codegen unit, stripped symbols, and abort-on-panic. With the daemon running, `keel status` on the linux kernel (80,000 files) returns in under 10ms. The full read-speed comparison against git is in the root [README](../../README.md).

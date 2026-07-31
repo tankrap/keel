@@ -1,8 +1,8 @@
 {
   "schema": "keel-bench/1",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "issue": "NEW-1094",
-  "description": "Pinned configuration for keel's live-LLM flywheel benchmark suite. Runs are reproducible and comparable over time because models, trial counts, worker parallelism, scenario counts and the Wilson z are all fixed here.",
+  "description": "Pinned configuration for keel's live-LLM flywheel benchmark suite. Runs are reproducible and comparable over time because models, trial counts, worker parallelism, scenario counts and the Wilson z are all fixed here. The adversarial control (flywheel_adversarial.py) runs standalone: it has three conditions rather than the without/with pair this suite aggregates.",
   "models": {
     "solver": "claude-opus-4-8",
     "judge": "claude-sonnet-5",
@@ -10,7 +10,7 @@
     "temperature": "none — opus-4-8 adaptive thinking forces temp=1; sending a temperature returns HTTP 400, so no temperature field is ever sent"
   },
   "run": {
-    "trials": 3,
+    "trials": 4,
     "workers": 6,
     "wilson_z": 1.96
   },
@@ -27,10 +27,10 @@
       "measures": "Synthetic flywheel retrieval-lift: 20 scenarios each carrying an arbitrary project convention a competent model cannot guess a priori. Recorded via `keel learn`, retrieved via `keel brief`. Solve WITHOUT vs WITH the retrieved lesson; dual judge scores rule-compliance.",
       "requires": "keel binary (KEEL_BIN)",
       "reference": {
-        "without": "0/60 (0%)",
-        "without_ci95_pct": [0, 6],
-        "with": "57/60 (95%)",
-        "with_ci95_pct": [86, 98],
+        "without": "0/80 (0%)",
+        "without_ci95_pct": [0, 5],
+        "with": "76/80 (95%)",
+        "with_ci95_pct": [88, 98],
         "lift_points": 95,
         "retrieved": "20/20"
       }
@@ -43,12 +43,44 @@
       "measures": "Real-corpus flywheel retrieval-lift: 16 real, documented VS Code conventions attached to their real files (real path + real content) and retrieved via `keel brief`. Answers the 'you invented those conventions' objection to the synthetic run.",
       "requires": "keel binary (KEEL_BIN) + a microsoft/vscode checkout (CORPUS_SRC, default ~/keel-vscode-demo)",
       "reference": {
-        "without": "36/48 (75%)",
-        "without_ci95_pct": [61, 85],
-        "with": "45/48 (94%)",
-        "with_ci95_pct": [83, 98],
-        "lift_points": 19,
+        "without": "47/64 (73%)",
+        "without_ci95_pct": [62, 83],
+        "with": "60/64 (94%)",
+        "with_ci95_pct": [85, 98],
+        "lift_points": 20,
         "retrieved": "16/16"
+      }
+    },
+    {
+      "id": "corpus-django",
+      "module": "corpus_bench_django",
+      "scenarios": 12,
+      "scenario_arity": 5,
+      "measures": "Real-corpus flywheel retrieval-lift on Django (Python): 12 real, documented django/django conventions attached to their real files and retrieved via `keel brief`. Generalizes the effect beyond TypeScript.",
+      "requires": "keel binary (KEEL_BIN) + a django/django checkout (CORPUS_SRC, default ~/keel-django-demo)",
+      "reference": {
+        "without": "30/48 (62%)",
+        "without_ci95_pct": [48, 75],
+        "with": "44/48 (92%)",
+        "with_ci95_pct": [80, 97],
+        "lift_points": 29,
+        "retrieved": "12/12"
+      }
+    },
+    {
+      "id": "corpus-go",
+      "module": "corpus_bench_go",
+      "scenarios": 12,
+      "scenario_arity": 5,
+      "measures": "Real-corpus flywheel retrieval-lift on Prometheus (Go): 12 real, documented prometheus/prometheus conventions attached to their real files and retrieved via `keel brief`. Lowest model prior of the three, so the highest lift.",
+      "requires": "keel binary (KEEL_BIN) + a prometheus/prometheus checkout (CORPUS_SRC, default ~/keel-go-demo)",
+      "reference": {
+        "without": "28/48 (58%)",
+        "without_ci95_pct": [44, 71],
+        "with": "43/48 (90%)",
+        "with_ci95_pct": [78, 96],
+        "lift_points": 31,
+        "retrieved": "12/12"
       }
     }
   ]
