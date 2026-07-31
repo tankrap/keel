@@ -264,6 +264,18 @@ fn is_safe_entry_name(name: &str) -> bool {
 
 /// Materialize `tree_id` onto `dir` (created if needed).
 pub fn checkout(store: &Store, tree_id: ObjectId, dir: &Path) -> Result<()> {
+    checkout_depth(store, tree_id, dir, 0)
+}
+
+/// Cap on directory nesting when walking a tree from the store. Tree objects can come from an
+/// untrusted remote; without a bound a deeply-nested crafted tree overflows the native stack and
+/// aborts the process. Real repos nest only a few dozen levels deep, so this is far above any need.
+pub(crate) const MAX_TREE_DEPTH: u32 = 1024;
+
+fn checkout_depth(store: &Store, tree_id: ObjectId, dir: &Path, depth: u32) -> Result<()> {
+    if depth > MAX_TREE_DEPTH {
+        return Err(StoreError::Corrupt(tree_id)); // pathologically deep tree — refuse
+    }
     fs::create_dir_all(dir)?;
     let tree = match store.get(&tree_id)?.ok_or(StoreError::Corrupt(tree_id))? {
         Object::Tree(t) => t,
@@ -275,7 +287,7 @@ pub fn checkout(store: &Store, tree_id: ObjectId, dir: &Path) -> Result<()> {
         }
         let p = dir.join(&e.name);
         if e.mode == MODE_DIR {
-            checkout(store, e.id, &p)?;
+            checkout_depth(store, e.id, &p, depth + 1)?;
         } else {
             let content = match store.get(&e.id)?.ok_or(StoreError::Corrupt(e.id))? {
                 Object::Blob(b) => b,
@@ -375,6 +387,25 @@ mod tests {
         let res = checkout(&s, evil, &target);
         assert!(!escaped.exists(), "checkout escaped the target dir: {}", escaped.display());
         assert!(res.is_err(), "checkout must reject a traversal entry name");
+    }
+
+    #[test]
+    fn checkout_rejects_pathologically_deep_trees() {
+        // A crafted chain of nested trees (constructable from an untrusted remote) must error, not
+        // overflow the stack. Build MAX_TREE_DEPTH+2 levels bottom-up.
+        let sd = TmpDir::new();
+        let out = TmpDir::new();
+        let s = Store::open(sd.path()).unwrap();
+        let leaf = s.put(&Object::Blob(b"x\n".to_vec())).unwrap();
+        let mut id = s
+            .put(&Object::Tree(Tree { entries: vec![TreeEntry { name: "f".into(), mode: MODE_FILE, id: leaf }] }))
+            .unwrap();
+        for _ in 0..(MAX_TREE_DEPTH + 2) {
+            id = s
+                .put(&Object::Tree(Tree { entries: vec![TreeEntry { name: "d".into(), mode: MODE_DIR, id }] }))
+                .unwrap();
+        }
+        assert!(checkout(&s, id, &out.path().join("deep")).is_err(), "deep tree must error, not crash");
     }
 
     #[test]

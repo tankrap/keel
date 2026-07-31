@@ -230,7 +230,7 @@ impl Repo {
             return Ok(Vec::new());
         }
         let mut out = Vec::new();
-        self.diff_trees(head_tree, Some(work_root), &work_trees, "", &mut out)?;
+        self.diff_trees(head_tree, Some(work_root), &work_trees, "", &mut out, 0)?;
         out.sort_by(|a, b| a.path.cmp(&b.path));
         Ok(out)
     }
@@ -269,7 +269,11 @@ impl Repo {
         extra: &HashMap<ObjectId, Tree>,
         prefix: &str,
         out: &mut Vec<PathChange>,
+        depth: u32,
     ) -> Result<()> {
+        if depth > snapshot::MAX_TREE_DEPTH {
+            return Err(StoreError::Corrupt(new.or(old).unwrap_or(ObjectId([0; 32]))));
+        }
         // name → (in old?, in new?), each carrying (id, is_dir)
         type Side = Option<(ObjectId, bool)>;
         let mut map: BTreeMap<String, (Side, Side)> = BTreeMap::new();
@@ -282,19 +286,19 @@ impl Repo {
         for (name, (o, n)) in map {
             let path = if prefix.is_empty() { name } else { format!("{prefix}/{name}") };
             match (o, n) {
-                (None, Some((id, is_dir))) => self.emit_side(id, is_dir, extra, &path, ChangeKind::Added, out)?,
-                (Some((id, is_dir)), None) => self.emit_side(id, is_dir, extra, &path, ChangeKind::Deleted, out)?,
+                (None, Some((id, is_dir))) => self.emit_side(id, is_dir, extra, &path, ChangeKind::Added, out, depth)?,
+                (Some((id, is_dir)), None) => self.emit_side(id, is_dir, extra, &path, ChangeKind::Deleted, out, depth)?,
                 (Some((oid, od)), Some((nid, nd))) => {
                     if oid == nid {
                         continue; // identical subtree/blob — content-addressing makes this exact
                     }
                     match (od, nd) {
-                        (true, true) => self.diff_trees(Some(oid), Some(nid), extra, &path, out)?,
+                        (true, true) => self.diff_trees(Some(oid), Some(nid), extra, &path, out, depth + 1)?,
                         (false, false) => out.push(PathChange { path, kind: ChangeKind::Modified }),
                         // a file replaced a directory (or vice-versa): delete one side, add the other
                         _ => {
-                            self.emit_side(oid, od, extra, &path, ChangeKind::Deleted, out)?;
-                            self.emit_side(nid, nd, extra, &path, ChangeKind::Added, out)?;
+                            self.emit_side(oid, od, extra, &path, ChangeKind::Deleted, out, depth)?;
+                            self.emit_side(nid, nd, extra, &path, ChangeKind::Added, out, depth)?;
                         }
                     }
                 }
@@ -305,6 +309,7 @@ impl Repo {
     }
 
     /// Emit `kind` for a single entry: one line for a blob, or every blob beneath a dir.
+    #[allow(clippy::too_many_arguments)] // recursive tree walker; the extra arg is the depth cap
     fn emit_side(
         &self,
         id: ObjectId,
@@ -313,14 +318,18 @@ impl Repo {
         path: &str,
         kind: ChangeKind,
         out: &mut Vec<PathChange>,
+        depth: u32,
     ) -> Result<()> {
+        if depth > snapshot::MAX_TREE_DEPTH {
+            return Err(StoreError::Corrupt(id));
+        }
         if !is_dir {
             out.push(PathChange { path: path.to_string(), kind });
             return Ok(());
         }
         for e in self.tree_entries_src(Some(id), extra)? {
             let child = format!("{path}/{}", e.name);
-            self.emit_side(e.id, e.mode == snapshot::MODE_DIR, extra, &child, kind, out)?;
+            self.emit_side(e.id, e.mode == snapshot::MODE_DIR, extra, &child, kind, out, depth + 1)?;
         }
         Ok(())
     }
@@ -352,10 +361,17 @@ impl Repo {
     /// Every `(path, blob-id)` under `tree` (recursively), depth-first — the leaf inventory
     /// used by `repack` to build per-path version chains.
     fn tree_files(&self, tree: ObjectId, prefix: &str, out: &mut Vec<(String, ObjectId)>) -> Result<()> {
+        self.tree_files_depth(tree, prefix, out, 0)
+    }
+
+    fn tree_files_depth(&self, tree: ObjectId, prefix: &str, out: &mut Vec<(String, ObjectId)>, depth: u32) -> Result<()> {
+        if depth > snapshot::MAX_TREE_DEPTH {
+            return Err(StoreError::Corrupt(tree));
+        }
         for e in self.tree_entries(Some(tree))? {
             let path = if prefix.is_empty() { e.name.clone() } else { format!("{prefix}/{}", e.name) };
             if e.mode == snapshot::MODE_DIR {
-                self.tree_files(e.id, &path, out)?;
+                self.tree_files_depth(e.id, &path, out, depth + 1)?;
             } else {
                 out.push((path, e.id));
             }

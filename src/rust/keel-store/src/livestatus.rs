@@ -150,6 +150,19 @@ fn flatten_head(
     prefix: String,
     out: &mut HashMap<String, ObjectId>,
 ) -> Result<()> {
+    flatten_head_depth(store, tree, prefix, out, 0)
+}
+
+fn flatten_head_depth(
+    store: &crate::store::Store,
+    tree: ObjectId,
+    prefix: String,
+    out: &mut HashMap<String, ObjectId>,
+    depth: u32,
+) -> Result<()> {
+    if depth > snapshot::MAX_TREE_DEPTH {
+        return Err(StoreError::Corrupt(tree)); // pathologically deep tree — refuse
+    }
     let entries = match store.get(&tree)? {
         Some(Object::Tree(t)) => t.entries,
         _ => return Ok(()),
@@ -157,7 +170,7 @@ fn flatten_head(
     for e in entries {
         let path = if prefix.is_empty() { e.name.clone() } else { format!("{prefix}/{}", e.name) };
         if e.mode == snapshot::MODE_DIR {
-            flatten_head(store, e.id, path, out)?;
+            flatten_head_depth(store, e.id, path, out, depth + 1)?;
         } else {
             out.insert(path, e.id);
         }

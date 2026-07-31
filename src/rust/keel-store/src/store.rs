@@ -319,7 +319,13 @@ impl Store {
             return Err(StoreError::Corrupt(*id)); // runaway delta chain (should be impossible)
         }
         if let Some(bytes) = self.objects.get(r, &id.0)? {
-            return Ok(Some(Object::decode(&unpack(bytes)?)?));
+            let obj = Object::decode(&unpack(bytes)?)?;
+            // Verify the address like the delta/chunked paths do: an inline value corrupted at rest
+            // (or tampered directly in LMDB) must not be served as if it were valid.
+            if obj.id() != *id {
+                return Err(StoreError::Corrupt(*id));
+            }
+            return Ok(Some(obj));
         }
         if let Some(stored) = self.deltas.get(r, &id.0)? {
             return Ok(Some(self.reconstruct_delta(r, id, stored, depth)?));
@@ -643,7 +649,7 @@ impl Store {
     /// green, -1 on red). Returns the new score.
     pub fn bump_lesson_help(&self, lesson: &ObjectId, delta: i64) -> Result<i64> {
         let cur = self.lesson_help(lesson)?;
-        let next = cur + delta;
+        let next = cur.saturating_add(delta);
         self.aux_put("lhelp", &lesson.0, &next.to_le_bytes())?;
         Ok(next)
     }
