@@ -1,16 +1,16 @@
 # keel
 
-keel is version control for AI-written code. It is git-compatible. A plain `git push` to a keel repo lands as a normal keel commit. Clone, fetch, pull, and push all work unchanged.
+keel is version control for AI-written code. It is git-compatible, so a plain `git push` to a keel repo lands as a normal keel commit, and clone, fetch, pull, and push all work unchanged.
 
-The difference from git: keel treats each agent session as a first-class unit of history, and it answers a read with one fetch that returns everything an agent needs for a task. The relevant code, the dependency graph, a signed record of who wrote what, and lessons from past sessions. git returns diffs and leaves the rest to you.
+The difference from git is what a read gives you back. keel treats each agent session as a first-class piece of history, and a single fetch returns everything an agent needs for a task: the relevant code, the dependency graph, a signed record of who wrote what, and lessons from past sessions. git returns diffs and leaves you to assemble the rest.
 
 ## Benchmarks that matter
 
-Measured, with 95% confidence intervals. Reproduce from `src/keel-bench`.
+The numbers below are measured, with 95% confidence intervals, and you can reproduce them from `src/keel-bench`.
 
 ### Does it make agents more correct?
 
-keel can record a project convention from one session and surface it automatically on the next. To test whether that helps, we measured rule compliance with and without the retrieved convention. Solver claude-opus-4-8, judge claude-sonnet-5, 4 trials per case.
+keel can record a project convention from one session and surface it automatically on the next. To test whether that actually helps, we measured how often a model followed a rule with and without the retrieved convention. The solver was claude-opus-4-8, the judge was claude-sonnet-5, and each case ran four trials.
 
 | test set | without keel | with keel | gain |
 |---|---|---|---|
@@ -20,13 +20,13 @@ keel can record a project convention from one session and surface it automatical
 | prometheus, go | 58% | 90% | +31 |
 | all real repos, 3 languages | 66% | 92% | +26 |
 
-Control: give the model a wrong convention instead of the right one. It scores the same as giving nothing, a 0% gain. So the gain comes from the specific rule, not from adding more text to the prompt.
+As a control, we gave the model a wrong convention instead of the right one. It did no better than with nothing at all, a 0% gain, which means the improvement comes from the specific rule and not from simply adding text to the prompt.
 
-The effect holds across three languages. The less a model already knows a language's conventions, the larger the gain.
+The effect holds across three languages, and it grows as the model knows less about a language's conventions to begin with.
 
 ### Read speed
 
-`keel status` on the linux kernel, 80,000 files, median of 5 runs.
+This is `keel status` on the linux kernel, 80,000 files, as the median of five runs.
 
 | | time |
 |---|---|
@@ -34,63 +34,63 @@ The effect holds across three languages. The less a model already knows a langua
 | keel status, no daemon | 0.42s |
 | git status | 0.26s |
 
-The daemon keeps a warm index and does work proportional to what changed, not to repo size. git is faster with no daemon. keel is faster with one.
+With the daemon running, keel keeps a warm index and does work proportional to what changed rather than to the size of the repo. Without it, git is faster. With it, keel is.
 
 ## keel vs git
 
-What keel adds.
+keel adds four things git does not have.
 
-- One fetch returns the full context for a task. The relevant code, the dependency graph, who wrote what, and past sessions. git returns diffs.
-- Memory across sessions. A convention recorded once is surfaced automatically later. Numbers above. git has none.
-- Signed authorship. Every change traces to a human, agent work included. git records an author name, unsigned by default.
-- Content-addressed storage. Every object has a hash and verifies against it. BLAKE3, chunked with FastCDC, delta compressed.
+- A single fetch returns the full context for a task: the relevant code, the dependency graph, who wrote what, and past sessions. git returns diffs.
+- Memory across sessions. A convention recorded once is surfaced automatically later, with the gains shown above. git has no equivalent.
+- Signed authorship, so every change traces back to a human, agent work included. git records an author name that is unsigned by default.
+- Content-addressed storage, where every object has a hash and verifies against it. It uses BLAKE3, chunks with FastCDC, and delta-compresses.
 
-Where git wins.
+git still wins in four places.
 
 - Shallow clones are faster.
-- Smaller on disk. keel repack cuts its own size by 36% on a 300-commit import, and git is still smaller.
-- 20 years of tooling and near-universal support. keel is new.
-- Simpler for human-only work, where no agent reads history.
+- git repos are smaller on disk. keel's repack cuts its own size by 36% on a 300-commit import, and git is still smaller than that.
+- git has twenty years of tooling and near-universal support, and keel is new.
+- For human-only work, where no agent ever reads the history, git is simpler.
 
 ## Benchmark your own repo
 
-The test: take rules your repo enforces, record each one, and measure whether retrieval makes an agent follow it.
+The idea is to take rules your repo enforces, record each one, and measure whether retrieval makes an agent follow it.
 
 ```
 # build keel
 cd src/rust && cargo build --release
 
-# check the harnesses run. no API calls. free.
+# check the harnesses run, with no API calls, for free
 cd ../keel-bench && python3 run_suite.py --dry-run
 
-# run a published benchmark. needs an Anthropic key in ~/.claude-token.
+# run a published benchmark (needs an Anthropic key in ~/.claude-token)
 TRIALS=4 python3 flywheel_bench.py
 
-# your repo: copy a harness, point it at your checkout,
-# replace the rule list with rules your repo enforces.
+# for your repo, copy a harness, point it at your checkout,
+# and replace the rule list with rules your repo enforces
 cp corpus_bench_django.py corpus_bench_mine.py
-# edit the scenario list to (file, description, task, rule, check), then:
+# edit the scenario list to (file, description, task, rule, check), then run:
 CORPUS_SRC=/path/to/your/repo python3 corpus_bench_mine.py
 ```
 
-Each scenario is one rule: the file it applies to, a task, the rule itself, and the check the judge uses. keel learns the rule, retrieves it, the agent solves the task with and without it, the judge scores compliance. Details in `src/keel-bench/SUITE-RESULTS.md`.
+Each scenario is a single rule, described by the file it applies to, a task, the rule itself, and the check the judge uses. keel learns the rule and retrieves it, the agent solves the task with and without it, and the judge scores whether the result complies. There is more detail in `src/keel-bench/SUITE-RESULTS.md`.
 
 ## Repo layout
 
-Rust workspace under `src/rust`.
+The Rust workspace lives under `src/rust`.
 
-- keel-store · object store. content-addressed, BLAKE3, FastCDC chunking, delta compression, LMDB.
-- keel-resolve · language resolvers. builds import and symbol graphs per language.
+- keel-store · the object store: content-addressed, BLAKE3, FastCDC chunking, delta compression, on LMDB.
+- keel-resolve · language resolvers that build import and symbol graphs per language.
 - keel-graph · the live dependency graph, kept warm.
 - keel-brief · assembles the per-task context in one fetch.
-- keel-coord · coordination. reservations and conflict prediction across sessions.
-- keel-git · git compatibility. byte-identical objects, packfiles, a smart-HTTP server, two-way mirror.
-- keel-net · transport over QUIC. fetch objects by hash, stream live events.
-- keel-daemon · keeld. keeps the store, graph, and status warm so reads are fast.
-- keel-cmd · the `keel` binary. a drop-in for git.
+- keel-coord · coordination, including reservations and conflict prediction across sessions.
+- keel-git · git compatibility: byte-identical objects, packfiles, a smart-HTTP server, and a two-way mirror.
+- keel-net · transport over QUIC, for fetching objects by hash and streaming live events.
+- keel-daemon · keeld, which keeps the store, graph, and status warm so reads stay fast.
+- keel-cmd · the `keel` binary, a drop-in for git.
 - keel-core · shared types.
 
-Benchmarks are in `src/keel-bench`. Design notes are in `src/docs`.
+Benchmarks live in `src/keel-bench`, and design notes in `src/docs`.
 
 ## Build
 
@@ -102,11 +102,6 @@ cargo test --release     # 20 test suites
 
 ## Status
 
-keel is early. Verified today.
+keel is early, but the core works. What is verified today: full git compatibility, so clone, fetch, pull, and push all work and a git push lands as a native commit, with objects byte-identical across 47,000 real ones. status and diff match git, including gitignore and symlinks. The correctness gains above reproduce. The daemon serves warm context and fast status, and coordinates over QUIC.
 
-- git compatibility. clone, fetch, pull, push. a git push lands as a native commit. objects are byte-identical across 47,000 real ones.
-- status and diff match git, including gitignore and symlinks.
-- the correctness gain, benchmarked above.
-- the daemon. warm context, fast status, coordination over QUIC.
-
-Not yet. on-disk size matching git. hosted multi-repo serving, which is a separate project called hull. a frozen on-disk format.
+What is not there yet: on-disk size does not match git, there is no hosted multi-repo serving (that is a separate project, hull), and the on-disk format is not yet frozen.
