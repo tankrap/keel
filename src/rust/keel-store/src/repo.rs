@@ -120,6 +120,38 @@ impl Repo {
         Err(StoreError::Io(std::io::Error::other("branch too contended: gave up after 64 commit retries")))
     }
 
+    /// Store a change with EXPLICIT parents — for replaying an external commit DAG (e.g. `keel
+    /// import`) where parents are known ids, not the current head. Unlike [`Self::commit_tree`]
+    /// this does not CAS against head or move any ref; the caller advances the branch with
+    /// [`Self::set_branch`] once the whole graph is written. Parents must already be stored.
+    pub fn commit_tree_with_parents(
+        &self,
+        tree: ObjectId,
+        parents: Vec<ObjectId>,
+        intent: &str,
+        author: &str,
+        timestamp: u64,
+        session: Option<ObjectId>,
+    ) -> Result<ObjectId> {
+        let obj = Object::Change(Change {
+            parents,
+            tree,
+            session,
+            intent: intent.to_string(),
+            author: author.to_string(),
+            timestamp,
+            verification: Verification::Unverified,
+        });
+        let id = obj.id();
+        self.store.put(&obj)?;
+        Ok(id)
+    }
+
+    /// Point the branch ref at `id` (used after replaying a DAG via [`Self::commit_tree_with_parents`]).
+    pub fn set_branch(&self, id: ObjectId) -> Result<()> {
+        self.store.set_ref(&self.branch, &id)
+    }
+
     /// Snapshot `work_dir` and commit it in one step.
     pub fn commit_dir(
         &self,

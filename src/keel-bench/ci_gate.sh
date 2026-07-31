@@ -68,6 +68,18 @@ IC=$("$KEEL" native log --root "$G" 2>/dev/null | wc -l | tr -d ' ')
 EC=$(git -C "$TMP/gitout" log --oneline 2>/dev/null | wc -l | tr -d ' ')
 if [ "$IC" = "2" ] && [ "$EC" = "2" ]; then pass "import 2 → export 2 commits"; else fail "on-ramp (import=$IC export=$EC)"; fi
 
+section "git on-ramp — merge DAG round-trips (no commit loss)"
+M="$TMP/mergesrc"; mkdir -p "$M"; ( cd "$M" && git init -q && git config user.email a@b.co && git config user.name a \
+  && printf 'base\n' > base.txt && git add -A && git commit -qm c1 \
+  && git checkout -q -b feature && printf 'f\n' > feat.txt && git add -A && git commit -qm feat \
+  && git checkout -q master && printf 'm\n' > mainf.txt && git add -A && git commit -qm mainside \
+  && git merge -q --no-edit feature ) >/dev/null 2>&1
+"$KEEL" import "$M" --into "$M" >/dev/null 2>&1
+"$KEEL" export "$TMP/mergeout" --store "$M/.keel/store" >/dev/null 2>&1
+MC=$(git -C "$TMP/mergeout" rev-list --count HEAD 2>/dev/null)
+MP=$(git -C "$TMP/mergeout" cat-file -p HEAD 2>/dev/null | grep -c '^parent ')
+if [ "$MC" = "4" ] && [ "$MP" = "2" ]; then pass "merge round-trip (4 commits, 2-parent merge)"; else fail "merge round-trip (commits=$MC merge-parents=$MP)"; fi
+
 section "status/diff correctness"
 printf 'export function helper(x: number): number { return x * 3; }\n' > "$TMP/repo/util.ts"
 ST=$("$KEEL" native status --root "$TMP/repo" 2>/dev/null)
