@@ -19,12 +19,14 @@
 
 pub mod chunk;
 pub mod delta;
+pub mod livestatus;
 pub mod object;
 pub mod repo;
 pub mod snapshot;
 pub mod store;
 pub mod textdiff;
 
+pub use livestatus::LiveStatus;
 pub use object::{Change, DecodeError, Object, ObjectId, Session, Tree, TreeEntry, Verification};
 pub use repo::{ChangeKind, PathChange, Repo};
 pub use textdiff::{diff_lines, DiffLine, Hunk, Tag};

@@ -31,6 +31,7 @@ fn main() {
         Some("reindex") => run(cmd_reindex(&args[1..])),
         Some("serve") => run(cmd_serve(&args[1..])),
         Some("net-serve") => run(cmd_net_serve(&args[1..])),
+        Some("net-events") => run(cmd_net_events(&args[1..])),
         Some("verify") => run(cmd_verify(&args[1..])),
         Some("pin") => run(cmd_pin(&args[1..])),
         Some("pins") => run(cmd_pins(&args[1..])),
@@ -250,30 +251,43 @@ fn session_from_file(repo: &Repo, path: &str, msg: &str, lesson_override: Option
 
 fn cmd_status(args: &[String]) -> io::Result<()> {
     let (root, store) = root_store(args)?;
-    let repo = Repo::open(&store).map_err(to_io)?;
-    let changes = repo.status(&root).map_err(to_io)?;
+
+    // Prefer the warm daemon: its fs-watched LiveStatus answers in O(changed) instead of walking
+    // the whole tree. Fall back to a local walk if no daemon is up (or it can't serve status).
+    let rows: Vec<Value> = match daemon_request(&root, &json!({ "op": "status" }))
+        .filter(|r| r.get("ok").and_then(Value::as_bool) == Some(true))
+        .and_then(|r| r.get("changes").and_then(Value::as_array).cloned())
+    {
+        Some(rows) => rows,
+        None => {
+            let repo = Repo::open(&store).map_err(to_io)?;
+            repo.status(&root)
+                .map_err(to_io)?
+                .iter()
+                .map(|c| json!({ "path": c.path, "status": c.kind.marker().to_string() }))
+                .collect()
+        }
+    };
 
     if has(args, "--json") {
-        let rows: Vec<Value> = changes
-            .iter()
-            .map(|c| json!({ "path": c.path, "status": c.kind.marker().to_string() }))
-            .collect();
         println!("{}", render_json(&json!({ "changes": rows })));
         return Ok(());
     }
 
-    if changes.is_empty() {
+    if rows.is_empty() {
         println!("working tree clean (matches HEAD)");
         return Ok(());
     }
     let (mut a, mut m, mut d) = (0, 0, 0);
-    for c in &changes {
-        match c.kind {
-            keel_store::ChangeKind::Added => a += 1,
-            keel_store::ChangeKind::Modified => m += 1,
-            keel_store::ChangeKind::Deleted => d += 1,
+    for c in &rows {
+        let marker = c.get("status").and_then(Value::as_str).unwrap_or("?");
+        match marker {
+            "A" => a += 1,
+            "M" => m += 1,
+            "D" => d += 1,
+            _ => {}
         }
-        println!("  {} {}", c.kind.marker(), c.path);
+        println!("  {} {}", marker, c.get("path").and_then(Value::as_str).unwrap_or(""));
     }
     println!("{a} added, {m} modified, {d} deleted");
     Ok(())
@@ -788,6 +802,12 @@ fn cmd_learn(args: &[String]) -> io::Result<()> {
     if !informed.is_empty() {
         repo.store().set_informed(&head, &informed).map_err(to_io)?;
     }
+    // Best-effort: if a daemon with QUIC is up, broadcast the new lesson to the fleet so other
+    // agents subscribed via `keel net-events` see it live (coordination over the wire).
+    let _ = daemon_request(
+        &_root,
+        &json!({"op": "announce", "event": {"kind": "lesson", "file": task, "lesson": lesson, "change": head.to_hex()}}),
+    );
     println!("learned on {} — future briefs on this file or its neighbors will surface it", short(&head.to_hex()));
     Ok(())
 }
@@ -825,6 +845,35 @@ fn cmd_net_serve(args: &[String]) -> io::Result<()> {
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
         }
+    })
+}
+
+/// `keel net-events <host:port>` — subscribe to a keeld/net-serve QUIC endpoint and print live
+/// fleet-coordination events (agents briefing on files, lessons learned, changes landed) as they
+/// arrive. The remote presence side of the flywheel: coordination over the wire, not just locally.
+fn cmd_net_events(args: &[String]) -> io::Result<()> {
+    let addr_s = args
+        .iter()
+        .find(|a| !a.starts_with("--"))
+        .cloned()
+        .ok_or_else(|| io::Error::other("usage: keel net-events <host:port>"))?;
+    let addr: std::net::SocketAddr =
+        addr_s.parse().map_err(|e| io::Error::other(format!("bad address {addr_s}: {e}")))?;
+    let rt = tokio::runtime::Runtime::new()?;
+    rt.block_on(async move {
+        let client = keel_net::Client::connect(addr).await.map_err(|e| io::Error::other(e.to_string()))?;
+        let mut events = client.subscribe().await.map_err(|e| io::Error::other(e.to_string()))?;
+        eprintln!("keel net-events: subscribed to {addr} — waiting for coordination events (Ctrl-C to stop)");
+        while let Some(bytes) = events.next().await {
+            // events are JSON coordination messages; print each on its own line (pass through raw
+            // if it isn't JSON we recognize).
+            match serde_json::from_slice::<Value>(&bytes) {
+                Ok(v) => println!("{}", serde_json::to_string(&v).unwrap_or_default()),
+                Err(_) => println!("{}", String::from_utf8_lossy(&bytes)),
+            }
+        }
+        eprintln!("keel net-events: stream closed");
+        Ok(())
     })
 }
 

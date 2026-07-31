@@ -68,6 +68,24 @@ impl Server {
     pub fn publish(&self, event: Vec<u8>) {
         let _ = self.events.send(event);
     }
+
+    /// A cheap, cloneable, **synchronous** publish handle. `broadcast::Sender::send` isn't async,
+    /// so the daemon can hold a `Publisher` and broadcast coordination events straight from its
+    /// (blocking) request handlers while the server's accept loop runs on a background runtime.
+    pub fn publisher(&self) -> Publisher {
+        Publisher(self.events.clone())
+    }
+}
+
+/// A detached handle for broadcasting coordination events without holding the [`Server`].
+#[derive(Clone)]
+pub struct Publisher(broadcast::Sender<Vec<u8>>);
+
+impl Publisher {
+    /// Broadcast an event to all current subscribers (best-effort; no subscribers = a no-op).
+    pub fn publish(&self, event: Vec<u8>) {
+        let _ = self.0.send(event);
+    }
 }
 
 async fn serve_conn(conn: Connection, store: Store, events: broadcast::Sender<Vec<u8>>) -> Result<()> {

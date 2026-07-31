@@ -186,6 +186,17 @@ impl BriefService {
         self
     }
 
+    /// The underlying repo — shares the one open LMDB env (opening the store twice in a process
+    /// is unsafe), so the daemon builds its `LiveStatus` / QUIC server from this handle.
+    pub fn repo(&self) -> &Repo {
+        &self.repo
+    }
+
+    /// The live working-tree root.
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
     /// Commit the current working tree (so future briefs have provenance).
     pub fn commit(&mut self, intent: &str, author: &str, timestamp: u64) -> io::Result<ObjectId> {
         self.repo.commit_dir(&self.root, intent, author, timestamp, None).map_err(to_io)
