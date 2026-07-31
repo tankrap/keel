@@ -1,0 +1,55 @@
+{
+  "schema": "keel-bench/1",
+  "version": "1.0.0",
+  "issue": "NEW-1094",
+  "description": "Pinned configuration for keel's live-LLM flywheel benchmark suite. Runs are reproducible and comparable over time because models, trial counts, worker parallelism, scenario counts and the Wilson z are all fixed here.",
+  "models": {
+    "solver": "claude-opus-4-8",
+    "judge": "claude-sonnet-5",
+    "api_version": "2023-06-01",
+    "temperature": "none — opus-4-8 adaptive thinking forces temp=1; sending a temperature returns HTTP 400, so no temperature field is ever sent"
+  },
+  "run": {
+    "trials": 3,
+    "workers": 6,
+    "wilson_z": 1.96
+  },
+  "key": {
+    "source": "~/.claude-token",
+    "note": "read lazily at call time, cached in-process, never printed or logged"
+  },
+  "benchmarks": [
+    {
+      "id": "flywheel-synthetic",
+      "module": "flywheel_bench",
+      "scenarios": 20,
+      "scenario_arity": 5,
+      "measures": "Synthetic flywheel retrieval-lift: 20 scenarios each carrying an arbitrary project convention a competent model cannot guess a priori. Recorded via `keel learn`, retrieved via `keel brief`. Solve WITHOUT vs WITH the retrieved lesson; dual judge scores rule-compliance.",
+      "requires": "keel binary (KEEL_BIN)",
+      "reference": {
+        "without": "0/60 (0%)",
+        "without_ci95_pct": [0, 6],
+        "with": "57/60 (95%)",
+        "with_ci95_pct": [86, 98],
+        "lift_points": 95,
+        "retrieved": "20/20"
+      }
+    },
+    {
+      "id": "corpus-vscode",
+      "module": "corpus_bench",
+      "scenarios": 16,
+      "scenario_arity": 5,
+      "measures": "Real-corpus flywheel retrieval-lift: 16 real, documented VS Code conventions attached to their real files (real path + real content) and retrieved via `keel brief`. Answers the 'you invented those conventions' objection to the synthetic run.",
+      "requires": "keel binary (KEEL_BIN) + a microsoft/vscode checkout (CORPUS_SRC, default ~/keel-vscode-demo)",
+      "reference": {
+        "without": "36/48 (75%)",
+        "without_ci95_pct": [61, 85],
+        "with": "45/48 (94%)",
+        "with_ci95_pct": [83, 98],
+        "lift_points": 19,
+        "retrieved": "16/16"
+      }
+    }
+  ]
+}
