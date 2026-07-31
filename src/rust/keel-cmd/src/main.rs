@@ -36,6 +36,7 @@ fn main() {
         Some("pins") => run(cmd_pins(&args[1..])),
         Some("sessions") => run(cmd_sessions(&args[1..])),
         Some("session") => run(cmd_session(&args[1..])),
+        Some("learn") => run(cmd_learn(&args[1..])),
         Some("native") => run(cmd_native(&args[1..])),
         // ── git-compatible surface ──
         Some("init") => run(cmd_init(&args[1..])),   // git init + keel store
@@ -65,6 +66,7 @@ fn print_usage() {
          KEEL VALUE-ADD (the fused graph + git mirror):\n\
          \x20 keel brief  --file <path> [--symbol <name>] [--task <t>] [--json] [--reserve]\n\
          \x20 keel pin <symbol> --lesson <text>   ·   keel pins\n\
+         \x20 keel learn --lesson <text> [--task <text>]   record what a change taught (flywheel)\n\
          \x20 keel sessions [--file <path>]       ·   keel session <change>\n\
          \x20 keel repack [--json]                delta-compress history + GC (like `git gc`)\n\
          \x20 keel size   [--json]                logical bytes / object counts\n\
@@ -757,6 +759,23 @@ fn decode_chunked(raw: &[u8]) -> Option<Vec<u8>> {
         out.extend_from_slice(&raw[i..i + size]);
         i += size + 2; // data + trailing CRLF
     }
+}
+
+/// `keel learn --lesson <text> [--task <text>]` — record the non-obvious thing this change taught,
+/// attached to the current keel change (a post-hoc side-table annotation, so it works on git-driven
+/// history). A later `keel brief` on this file or its neighbors surfaces the lesson — the flywheel.
+fn cmd_learn(args: &[String]) -> io::Result<()> {
+    let lesson = flag(args, "--lesson").ok_or_else(|| io::Error::other("usage: keel learn --lesson <text> [--task <text>]"))?;
+    let task = flag(args, "--task").unwrap_or("");
+    let (_root, store_path) = root_store(args)?;
+    let repo = Repo::open(&store_path).map_err(to_io)?;
+    let head = repo
+        .head()
+        .map_err(to_io)?
+        .ok_or_else(|| io::Error::other("no keel history yet — commit first (e.g. `keel commit -m …`)"))?;
+    repo.store().set_lesson(&head, task, lesson).map_err(to_io)?;
+    println!("learned on {} — future briefs on this file or its neighbors will surface it", short(&head.to_hex()));
+    Ok(())
 }
 
 /// `keel net-serve [--port N]` — serve this repo's objects + a coordination event channel over

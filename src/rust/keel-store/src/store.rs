@@ -510,6 +510,39 @@ impl Store {
         Ok(out)
     }
 
+    // ── lessons (change → the non-obvious thing learned; the flywheel's fuel) ─────────────────
+    //
+    // A lesson is a POST-HOC annotation on an (immutable) change — like a verification — so it
+    // works on git-driven history too: `keel commit` (git) makes the change, `keel learn` attaches
+    // what was learned, and a later brief retrieves it for related work. Stored in the `aux` KV so
+    // it never moves the change's address. Value is `task ++ 0x00 ++ lesson` (task has no NUL).
+
+    /// Attach a `(task, lesson)` to a change.
+    pub fn set_lesson(&self, change: &ObjectId, task: &str, lesson: &str) -> Result<()> {
+        let mut v = Vec::with_capacity(task.len() + 1 + lesson.len());
+        v.extend_from_slice(task.as_bytes());
+        v.push(0);
+        v.extend_from_slice(lesson.as_bytes());
+        self.aux_put("lesson", &change.0, &v)
+    }
+
+    /// The `(task, lesson)` recorded for a change, if any.
+    pub fn lesson(&self, change: &ObjectId) -> Result<Option<(String, String)>> {
+        Ok(self.aux_get("lesson", &change.0)?.map(|v| split_lesson(&v)))
+    }
+
+    /// Every recorded lesson as `(change, task, lesson)`.
+    pub fn lessons(&self) -> Result<Vec<(ObjectId, String, String)>> {
+        let mut out = Vec::new();
+        for (k, v) in self.aux_iter("lesson")? {
+            if let Some(id) = read_id(&k) {
+                let (task, lesson) = split_lesson(&v);
+                out.push((id, task, lesson));
+            }
+        }
+        Ok(out)
+    }
+
     // ── generic namespaced KV (adapter side-tables; core stays adapter-agnostic) ─────────────
 
     fn aux_key(ns: &str, key: &[u8]) -> Vec<u8> {
@@ -825,6 +858,17 @@ fn unpack(stored: &[u8]) -> Result<Vec<u8>> {
 // it beats the full compressed blob, so a blob with no good base simply stays whole (never a
 // regression). The op codec finds shared regions anywhere in the base, so a blob can delta
 // against a merely *similar* one, not just its same-path predecessor.
+
+/// Split a stored lesson (`task ++ 0x00 ++ lesson`) into `(task, lesson)`.
+fn split_lesson(v: &[u8]) -> (String, String) {
+    match v.iter().position(|&b| b == 0) {
+        Some(i) => (
+            String::from_utf8_lossy(&v[..i]).into_owned(),
+            String::from_utf8_lossy(&v[i + 1..]).into_owned(),
+        ),
+        None => (String::new(), String::from_utf8_lossy(v).into_owned()),
+    }
+}
 
 /// Split a delta value (already `unpack`ed) into `(base_id, ops)`.
 fn split_delta(raw: &[u8]) -> Option<(ObjectId, &[u8])> {
