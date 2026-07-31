@@ -19,6 +19,7 @@
 
 pub mod chunk;
 pub mod delta;
+pub mod ignorerules;
 pub mod livestatus;
 pub mod object;
 pub mod repo;
