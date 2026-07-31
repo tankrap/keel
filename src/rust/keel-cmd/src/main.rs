@@ -531,7 +531,14 @@ fn sync_after(verb: &str) {
     }
     let synced = keel_store::store::Store::open(&store_path)
         .map_err(|e| io::Error::other(e.to_string()))
-        .and_then(|store| ingest_repo(&store, &top, true));
+        .and_then(|store| {
+            ingest_repo(&store, &top, true)?;
+            // Rebuild keel-native history for any new commits (incremental — only new ones), so
+            // `keel brief` / provenance see work done through the git surface without a manual
+            // `keel reindex`. Best-effort; a failure here never fails the git command.
+            keel_git::bridge::bridge(&store)?;
+            Ok(())
+        });
     if let Err(e) = synced {
         eprintln!("keel: mirror sync skipped ({e})");
     }

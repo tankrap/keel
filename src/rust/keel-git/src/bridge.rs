@@ -59,6 +59,17 @@ pub fn bridge(store: &Store) -> io::Result<BridgeStats> {
 
     let mut tree_cache: HashMap<[u8; 20], ObjectId> = HashMap::new();
     let mut change_map: HashMap<[u8; 20], ObjectId> = HashMap::new();
+    // Load already-bridged commits so a re-bridge is INCREMENTAL: commits already in the map are
+    // skipped (the topo walk short-circuits on them), so only new commits are converted. This is
+    // what makes re-bridging after each git-surface commit cheap instead of O(whole history).
+    for (goid, cid) in store.aux_iter(NS_CHANGE).map_err(to_io)? {
+        if goid.len() == 20 && cid.len() == 32 {
+            let (mut g, mut c) = ([0u8; 20], [0u8; 32]);
+            g.copy_from_slice(&goid);
+            c.copy_from_slice(&cid);
+            change_map.insert(g, ObjectId(c));
+        }
+    }
     let mut pending: Vec<Object> = Vec::new();
     let mut stats = BridgeStats::default();
 
