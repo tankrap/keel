@@ -2,3 +2,8 @@
 bench-report.json
 bench-report.md
 __pycache__/
+report-flywheel.json
+report-vscode.json
+report-django.json
+report-go.json
+report-adversarial.json
