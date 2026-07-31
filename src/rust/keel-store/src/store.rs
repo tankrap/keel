@@ -26,7 +26,7 @@
 //! single-writer + copy-on-write (no WAL) matches keel's read-heavy, concurrent,
 //! write-once, crash-only pattern, with zero-recovery restart.
 
-use crate::object::{DecodeError, Object, ObjectId, Verification};
+use crate::object::{DecodeError, Object, ObjectId, Review, Verification};
 use heed::types::Bytes;
 use heed::{Database, Env, EnvOpenOptions, RoTxn, RwTxn};
 use std::collections::HashSet;
@@ -543,6 +543,39 @@ impl Store {
         Ok(out)
     }
 
+    // ── reviews (a reviewer's verdict on a session/change, as a first-class object) ────────────
+    //
+    // A review is stored as a content-addressed `Object::Review`, exactly like a session. We also
+    // index its id in the `review` aux namespace (id → target) so reviews are enumerable and
+    // queryable without scanning every object. Several reviews of one target with differing
+    // verdicts express disagreement; the summary/labels/by_human fields let callers answer
+    // "reviews mentioning X", "security-critical reviews", and "approved without a human".
+
+    /// Store a review object and index it for enumeration. Returns its content address.
+    pub fn record_review(&self, r: &Review) -> Result<ObjectId> {
+        let id = self.put(&Object::Review(r.clone()))?;
+        self.aux_put("review", &id.0, &r.target.0)?;
+        Ok(id)
+    }
+
+    /// Every recorded review as `(id, review)`.
+    pub fn reviews(&self) -> Result<Vec<(ObjectId, Review)>> {
+        let mut out = Vec::new();
+        for (k, _) in self.aux_iter("review")? {
+            if let Some(id) = read_id(&k) {
+                if let Some(Object::Review(r)) = self.get(&id)? {
+                    out.push((id, r));
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Reviews of a specific target (session or change).
+    pub fn reviews_of(&self, target: &ObjectId) -> Result<Vec<(ObjectId, Review)>> {
+        Ok(self.reviews()?.into_iter().filter(|(_, r)| &r.target == target).collect())
+    }
+
     // ── feedback-weighted selector (the flywheel LEARNS from outcomes) ────────────────────────
     //
     // Causal chain: a brief serves lessons → the agent's work becomes change C → C is verified. If
@@ -782,6 +815,12 @@ impl Store {
                             stack.push(x.0);
                         }
                     }
+                    Object::Review(rv) => {
+                        stack.push(rv.target.0);
+                        for x in rv.findings.iter() {
+                            stack.push(x.0);
+                        }
+                    }
                 }
             } else if let Some(stored) = self.deltas.get(&w, &idb)? {
                 // a delta blob is kept alive, and its base must be kept too (the delta can't be
@@ -977,11 +1016,67 @@ fn read_uvarint(b: &[u8], i: &mut usize) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::object::{Change, Session, Tree, TreeEntry, Verification};
+    use crate::object::{Change, Review, Session, Tree, TreeEntry, Verdict, Verification};
     use crate::testutil::TmpDir;
 
     fn oid(b: u8) -> ObjectId {
         ObjectId([b; 32])
+    }
+
+    #[test]
+    fn record_enumerate_and_query_reviews() {
+        let d = TmpDir::new();
+        let s = Store::open(&d.0).unwrap();
+        let (sess_a, sess_b) = (oid(0xa0), oid(0xb0));
+
+        let mk = |target, reviewer: &str, human, verdict, summary: &str, labels: &[&str]| Review {
+            target,
+            reviewer: reviewer.into(),
+            by_human: human,
+            verdict,
+            summary: summary.into(),
+            labels: labels.iter().map(|l| l.to_string()).collect(),
+            findings: vec![],
+        };
+
+        // Session A: two reviewers disagree, one flags a race condition, and it was auto-approved.
+        let ra = s
+            .record_review(&mk(sess_a, "claude-sonnet-5", false, Verdict::Approve, "auto-approved", &["general"]))
+            .unwrap();
+        s.record_review(&mk(sess_a, "gpt-x", false, Verdict::RequestChanges, "possible race condition in retry", &["concurrency"]))
+            .unwrap();
+        // Session B: one human security review, approved.
+        s.record_review(&mk(sess_b, "human:alice", true, Verdict::Approve, "security pass ok", &["security"]))
+            .unwrap();
+
+        // Stored as a real content-addressed object, and enumerable.
+        assert!(matches!(s.get(&ra).unwrap(), Some(Object::Review(_))));
+        assert_eq!(s.reviews().unwrap().len(), 3);
+        assert_eq!(s.reviews_of(&sess_a).unwrap().len(), 2);
+        assert_eq!(s.reviews_of(&sess_b).unwrap().len(), 1);
+
+        let all = s.reviews().unwrap();
+        // "reviews mentioning race conditions"
+        let race: Vec<_> =
+            all.iter().filter(|(_, r)| r.summary.to_lowercase().contains("race condition")).collect();
+        assert_eq!(race.len(), 1);
+        assert_eq!(race[0].1.target, sess_a);
+        // "security-critical reviews"
+        let sec: Vec<_> = all.iter().filter(|(_, r)| r.labels.iter().any(|l| l == "security")).collect();
+        assert_eq!(sec.len(), 1);
+        assert_eq!(sec[0].1.target, sess_b);
+        // "approved without a human"
+        let auto: Vec<_> =
+            all.iter().filter(|(_, r)| r.verdict == Verdict::Approve && !r.by_human).collect();
+        assert_eq!(auto.len(), 1);
+        assert_eq!(auto[0].1.target, sess_a);
+        // "reviewers disagreed" — a target carrying more than one distinct verdict
+        let verdicts_a: std::collections::HashSet<_> =
+            s.reviews_of(&sess_a).unwrap().into_iter().map(|(_, r)| r.verdict).collect();
+        assert!(verdicts_a.len() >= 2);
+        let verdicts_b: std::collections::HashSet<_> =
+            s.reviews_of(&sess_b).unwrap().into_iter().map(|(_, r)| r.verdict).collect();
+        assert_eq!(verdicts_b.len(), 1);
     }
 
     /// Deterministic pseudo-random bytes (LCG) so tests are reproducible.

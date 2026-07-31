@@ -28,7 +28,9 @@ pub mod store;
 pub mod textdiff;
 
 pub use livestatus::LiveStatus;
-pub use object::{Change, DecodeError, Object, ObjectId, Session, Tree, TreeEntry, Verification};
+pub use object::{
+    Change, DecodeError, Object, ObjectId, Review, Session, Tree, TreeEntry, Verdict, Verification,
+};
 pub use repo::{ChangeKind, PathChange, Repo};
 pub use textdiff::{diff_lines, DiffLine, Hunk, Tag};
 pub use store::{Store, StoreError};

@@ -2,7 +2,7 @@
 //!
 //! Wire form: `encode(obj) = [KIND] ++ body`. `id(obj) = BLAKE3(encode(obj))`.
 //! The KIND byte is hashed, so a blob and a tree with otherwise-identical bytes
-//! never collide. Structured objects (tree/change/session) use length-prefixed,
+//! never collide. Structured objects (tree/change/session/review) use length-prefixed,
 //! canonically-ordered fields so the encoding is byte-stable regardless of how the
 //! in-memory value was built. Blobs are `[KIND_BLOB] ++ raw content`.
 
@@ -44,6 +44,7 @@ pub const KIND_BLOB: u8 = 1;
 pub const KIND_TREE: u8 = 2;
 pub const KIND_CHANGE: u8 = 3;
 pub const KIND_SESSION: u8 = 4;
+pub const KIND_REVIEW: u8 = 5;
 
 // ── ObjectId ─────────────────────────────────────────────────────────────────
 
@@ -129,6 +130,58 @@ impl Verification {
     }
 }
 
+/// A reviewer's verdict on a session or change.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum Verdict {
+    Approve,
+    RequestChanges,
+    Reject,
+    Comment,
+}
+impl Verdict {
+    /// Wire tag.
+    pub fn tag(self) -> u8 {
+        match self {
+            Verdict::Approve => 0,
+            Verdict::RequestChanges => 1,
+            Verdict::Reject => 2,
+            Verdict::Comment => 3,
+        }
+    }
+    fn from_tag(t: u8) -> Result<Verdict> {
+        Self::from_u8(t).ok_or(DecodeError::BadTag(t))
+    }
+    /// Decode a tag byte, or `None` if it isn't a valid verdict.
+    pub fn from_u8(t: u8) -> Option<Verdict> {
+        match t {
+            0 => Some(Verdict::Approve),
+            1 => Some(Verdict::RequestChanges),
+            2 => Some(Verdict::Reject),
+            3 => Some(Verdict::Comment),
+            _ => None,
+        }
+    }
+    /// Lowercase name, for CLI/JSON.
+    pub fn name(self) -> &'static str {
+        match self {
+            Verdict::Approve => "approve",
+            Verdict::RequestChanges => "request-changes",
+            Verdict::Reject => "reject",
+            Verdict::Comment => "comment",
+        }
+    }
+    /// Parse from the CLI/JSON name.
+    pub fn from_name(s: &str) -> Option<Verdict> {
+        match s {
+            "approve" => Some(Verdict::Approve),
+            "request-changes" => Some(Verdict::RequestChanges),
+            "reject" => Some(Verdict::Reject),
+            "comment" => Some(Verdict::Comment),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct TreeEntry {
     pub name: String,
@@ -173,6 +226,28 @@ pub struct Session {
     pub tokens_out: u64,
 }
 
+/// A review of a session or change, as a first-class object (peer to [`Session`]). One reviewer,
+/// one verdict; several reviews of the same `target` with differing verdicts express disagreement.
+/// Large detail (per-finding write-ups) is referenced as blobs, not inlined; the `summary` and
+/// `labels` stay inline so the store can answer queries ("reviews mentioning race conditions",
+/// "security-critical reviews", "approved without a human") without fetching every finding.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct Review {
+    /// The session or change under review.
+    pub target: ObjectId,
+    /// The reviewing model or actor (e.g. "claude-opus-4-8", "human:alice").
+    pub reviewer: String,
+    /// Whether a human performed or signed off this review (vs a fully automated one).
+    pub by_human: bool,
+    pub verdict: Verdict,
+    /// One-line, searchable summary of the review.
+    pub summary: String,
+    /// Topic labels (e.g. "security", "concurrency"), order preserved.
+    pub labels: Vec<String>,
+    /// Detailed findings, referenced as blobs.
+    pub findings: Vec<ObjectId>,
+}
+
 /// A content-addressed object.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Object {
@@ -180,6 +255,7 @@ pub enum Object {
     Tree(Tree),
     Change(Change),
     Session(Session),
+    Review(Review),
 }
 
 impl Object {
@@ -189,6 +265,7 @@ impl Object {
             Object::Tree(_) => KIND_TREE,
             Object::Change(_) => KIND_CHANGE,
             Object::Session(_) => KIND_SESSION,
+            Object::Review(_) => KIND_REVIEW,
         }
     }
 
@@ -232,6 +309,15 @@ impl Object {
                 o.push(s.verification.tag());
                 put_uvarint(&mut o, s.tokens_in);
                 put_uvarint(&mut o, s.tokens_out);
+            }
+            Object::Review(rv) => {
+                o.extend_from_slice(&rv.target.0);
+                put_bytes(&mut o, rv.reviewer.as_bytes());
+                o.push(rv.by_human as u8);
+                o.push(rv.verdict.tag());
+                put_bytes(&mut o, rv.summary.as_bytes());
+                put_vec_str(&mut o, &rv.labels);
+                put_vec_id(&mut o, &rv.findings);
             }
         }
         o
@@ -307,6 +393,25 @@ impl Object {
                     tokens_out,
                 }))
             }
+            KIND_REVIEW => {
+                let mut r = Reader::new(rest);
+                let target = r.id()?;
+                let reviewer = r.string()?;
+                let by_human = r.bool()?;
+                let verdict = Verdict::from_tag(r.u8()?)?;
+                let summary = r.string()?;
+                let labels = r.vec_str()?;
+                let findings = r.vec_id()?;
+                r.finish(Object::Review(Review {
+                    target,
+                    reviewer,
+                    by_human,
+                    verdict,
+                    summary,
+                    labels,
+                    findings,
+                }))
+            }
             k => Err(DecodeError::BadKind(k)),
         }
     }
@@ -347,6 +452,13 @@ fn put_vec_id(o: &mut Vec<u8>, ids: &[ObjectId]) {
     put_uvarint(o, ids.len() as u64);
     for id in ids {
         o.extend_from_slice(&id.0);
+    }
+}
+
+fn put_vec_str(o: &mut Vec<u8>, ss: &[String]) {
+    put_uvarint(o, ss.len() as u64);
+    for s in ss {
+        put_bytes(o, s.as_bytes());
     }
 }
 
@@ -426,6 +538,23 @@ impl<'a> Reader<'a> {
         Ok(v)
     }
 
+    fn vec_str(&mut self) -> Result<Vec<String>> {
+        let n = self.uvarint()? as usize;
+        let mut v = Vec::with_capacity(n.min(1 << 16));
+        for _ in 0..n {
+            v.push(self.string()?);
+        }
+        Ok(v)
+    }
+
+    fn bool(&mut self) -> Result<bool> {
+        match self.u8()? {
+            0 => Ok(false),
+            1 => Ok(true),
+            t => Err(DecodeError::BadTag(t)),
+        }
+    }
+
     /// Return `obj` only if all bytes were consumed (no trailing garbage).
     fn finish(&self, obj: Object) -> Result<Object> {
         if self.i == self.b.len() {
@@ -480,6 +609,18 @@ mod tests {
         })
     }
 
+    fn sample_review() -> Object {
+        Object::Review(Review {
+            target: oid(9),
+            reviewer: "claude-sonnet-5".into(),
+            by_human: false,
+            verdict: Verdict::RequestChanges,
+            summary: "possible race condition on the settle-delay retry".into(),
+            labels: vec!["concurrency".into(), "security".into()],
+            findings: vec![oid(20), oid(21)],
+        })
+    }
+
     #[test]
     fn id_is_deterministic() {
         let b = Object::Blob(b"hello keel".to_vec());
@@ -496,10 +637,37 @@ mod tests {
             sample_tree(),
             sample_change(),
             sample_session(),
+            sample_review(),
         ] {
             let decoded = Object::decode(&obj.encode()).expect("decode");
             assert_eq!(decoded, obj, "round-trip failed for {:?}", obj.kind());
         }
+    }
+
+    #[test]
+    fn review_fields_are_addressed() {
+        // Any field a query relies on must change the content address.
+        let base = match sample_review() {
+            Object::Review(r) => r,
+            _ => unreachable!(),
+        };
+        let id0 = Object::Review(base.clone()).id();
+
+        let mut verdict = base.clone();
+        verdict.verdict = Verdict::Approve;
+        assert_ne!(Object::Review(verdict).id(), id0, "verdict must be addressed");
+
+        let mut human = base.clone();
+        human.by_human = true;
+        assert_ne!(Object::Review(human).id(), id0, "by_human must be addressed");
+
+        let mut labels = base.clone();
+        labels.labels = vec!["security".into(), "concurrency".into()]; // same set, different order
+        assert_ne!(Object::Review(labels).id(), id0, "label order is significant");
+
+        let mut target = base;
+        target.target = oid(0xee);
+        assert_ne!(Object::Review(target).id(), id0, "target must be addressed");
     }
 
     #[test]
@@ -614,11 +782,18 @@ mod tests {
     fn rvecid(r: &mut Rng) -> Vec<ObjectId> {
         (0..(r.next() % 4)).map(|_| rid(r)).collect()
     }
+    fn rvecstr(r: &mut Rng) -> Vec<String> {
+        (0..(r.next() % 4)).map(|_| rstr(r)).collect()
+    }
+    fn rverdict(r: &mut Rng) -> Verdict {
+        [Verdict::Approve, Verdict::RequestChanges, Verdict::Reject, Verdict::Comment]
+            [(r.next() % 4) as usize]
+    }
     fn rverif(r: &mut Rng) -> Verification {
         [Verification::Unverified, Verification::Green, Verification::Red][(r.next() % 3) as usize]
     }
     fn random_object(r: &mut Rng) -> Object {
-        match r.next() % 4 {
+        match r.next() % 5 {
             0 => {
                 let n = (r.next() % 40) as usize;
                 Object::Blob((0..n).map(|_| (r.next() & 0xff) as u8).collect())
@@ -641,7 +816,7 @@ mod tests {
                 timestamp: r.next(),
                 verification: rverif(r),
             }),
-            _ => Object::Session(Session {
+            3 => Object::Session(Session {
                 task: rstr(r),
                 model: rstr(r),
                 lesson: rstr(r),
@@ -652,6 +827,15 @@ mod tests {
                 verification: rverif(r),
                 tokens_in: r.next(),
                 tokens_out: r.next(),
+            }),
+            _ => Object::Review(Review {
+                target: rid(r),
+                reviewer: rstr(r),
+                by_human: r.next().is_multiple_of(2),
+                verdict: rverdict(r),
+                summary: rstr(r),
+                labels: rvecstr(r),
+                findings: rvecid(r),
             }),
         }
     }
@@ -666,7 +850,8 @@ mod tests {
             let _ = Object::decode(&bytes);
         }
         // single-byte mutations + truncations of valid encodings (targets the parser)
-        let valids = [sample_tree(), sample_change(), sample_session(), Object::Blob(vec![1, 2, 3, 4])];
+        let valids =
+            [sample_tree(), sample_change(), sample_session(), sample_review(), Object::Blob(vec![1, 2, 3, 4])];
         for v in &valids {
             let enc = v.encode();
             for _ in 0..3_000 {

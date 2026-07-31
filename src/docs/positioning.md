@@ -48,11 +48,11 @@ It measurably improves correctness. On real codebases, retrieving a learned conv
 
 ## Review, reimagined *(vision)*
 
-Everything in this section is direction, not built. It is the goal a separate hosted project, hull, is aimed at.
+The hosted review flow in this section is direction, not built, and it is the goal a separate hosted project, hull, is aimed at. One foundational piece already exists in keel: reviews are first-class objects, so the cross-review queries below run today.
 
 Today's review tools review a diff. A human reads it, and AI review tools add a model that reads the same diff first. The artifact is still the diff. If the session is first-class, the thing to review is the session, not the diff: a review package that carries the task, the reasoning, the semantic operations, tests and CI, dependency impact, and a risk read, so a human reviews synthesized understanding rather than raw text.
 
-Two ideas follow from that. Review can be independent by construction, with a model from a different family than the one that wrote the code, to reduce correlated blind spots. The goal is independent critique, not consensus. And review itself can be a first-class object, so you can ask questions across reviews: every security review, every disagreement, everything that mentioned a race condition, everything approved without a human. git has no representation for any of that.
+Two ideas follow from that. Review can be independent by construction, with a model from a different family than the one that wrote the code, to reduce correlated blind spots. The goal is independent critique, not consensus. And review itself is a first-class object, which keel implements today, so you can ask questions across reviews: every security review, every disagreement, everything that mentioned a race condition, everything approved without a human. Those queries run now via `keel reviews`. git has no representation for any of that.
 
 ## Semantic operations, not line diffs *(vision)*
 
@@ -77,5 +77,6 @@ The core of it: keel is not trying to replace git's interoperability. It is repl
 | the flywheel: learn, retrieve, measured correctness lift | shipped and benchmarked |
 | coordinate-before-conflict: reservations, conflict prediction | building |
 | semantic diff and semantic operations | roadmapped |
-| session-based review, independent-model review, review objects | vision (hull) |
+| reviews as first-class objects, with cross-review queries (`keel review` / `keel reviews`) | shipped |
+| session-based review packages, independent-model review, semantic review | vision (hull) |
 | cryptographic authorship and human accountability | vision (hull) |
