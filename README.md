@@ -2,7 +2,7 @@
 
 keel is version control for AI-written code. It is git-compatible, so a plain `git push` to a keel repo lands as a normal keel commit, and clone, fetch, pull, and push all work unchanged.
 
-The difference from git is what a read gives you back. keel treats each agent session as a first-class piece of history, and a single fetch returns everything an agent needs for a task: the relevant code, the dependency graph, a signed record of who wrote what, and lessons from past sessions. git returns diffs and leaves you to assemble the rest.
+The difference from git is what a read gives you back. keel treats each agent session as a first-class piece of history, and a single fetch returns everything an agent needs for a task: the relevant code, the dependency graph, a record of who wrote what, and lessons from past sessions. git returns diffs and leaves you to assemble the rest.
 
 ## Benchmarks that matter
 
@@ -38,12 +38,11 @@ With the daemon running, keel keeps a warm index and does work proportional to w
 
 ## keel vs git
 
-keel adds four things git does not have.
+keel adds three things git does not have.
 
-- A single fetch returns the full context for a task: the relevant code, the dependency graph, who wrote what, and past sessions. git returns diffs.
-- Memory across sessions. A convention recorded once is surfaced automatically later, with the gains shown above. git has no equivalent.
-- Signed authorship, so every change traces back to a human, agent work included. git records an author name that is unsigned by default.
-- Content-addressed storage, where every object has a hash and verifies against it. It uses BLAKE3, chunks with FastCDC, and delta-compresses.
+- A single fetch returns the full context for a task: the relevant code, the dependency graph, who wrote what, and past sessions. git returns diffs and leaves you to assemble the rest.
+- Memory across sessions. A convention recorded once is surfaced automatically on later tasks, worth the gains in the table above. git has no equivalent.
+- Sessions are first-class history. keel records how a change was made, including the task, the model, the prompts, the tool calls, and whether the result verified, as an object in the history. git records the commit and an author name, and nothing about how the change was produced.
 
 git still wins in four places.
 
