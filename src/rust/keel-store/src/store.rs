@@ -543,6 +543,49 @@ impl Store {
         Ok(out)
     }
 
+    // ── feedback-weighted selector (the flywheel LEARNS from outcomes) ────────────────────────
+    //
+    // Causal chain: a brief serves lessons → the agent's work becomes change C → C is verified. If
+    // C went green, the lessons that INFORMED it earned their keep and are upweighted for the next
+    // brief; if red, downweighted. `informed` records which lessons produced a change; `lesson_help`
+    // is the accumulating score a brief ranks by. Both in the aux KV (post-hoc, address-stable).
+
+    /// Record that `change` was produced with the help of `lessons` (each identified by the change
+    /// the lesson is attached to). Overwrites any prior record for `change`.
+    pub fn set_informed(&self, change: &ObjectId, lessons: &[ObjectId]) -> Result<()> {
+        let mut v = Vec::with_capacity(lessons.len() * 32);
+        for l in lessons {
+            v.extend_from_slice(&l.0);
+        }
+        self.aux_put("informed", &change.0, &v)
+    }
+
+    /// The lessons that informed `change` (empty if none recorded).
+    pub fn informed(&self, change: &ObjectId) -> Result<Vec<ObjectId>> {
+        Ok(self
+            .aux_get("informed", &change.0)?
+            .map(|v| v.chunks_exact(32).filter_map(read_id).collect())
+            .unwrap_or_default())
+    }
+
+    /// Adjust a lesson's helpfulness score by `delta` (e.g. +1 when a change it informed verifies
+    /// green, -1 on red). Returns the new score.
+    pub fn bump_lesson_help(&self, lesson: &ObjectId, delta: i64) -> Result<i64> {
+        let cur = self.lesson_help(lesson)?;
+        let next = cur + delta;
+        self.aux_put("lhelp", &lesson.0, &next.to_le_bytes())?;
+        Ok(next)
+    }
+
+    /// A lesson's accumulated helpfulness score (0 if never scored).
+    pub fn lesson_help(&self, lesson: &ObjectId) -> Result<i64> {
+        Ok(self
+            .aux_get("lhelp", &lesson.0)?
+            .filter(|v| v.len() == 8)
+            .map(|v| i64::from_le_bytes(v.try_into().unwrap()))
+            .unwrap_or(0))
+    }
+
     // ── generic namespaced KV (adapter side-tables; core stays adapter-agnostic) ─────────────
 
     fn aux_key(ns: &str, key: &[u8]) -> Vec<u8> {
@@ -1046,6 +1089,31 @@ mod tests {
         assert_eq!(id, obj.id(), "chunking must not change the address");
         assert!(s.chunk_count().unwrap() > 1, "large blob split into chunks");
         assert_eq!(s.get(&id).unwrap(), Some(Object::Blob(content)));
+    }
+
+    #[test]
+    fn lesson_informed_and_help_feedback() {
+        let d = TmpDir::new();
+        let s = Store::open(&d.0).unwrap();
+        let (a, b, c) = (ObjectId([1; 32]), ObjectId([2; 32]), ObjectId([3; 32]));
+
+        // lessons on A and B
+        s.set_lesson(&a, "cache", "flush before close").unwrap();
+        s.set_lesson(&b, "auth", "check the nonce").unwrap();
+        assert_eq!(s.lesson(&a).unwrap(), Some(("cache".into(), "flush before close".into())));
+        assert_eq!(s.lessons().unwrap().len(), 2);
+
+        // change C was informed by lesson A; scoring A on C's outcome
+        s.set_informed(&c, &[a]).unwrap();
+        assert_eq!(s.informed(&c).unwrap(), vec![a]);
+        assert_eq!(s.lesson_help(&a).unwrap(), 0);
+        for l in s.informed(&c).unwrap() {
+            s.bump_lesson_help(&l, 1).unwrap();
+        }
+        assert_eq!(s.lesson_help(&a).unwrap(), 1, "A credited for informing a green change");
+        assert_eq!(s.lesson_help(&b).unwrap(), 0, "B uninvolved → unchanged");
+        // a red outcome penalizes
+        assert_eq!(s.bump_lesson_help(&a, -1).unwrap(), 0);
     }
 
     #[test]

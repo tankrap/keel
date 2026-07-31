@@ -138,10 +138,18 @@ fn cmd_brief(args: &[String]) -> io::Result<()> {
 
 /// Persist the context this brief served to `<root>/.keel/last_brief.json` (overwrites).
 fn record_last_brief(root: &Path, value: &Value) {
+    // Also record WHICH lessons this brief served (by the change each is attached to), so a
+    // following `keel learn` can attribute the resulting work to them — the flywheel's feedback edge.
+    let served: Vec<Value> = value
+        .get("sessions")
+        .and_then(Value::as_array)
+        .map(|a| a.iter().filter_map(|s| s.get("change").cloned()).collect())
+        .unwrap_or_default();
     let rec = json!({
         "task": value.get("task").cloned().unwrap_or(Value::Null),
         "file": value.get("file").cloned().unwrap_or(Value::Null),
         "context": value.get("context").cloned().unwrap_or(Value::Null),
+        "served_lessons": served,
     });
     let dir = root.join(".keel");
     let _ = std::fs::create_dir_all(&dir);
@@ -774,8 +782,31 @@ fn cmd_learn(args: &[String]) -> io::Result<()> {
         .map_err(to_io)?
         .ok_or_else(|| io::Error::other("no keel history yet — commit first (e.g. `keel commit -m …`)"))?;
     repo.store().set_lesson(&head, task, lesson).map_err(to_io)?;
+    // Attribute this work to the lessons the last brief served — so when this change is verified
+    // green, those lessons earn a helpfulness bump (the flywheel's feedback edge).
+    let informed = served_lessons(&_root);
+    if !informed.is_empty() {
+        repo.store().set_informed(&head, &informed).map_err(to_io)?;
+    }
     println!("learned on {} — future briefs on this file or its neighbors will surface it", short(&head.to_hex()));
     Ok(())
+}
+
+/// The lessons the most recent `keel brief` served, from `.keel/last_brief.json` (each identified
+/// by the change it's attached to).
+fn served_lessons(root: &Path) -> Vec<ObjectId> {
+    let raw = match std::fs::read_to_string(root.join(".keel/last_brief.json")) {
+        Ok(r) => r,
+        Err(_) => return Vec::new(),
+    };
+    let v: Value = match serde_json::from_str(&raw) {
+        Ok(v) => v,
+        Err(_) => return Vec::new(),
+    };
+    v.get("served_lessons")
+        .and_then(Value::as_array)
+        .map(|a| a.iter().filter_map(|s| s.as_str()).filter_map(ObjectId::from_hex).collect())
+        .unwrap_or_default()
 }
 
 /// `keel net-serve [--port N]` — serve this repo's objects + a coordination event channel over
@@ -1084,8 +1115,16 @@ fn cmd_verify(args: &[String]) -> io::Result<()> {
     let repo = Repo::open(&store).map_err(to_io)?;
     let id = resolve_change(&repo, change)?; // accepts a full id or a short prefix (git-style)
     repo.store().set_verification(&id, v).map_err(to_io)?;
+    // Feedback: reward/penalize the lessons that INFORMED this change (the flywheel learns which
+    // retrieved lessons actually lead to green outcomes, and ranks them up for the next brief).
+    let delta = if matches!(v, Verification::Green) { 1 } else { -1 };
+    let informed = repo.store().informed(&id).map_err(to_io)?;
+    for lesson in &informed {
+        let _ = repo.store().bump_lesson_help(lesson, delta);
+    }
     let mark = if matches!(v, Verification::Green) { "green ✓" } else { "red ✗" };
-    println!("verified {} · {mark}", short(&id.to_hex()));
+    let credited = if informed.is_empty() { String::new() } else { format!(" · {} lesson(s) {}", informed.len(), if delta > 0 { "credited" } else { "penalized" }) };
+    println!("verified {} · {mark}{credited}", short(&id.to_hex()));
     Ok(())
 }
 
