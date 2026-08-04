@@ -333,23 +333,26 @@ impl Repo {
         if depth > snapshot::MAX_TREE_DEPTH {
             return Err(StoreError::Corrupt(new.or(old).unwrap_or(ObjectId([0; 32]))));
         }
-        // name → (in old?, in new?), each carrying (id, is_dir)
-        type Side = Option<(ObjectId, bool)>;
+        // name → (in old?, in new?), each carrying (id, mode). Mode is kept in full (not reduced to
+        // is_dir) so a mode-only change — e.g. `chmod +x`, or a file⇄symlink swap with equal bytes —
+        // is still reported: it changes the tree id but not the blob id, so an id-only compare misses it.
+        type Side = Option<(ObjectId, u32)>;
         let mut map: BTreeMap<String, (Side, Side)> = BTreeMap::new();
         for e in self.tree_entries_src(old, extra)? {
-            map.entry(e.name).or_default().0 = Some((e.id, e.mode == snapshot::MODE_DIR));
+            map.entry(e.name).or_default().0 = Some((e.id, e.mode));
         }
         for e in self.tree_entries_src(new, extra)? {
-            map.entry(e.name).or_default().1 = Some((e.id, e.mode == snapshot::MODE_DIR));
+            map.entry(e.name).or_default().1 = Some((e.id, e.mode));
         }
         for (name, (o, n)) in map {
             let path = if prefix.is_empty() { name } else { format!("{prefix}/{name}") };
             match (o, n) {
-                (None, Some((id, is_dir))) => self.emit_side(id, is_dir, extra, &path, ChangeKind::Added, out, depth)?,
-                (Some((id, is_dir)), None) => self.emit_side(id, is_dir, extra, &path, ChangeKind::Deleted, out, depth)?,
-                (Some((oid, od)), Some((nid, nd))) => {
-                    if oid == nid {
-                        continue; // identical subtree/blob — content-addressing makes this exact
+                (None, Some((id, m))) => self.emit_side(id, m == snapshot::MODE_DIR, extra, &path, ChangeKind::Added, out, depth)?,
+                (Some((id, m)), None) => self.emit_side(id, m == snapshot::MODE_DIR, extra, &path, ChangeKind::Deleted, out, depth)?,
+                (Some((oid, om)), Some((nid, nm))) => {
+                    let (od, nd) = (om == snapshot::MODE_DIR, nm == snapshot::MODE_DIR);
+                    if oid == nid && om == nm {
+                        continue; // identical subtree/blob and mode — content-addressing makes this exact
                     }
                     match (od, nd) {
                         (true, true) => self.diff_trees(Some(oid), Some(nid), extra, &path, out, depth + 1)?,
@@ -761,6 +764,30 @@ mod tests {
         // and it must still be tracked in HEAD
         let head = repo.head().unwrap().unwrap();
         assert!(repo.file_at(head, "app.min.js").unwrap().is_some(), "tracked file dropped from HEAD");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn status_reports_a_mode_only_change() {
+        use std::os::unix::fs::PermissionsExt;
+        let sd = TmpDir::new();
+        let work = TmpDir::new();
+        let repo = Repo::open(sd.path()).unwrap();
+        let f = work.path().join("run.sh");
+        fs::write(&f, b"#!/bin/sh\necho hi\n").unwrap();
+        repo.commit_dir(work.path(), "add", "acct", 1, None).unwrap();
+
+        // chmod +x: identical bytes (same blob id) but a new mode → the tree id changes while the
+        // blob id does not. A blob-id-only diff would miss this and report the tree as clean.
+        let mut perm = fs::metadata(&f).unwrap().permissions();
+        perm.set_mode(0o755);
+        fs::set_permissions(&f, perm).unwrap();
+
+        let st = repo.status(work.path()).unwrap();
+        assert!(
+            st.iter().any(|c| c.path == "run.sh" && matches!(c.kind, ChangeKind::Modified)),
+            "chmod +x must be reported as a modification, got {st:?}"
+        );
     }
 
     #[test]

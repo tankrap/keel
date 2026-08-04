@@ -155,7 +155,17 @@ pub fn receive_pack(store: &Store, request: &[u8]) -> io::Result<Vec<u8>> {
             let res = if new.bytes().all(|b| b == b'0') {
                 mirror::delete_ref(store, r).map(|_| ())
             } else {
-                mirror::set_ref(store, r, new)
+                // Refuse a ref update whose tip object isn't present (in this pack or already
+                // stored): otherwise the ref is advertised but unclonable — every later clone
+                // `want`s an object the server can't send and the client aborts. (git enforces full
+                // connectivity; this catches the outright-missing tip cheaply.)
+                match Oid::from_hex_str(new) {
+                    Ok(oid) if mirror::get_object(store, &oid).ok().flatten().is_some() => {
+                        mirror::set_ref(store, r, new)
+                    }
+                    Ok(_) => Err(io::Error::new(io::ErrorKind::InvalidData, "missing necessary objects")),
+                    Err(_) => Err(io::Error::new(io::ErrorKind::InvalidData, "bad ref oid")),
+                }
             };
             ref_results.push((r.clone(), res.map_err(|e| e.to_string())));
         }
@@ -250,6 +260,33 @@ mod tests {
         assert!(refs.iter().any(|(n, v)| n == "HEAD" && v == "ref: refs/heads/main"));
         assert_eq!(mirror::get_object(&store, &coid).unwrap().unwrap().0, Kind::Commit);
         assert_eq!(mirror::get_object(&store, &boid).unwrap().unwrap().1, blob);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn receive_pack_rejects_a_ref_update_with_a_missing_tip() {
+        // A push that names a tip oid not present in the pack (here: an empty pack) must be
+        // refused, not recorded — otherwise the ref is advertised but every clone `want`s an object
+        // the server can't send, leaving the repo unclonable.
+        let dir = std::env::temp_dir().join(format!("keelgit-recv-miss-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = Store::open(&dir.join("store")).unwrap();
+
+        let zero = "0".repeat(40);
+        let missing = "1".repeat(40); // a well-formed oid the store has never seen
+        let mut req = pktline::encode(
+            format!("{zero} {missing} refs/heads/evil\0report-status\n").as_bytes(),
+        );
+        req.extend_from_slice(pktline::FLUSH);
+        // no packfile follows → the object is absent
+
+        let report = receive_pack(&store, &req).unwrap();
+        let text = String::from_utf8_lossy(&report);
+        assert!(text.contains("ng refs/heads/evil"), "update should be reported failed: {text}");
+        assert!(
+            !mirror::refs(&store).unwrap().iter().any(|(n, _)| n == "refs/heads/evil"),
+            "a ref with a missing tip must not be recorded"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

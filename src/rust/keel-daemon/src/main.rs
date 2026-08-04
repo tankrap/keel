@@ -321,9 +321,7 @@ fn status_response(ctx: &Ctx) -> Value {
             l.on_paths(&paths);
         }
     }
-    let changes: Vec<Value> = live
-        .lock()
-        .unwrap()
+    let changes: Vec<Value> = lock(live)
         .changes()
         .into_iter()
         .map(|c| json!({"path": c.path, "status": c.kind.marker().to_string()}))

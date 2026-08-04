@@ -265,9 +265,12 @@ pub fn read(
     let mut by_offset: HashMap<usize, (Kind, Vec<u8>)> = HashMap::new();
     let mut by_oid: HashMap<[u8; 20], (Kind, Vec<u8>)> = HashMap::new();
     // The header's object count is attacker-controlled (up to 4.29B). Each object costs at least a
-    // few bytes on the wire, so a legitimate `count` can't exceed the remaining pack length — cap
-    // the capacity hint by it so a bogus count can't drive a huge up-front reservation.
-    let mut out = Vec::with_capacity(count.min(pack.len()));
+    // few bytes on the wire, so a legitimate `count` can't exceed the remaining pack length; cap by
+    // that, and by an absolute element ceiling — each element is a 32-byte `(Kind, Vec<u8>)`, so
+    // `count.min(pack.len())` alone still reserves ~32× the pack size. The Vec grows as needed past
+    // the hint for genuinely huge packs.
+    let cap_hint = count.min(pack.len()).min(1 << 20);
+    let mut out = Vec::with_capacity(cap_hint);
 
     for _ in 0..count {
         let obj_offset = pos;

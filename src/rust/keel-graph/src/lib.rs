@@ -300,12 +300,15 @@ impl LiveGraph {
 /// imports, C `#include`s, …); the walk just has to find them, so it spans the languages
 /// keel has resolvers for. `.d.ts` is skipped (declarations, no edges of interest).
 fn is_source(name: &str) -> bool {
-    if name.ends_with(".d.ts") {
+    // TypeScript declaration files carry no edges of interest, in any of their extension variants.
+    if name.ends_with(".d.ts") || name.ends_with(".d.mts") || name.ends_with(".d.cts") {
         return false;
     }
+    // Must stay in sync with keel-resolve's `lang_of`: any extension the sidecar resolves has to be
+    // walked/watched here, or those files never enter the dependency graph.
     const EXTS: &[&str] = &[
-        ".ts", ".tsx", ".js", ".jsx", ".mjs", ".c", ".h", ".cc", ".cpp", ".cxx", ".hh", ".hpp",
-        ".py", ".pyi", ".go",
+        ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".mts", ".cts", ".c", ".h", ".cc", ".cpp",
+        ".cxx", ".hh", ".hpp", ".hxx", ".py", ".pyi", ".go",
     ];
     EXTS.iter().any(|e| name.ends_with(e))
 }
@@ -379,6 +382,21 @@ mod tests {
 
     fn script() -> PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR")).join("../keel-resolve/sidecar/resolve.mjs")
+    }
+
+    #[test]
+    fn is_source_covers_every_extension_the_resolver_handles() {
+        // These are the modern TS/C variants keel-resolve's `lang_of` routes to a sidecar. If the
+        // walk/watch filter here skips any of them, those files silently never enter the graph.
+        for f in ["m.mts", "c.cts", "s.cjs", "h.hxx"] {
+            assert!(is_source(f), "{f} must be treated as a source file");
+        }
+        // Declaration files still carry no edges, in every extension variant.
+        for f in ["t.d.ts", "t.d.mts", "t.d.cts"] {
+            assert!(!is_source(f), "{f} is a declaration file and must be skipped");
+        }
+        // A regular .mts is a source file even though .d.mts is not.
+        assert!(is_source("real.mts"));
     }
 
     /// With fs-watching on, `refresh` picks up a newly created file (and its edges) without a

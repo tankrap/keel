@@ -290,8 +290,17 @@ pub fn materialize(store: &Store, dst: &Path) -> io::Result<MirrorStats> {
 }
 
 fn write_ref(git: &Path, name: &str, val: &str) -> io::Result<()> {
-    // guard against path escapes; refs are always under .git
-    if name.contains("..") || name.starts_with('/') {
+    // Ref names come from untrusted input (a pushed receive-pack command, or a crafted `packed-refs`
+    // on mirror-in). Restrict to the legitimate namespace — `HEAD` or `refs/…` — so a name like
+    // `config` or `objects/info/alternates` can't be written straight into `.git/`. Blocking only
+    // `..`/leading-`/` (the old guard) still allowed arbitrary top-level files.
+    if name != "HEAD" && !name.starts_with("refs/") {
+        return Err(bad("ref name outside refs/ namespace"));
+    }
+    if name.starts_with('/')
+        || name.contains('\\')
+        || name.split('/').any(|c| c.is_empty() || c == "." || c == "..")
+    {
         return Err(bad("suspicious ref name"));
     }
     let path = git.join(name);
@@ -325,6 +334,27 @@ fn to_io(e: keel_store::store::StoreError) -> io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn write_ref_stays_inside_the_refs_namespace() {
+        let dir = std::env::temp_dir().join(format!("keelgit-writeref-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let git = dir.join(".git");
+        std::fs::create_dir_all(&git).unwrap();
+
+        // legitimate ref targets are written
+        assert!(write_ref(&git, "refs/heads/main", "aaaa").is_ok());
+        assert!(write_ref(&git, "HEAD", "ref: refs/heads/main").is_ok());
+        assert!(git.join("refs/heads/main").exists());
+
+        // names that would escape the ref tree and clobber real repo files are refused
+        for name in ["config", "packed-refs", "objects/info/alternates", "../evil", "refs/../config", "/etc/passwd"] {
+            assert!(write_ref(&git, name, "x").is_err(), "{name} must be rejected");
+        }
+        assert!(!git.join("config").exists(), "must not have written .git/config");
+        assert!(!git.join("packed-refs").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// Frame one object as a `git cat-file --batch` record: `<hex> <type> <size>\n<payload>\n`.
     fn record(kind: Kind, payload: &[u8]) -> Vec<u8> {
