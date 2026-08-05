@@ -11,12 +11,11 @@ Rust is the production language here for the reasons that matter for this worklo
 
 ```
 cargo build --release    # target/release/keel and target/release/keeld
-cargo test --release     # 20 test suites, including a differential test against git
+cargo test --release     # the workspace test suites
 ```
 
 ## Crates
 
-- keel-core — shared types and the canonical encoding every peer must agree on.
 - keel-store — the object store: content-addressed, BLAKE3, FastCDC chunking, delta compression, on LMDB. Also the warm live-status index, ignore rules, and read-only snapshots.
 - keel-resolve — language resolvers that build import and symbol graphs, one sidecar process per language.
 - keel-graph — the dependency graph, kept warm.
@@ -26,7 +25,6 @@ cargo test --release     # 20 test suites, including a differential test against
 - keel-net — transport over QUIC, for fetching objects by hash and streaming live events.
 - keel-daemon — keeld.
 - keel-cmd — the `keel` binary.
-- keel-cli — an earlier CLI, still built as `keel-legacy`, kept for reference.
 
 ## Speed
 

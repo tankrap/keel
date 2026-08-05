@@ -66,7 +66,7 @@ fn parse_map_size(s: &str) -> Option<usize> {
 }
 
 /// Blobs larger than this are stored as FastCDC chunk manifests (deduped);
-/// smaller blobs are inlined. `keel_core::MAX` is the FastCDC max chunk size, so
+/// smaller blobs are inlined. `chunk::MAX` is the FastCDC max chunk size, so
 /// below it a blob is at most one chunk and inlining is strictly cheaper.
 const CHUNK_THRESHOLD: usize = crate::chunk::MAX;
 
