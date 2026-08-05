@@ -33,6 +33,7 @@ use std::collections::HashSet;
 use std::fmt;
 use std::os::unix::io::AsRawFd;
 use std::path::Path;
+use std::sync::{Arc, RwLock};
 
 /// Advisory-lock guard held on the store's `gc.lock` file; releases (unlocks) on drop. Commit takes
 /// it shared, GC takes it exclusive, so GC can never run in the window between a commit writing its
@@ -65,6 +66,19 @@ fn parse_map_size(s: &str) -> Option<usize> {
     num.trim().parse::<usize>().ok().map(|n| n.saturating_mul(mult)).filter(|&n| n > 0)
 }
 
+/// Upper bound on online map growth (`grow_map` doubles on each `MDB_MAP_FULL`). The map is a sparse
+/// address-space reservation, so this is cheap headroom, not committed memory — but a ceiling stops a
+/// pathological write from doubling forever.
+const MAX_MAP_SIZE: usize = 4 * 1024 * 1024 * 1024 * 1024; // 4 TiB
+
+/// Round `n` up to a multiple of the OS page size. heed's `resize` rejects a size that isn't a
+/// page multiple, and `parse_map_size` accepts non-aligned values, so the doubled size must be
+/// aligned before it reaches LMDB.
+fn page_round_up(n: usize) -> usize {
+    let page = (unsafe { libc::sysconf(libc::_SC_PAGESIZE) }).max(1) as usize;
+    n.next_multiple_of(page)
+}
+
 /// Blobs larger than this are stored as FastCDC chunk manifests (deduped);
 /// smaller blobs are inlined. `chunk::MAX` is the FastCDC max chunk size, so
 /// below it a blob is at most one chunk and inlining is strictly cheaper.
@@ -80,6 +94,9 @@ pub enum StoreError {
     /// the LMDB map is full — the store outgrew its fixed address-space reservation. Distinct from
     /// a generic `Db` error so callers/operators get an actionable message instead of `MDB_MAP_FULL`.
     MapFull,
+    /// another process grew the map (`MDB_MAP_RESIZED`); this env is still mapped at the old size.
+    /// Handled internally (adopt the new size + retry the txn), never surfaced to callers.
+    MapResized,
 }
 
 impl fmt::Display for StoreError {
@@ -93,15 +110,20 @@ impl fmt::Display for StoreError {
                 f,
                 "store map is full; set KEEL_STORE_MAP_SIZE to a larger value (e.g. 128G) and reopen the store"
             ),
+            StoreError::MapResized => write!(f, "store map was resized by another process"),
         }
     }
 }
 impl std::error::Error for StoreError {}
 impl From<heed::Error> for StoreError {
     fn from(e: heed::Error) -> Self {
-        // Surface a full map as its own actionable error rather than an opaque `Db(MDB_MAP_FULL)`.
+        // Surface a full map, and a peer's resize, as their own variants — the first is actionable,
+        // the second is caught and recovered from internally — rather than an opaque `Db(...)`.
         if matches!(e, heed::Error::Mdb(heed::MdbError::MapFull)) {
             return StoreError::MapFull;
+        }
+        if matches!(e, heed::Error::Mdb(heed::MdbError::MapResized)) {
+            return StoreError::MapResized;
         }
         StoreError::Db(e)
     }
@@ -164,6 +186,11 @@ pub struct Store {
     /// the core knowing about them (e.g. the git-mirror's oid↔object and ref maps). Keys are
     /// `namespace ++ 0x00 ++ key`; the core stays adapter-agnostic.
     aux: Database<Bytes, Bytes>,
+    /// Guards online map growth. Every txn (read and write) holds this **shared**; `grow_map` takes it
+    /// **exclusive** so `mdb_env_set_mapsize` runs with no txn active in the process (LMDB's rule).
+    /// Uncontended in the steady state (a read lock is a cheap atomic); only a rare `MDB_MAP_FULL`
+    /// blocks briefly. Shared across clones so every handle to this env agrees on when a resize is safe.
+    resize_lock: Arc<RwLock<()>>,
 }
 
 /// A cached stat entry: `(mtime_ns, size, blob-id)`. A snapshot may reuse `id` (skipping the
@@ -172,9 +199,9 @@ pub type StatEntry = (u64, u64, ObjectId);
 
 impl Store {
     pub fn open(path: &Path) -> Result<Store> {
-        // The map is a fixed address-space reservation (sparse on disk), so it can't grow online
-        // without quiescing every txn. Until that lands, let operators size it up front for a large
-        // repo/fleet via KEEL_STORE_MAP_SIZE; the 64 GiB default is ample for ordinary use.
+        // The map grows online on `MDB_MAP_FULL` (see `grow_map`), so the initial size is just a
+        // starting reservation; operators can still set it up front for a large repo/fleet via
+        // KEEL_STORE_MAP_SIZE to avoid the first few doublings. The 64 GiB default is ample.
         let size = std::env::var("KEEL_STORE_MAP_SIZE")
             .ok()
             .and_then(|v| parse_map_size(&v))
@@ -208,7 +235,89 @@ impl Store {
             pins,
             deltas,
             aux,
+            resize_lock: Arc::new(RwLock::new(())),
         })
+    }
+
+    /// Acquire the shared resize guard for the life of a txn. Held while any read/write txn is open
+    /// so `grow_map` (which needs the exclusive side) can't remap the file out from under it.
+    fn resize_guard(&self) -> std::sync::RwLockReadGuard<'_, ()> {
+        self.resize_lock.read().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// Open a read txn paired with its resize guard (drop order gives the txn a shorter life than the
+    /// guard). If a **peer process** grew the map, `read_txn` returns `MDB_MAP_RESIZED`; adopt the new
+    /// size and retry, so a reader never fails just because another process grew the file.
+    fn ro_txn(&self) -> Result<(std::sync::RwLockReadGuard<'_, ()>, RoTxn<'_>)> {
+        loop {
+            let guard = self.resize_guard();
+            match self.env.read_txn() {
+                Ok(txn) => return Ok((guard, txn)),
+                Err(e) => match StoreError::from(e) {
+                    StoreError::MapResized => {
+                        drop(guard);
+                        self.adopt_map_size()?;
+                    }
+                    other => return Err(other),
+                },
+            }
+        }
+    }
+
+    /// Run a write transaction, retrying if the map filled (`MDB_MAP_FULL` → grow) or a peer grew it
+    /// (`MDB_MAP_RESIZED` → adopt). The body gets a fresh `&mut RwTxn`; the combinator owns commit so
+    /// it can catch a size error from either a `put` or the commit itself. The body must be safe to
+    /// re-run — all writes here are idempotent (content-addressed puts, or a CAS that re-reads the
+    /// ref). The shared resize guard is held for the attempt and dropped before any resize.
+    fn write_with_retry<T>(&self, mut body: impl FnMut(&mut RwTxn) -> Result<T>) -> Result<T> {
+        loop {
+            let guard = self.resize_guard();
+            let attempt = (|| -> Result<T> {
+                let mut w = self.env.write_txn()?;
+                let v = body(&mut w)?;
+                w.commit()?;
+                Ok(v)
+            })();
+            match attempt {
+                Err(e) if matches!(e, StoreError::MapFull) => {
+                    drop(guard); // release our shared guard so the resize can take the exclusive one
+                    self.grow_map()?; // waits for all other txns to drain, then resizes
+                }
+                Err(e) if matches!(e, StoreError::MapResized) => {
+                    drop(guard);
+                    self.adopt_map_size()?; // a peer grew the file; match its size, then retry
+                }
+                other => return other,
+            }
+        }
+    }
+
+    /// Double the LMDB map after a write hit `MDB_MAP_FULL`. Takes the resize lock **exclusive**,
+    /// which blocks until every in-flight txn (each holding it shared) has finished — LMDB requires
+    /// no active txn in the process for `mdb_env_set_mapsize`. Rounds up to the OS page size (heed
+    /// rejects a non-page-multiple), and is bounded by `MAX_MAP_SIZE` so a pathological write can't
+    /// double forever.
+    fn grow_map(&self) -> Result<()> {
+        let _exclusive = self.resize_lock.write().unwrap_or_else(|p| p.into_inner());
+        let cur = self.env.info().map_size;
+        let next = page_round_up(cur.saturating_mul(2));
+        if next <= cur || next > MAX_MAP_SIZE {
+            return Err(StoreError::MapFull); // at the ceiling — surface it rather than loop forever
+        }
+        // SAFETY: we hold the exclusive resize lock, so no read or write txn is active in this
+        // process; that is exactly LMDB's precondition for resizing the mapping.
+        unsafe { self.env.resize(next) }?;
+        Ok(())
+    }
+
+    /// Adopt the map size another process grew the file to (`mdb_env_set_mapsize(0)` reads the size
+    /// from the file header). Like `grow_map`, this needs no active txn, so it runs under the
+    /// exclusive resize lock.
+    fn adopt_map_size(&self) -> Result<()> {
+        let _exclusive = self.resize_lock.write().unwrap_or_else(|p| p.into_inner());
+        // SAFETY: exclusive lock held ⇒ no txn active in this process. Size 0 = "adopt current".
+        unsafe { self.env.resize(0) }?;
+        Ok(())
     }
 
     /// Open (creating if needed) the `gc.lock` file and take an advisory `flock`. `exclusive`
@@ -238,23 +347,20 @@ impl Store {
 
     /// Store an object, returning its content address. Idempotent.
     pub fn put(&self, obj: &Object) -> Result<ObjectId> {
-        let mut w = self.env.write_txn()?;
-        let id = self.write_object(&mut w, obj)?;
-        w.commit()?;
-        Ok(id)
+        self.write_with_retry(|w| self.write_object(w, obj))
     }
 
     /// Store many objects in ONE atomic transaction (all-or-nothing). This is the
     /// primitive the transactional-fusion model needs: a change + its session +
     /// verification commit together or not at all.
     pub fn put_many(&self, objs: &[Object]) -> Result<Vec<ObjectId>> {
-        let mut w = self.env.write_txn()?;
-        let mut ids = Vec::with_capacity(objs.len());
-        for obj in objs {
-            ids.push(self.write_object(&mut w, obj)?);
-        }
-        w.commit()?;
-        Ok(ids)
+        self.write_with_retry(|w| {
+            let mut ids = Vec::with_capacity(objs.len());
+            for obj in objs {
+                ids.push(self.write_object(w, obj)?);
+            }
+            Ok(ids)
+        })
     }
 
     /// Write one object within an existing transaction. Idempotent per address.
@@ -292,16 +398,16 @@ impl Store {
     /// commit primitive: a change (with its session + verification) lands together
     /// with the ref advance, or not at all. Nothing else can observe a half-commit.
     pub fn apply(&self, objs: &[Object], set_refs: &[(&str, ObjectId)]) -> Result<Vec<ObjectId>> {
-        let mut w = self.env.write_txn()?;
-        let mut ids = Vec::with_capacity(objs.len());
-        for obj in objs {
-            ids.push(self.write_object(&mut w, obj)?);
-        }
-        for (name, id) in set_refs {
-            self.refs.put(&mut w, name.as_bytes(), &id.0)?;
-        }
-        w.commit()?;
-        Ok(ids)
+        self.write_with_retry(|w| {
+            let mut ids = Vec::with_capacity(objs.len());
+            for obj in objs {
+                ids.push(self.write_object(w, obj)?);
+            }
+            for (name, id) in set_refs {
+                self.refs.put(w, name.as_bytes(), &id.0)?;
+            }
+            Ok(ids)
+        })
     }
 
     /// Compare-and-swap commit: write `objs` and advance `ref_name` to `new_ref` **only if**
@@ -316,22 +422,24 @@ impl Store {
         expected: Option<ObjectId>,
         new_ref: ObjectId,
     ) -> Result<Applied> {
-        let mut w = self.env.write_txn()?;
-        let cur = self.refs.get(&w, ref_name.as_bytes())?.and_then(read_id);
-        if cur != expected {
-            return Ok(Applied::Conflict(cur)); // dropping `w` discards any pending writes
-        }
-        for obj in objs {
-            self.write_object(&mut w, obj)?;
-        }
-        self.refs.put(&mut w, ref_name.as_bytes(), &new_ref.0)?;
-        w.commit()?;
-        Ok(Applied::Committed)
+        self.write_with_retry(|w| {
+            let cur = self.refs.get(&*w, ref_name.as_bytes())?.and_then(read_id);
+            if cur != expected {
+                // Returning before any write leaves the txn empty; the combinator's commit is a
+                // no-op, matching the old "drop `w` to discard" behavior.
+                return Ok(Applied::Conflict(cur));
+            }
+            for obj in objs {
+                self.write_object(w, obj)?;
+            }
+            self.refs.put(w, ref_name.as_bytes(), &new_ref.0)?;
+            Ok(Applied::Committed)
+        })
     }
 
     /// Fetch and decode an object by address.
     pub fn get(&self, id: &ObjectId) -> Result<Option<Object>> {
-        let r = self.env.read_txn()?;
+        let (_rg, r) = self.ro_txn()?;
         self.read_object(&r, id)
     }
 
@@ -411,7 +519,7 @@ impl Store {
 
     /// Whether an address is present, without decoding/reassembling.
     pub fn has(&self, id: &ObjectId) -> Result<bool> {
-        let r = self.env.read_txn()?;
+        let (_rg, r) = self.ro_txn()?;
         Ok(self.objects.get(&r, &id.0)?.is_some()
             || self.deltas.get(&r, &id.0)?.is_some()
             || self.blob_manifests.get(&r, &id.0)?.is_some())
@@ -419,19 +527,19 @@ impl Store {
 
     /// Number of stored logical objects (inline + chunked blobs).
     pub fn object_count(&self) -> Result<u64> {
-        let r = self.env.read_txn()?;
+        let (_rg, r) = self.ro_txn()?;
         Ok(self.objects.len(&r)? + self.deltas.len(&r)? + self.blob_manifests.len(&r)?)
     }
 
     /// Number of distinct stored chunks (dedup denominator).
     pub fn chunk_count(&self) -> Result<u64> {
-        let r = self.env.read_txn()?;
+        let (_rg, r) = self.ro_txn()?;
         Ok(self.chunks.len(&r)?)
     }
 
     /// Number of blobs currently stored in delta form.
     pub fn delta_count(&self) -> Result<u64> {
-        let r = self.env.read_txn()?;
+        let (_rg, r) = self.ro_txn()?;
         Ok(self.deltas.len(&r)?)
     }
 
@@ -439,7 +547,7 @@ impl Store {
     /// a Blob) — `None` for a delta, a chunked blob, a tree/change/session, or a miss. `repack`
     /// uses this to pick cross-path delta bases that are full (so the delta chain stays depth 1).
     pub fn blob_bytes_if_full(&self, id: &ObjectId) -> Result<Option<Vec<u8>>> {
-        let r = self.env.read_txn()?;
+        let (_rg, r) = self.ro_txn()?;
         match self.objects.get(&r, &id.0)? {
             Some(b) => match Object::decode(&unpack(b)?)? {
                 Object::Blob(c) => Ok(Some(c)),
@@ -452,7 +560,7 @@ impl Store {
     /// All content-table keys (objects + deltas + chunked-blob manifests). For benchmarks and
     /// integrity sweeps — lets a caller `get` every stored object to time/verify reconstruction.
     pub fn content_ids(&self) -> Result<Vec<ObjectId>> {
-        let r = self.env.read_txn()?;
+        let (_rg, r) = self.ro_txn()?;
         let mut out = Vec::new();
         for db in [&self.objects, &self.deltas, &self.blob_manifests] {
             for kv in db.iter(&r)? {
@@ -469,7 +577,7 @@ impl Store {
     /// This is the honest "size on disk" for comparison — unlike the LMDB file length it isn't
     /// inflated by map-size reservation or by freed-but-not-reclaimed pages after a GC.
     pub fn stored_bytes(&self) -> Result<u64> {
-        let r = self.env.read_txn()?;
+        let (_rg, r) = self.ro_txn()?;
         let mut total = 0u64;
         for db in [&self.objects, &self.deltas, &self.chunks, &self.blob_manifests] {
             for kv in db.iter(&r)? {
@@ -493,7 +601,7 @@ impl Store {
         if target == base {
             return Ok(0);
         }
-        let r = self.env.read_txn()?;
+        let (_rg, r) = self.ro_txn()?;
         // target must currently be an inline blob (chunked/absent/already-delta → skip)
         let Some(stored) = self.objects.get(&r, &target.0)? else {
             return Ok(0);
@@ -508,6 +616,9 @@ impl Store {
             _ => return Ok(0),
         };
         drop(r);
+        // Release the resize guard BEFORE the write: write_with_retry may grow the map on MapFull,
+        // and grow_map needs the exclusive lock — holding our read guard across it would deadlock.
+        drop(_rg);
 
         let ops = crate::delta::compress(&base_content, &content);
         let mut raw = Vec::with_capacity(32 + ops.len());
@@ -529,11 +640,11 @@ impl Store {
             return Ok(0);
         }
 
-        let mut w = self.env.write_txn()?;
-        self.deltas.put(&mut w, &target.0, &packed)?;
-        self.objects.delete(&mut w, &target.0)?;
-        w.commit()?;
-        Ok((current_size - packed.len()) as u64)
+        self.write_with_retry(|w| {
+            self.deltas.put(w, &target.0, &packed)?;
+            self.objects.delete(w, &target.0)?;
+            Ok((current_size - packed.len()) as u64)
+        })
     }
 
     // ── verifications (post-hoc green/red on an immutable change) ────────────
@@ -541,15 +652,15 @@ impl Store {
     /// Record a change's verification result (CI/tests run after the commit). Stored beside
     /// the change, not in it, so the change's content address never moves.
     pub fn set_verification(&self, change: &ObjectId, v: Verification) -> Result<()> {
-        let mut w = self.env.write_txn()?;
-        self.verifications.put(&mut w, &change.0, &[v.tag()])?;
-        w.commit()?;
-        Ok(())
+        self.write_with_retry(|w| {
+            self.verifications.put(w, &change.0, &[v.tag()])?;
+            Ok(())
+        })
     }
 
     /// A change's recorded verification, or `Unverified` if none was set.
     pub fn verification(&self, change: &ObjectId) -> Result<Verification> {
-        let r = self.env.read_txn()?;
+        let (_rg, r) = self.ro_txn()?;
         Ok(self
             .verifications
             .get(&r, &change.0)?
@@ -562,21 +673,21 @@ impl Store {
 
     /// Pin an invariant lesson to a symbol (overwrites any existing pin for it).
     pub fn set_pin(&self, symbol: &str, lesson: &str) -> Result<()> {
-        let mut w = self.env.write_txn()?;
-        self.pins.put(&mut w, symbol.as_bytes(), lesson.as_bytes())?;
-        w.commit()?;
-        Ok(())
+        self.write_with_retry(|w| {
+            self.pins.put(w, symbol.as_bytes(), lesson.as_bytes())?;
+            Ok(())
+        })
     }
 
     /// The invariant pinned to `symbol`, if any.
     pub fn pin(&self, symbol: &str) -> Result<Option<String>> {
-        let r = self.env.read_txn()?;
+        let (_rg, r) = self.ro_txn()?;
         Ok(self.pins.get(&r, symbol.as_bytes())?.map(|b| String::from_utf8_lossy(b).into_owned()))
     }
 
     /// All pins (symbol, lesson), sorted by symbol — for `keel pins`.
     pub fn pins(&self) -> Result<Vec<(String, String)>> {
-        let r = self.env.read_txn()?;
+        let (_rg, r) = self.ro_txn()?;
         let mut out = Vec::new();
         for kv in self.pins.iter(&r)? {
             let (k, v) = kv?;
@@ -709,10 +820,10 @@ impl Store {
 
     /// Put `key → val` in namespace `ns`.
     pub fn aux_put(&self, ns: &str, key: &[u8], val: &[u8]) -> Result<()> {
-        let mut w = self.env.write_txn()?;
-        self.aux.put(&mut w, &Self::aux_key(ns, key), val)?;
-        w.commit()?;
-        Ok(())
+        self.write_with_retry(|w| {
+            self.aux.put(w, &Self::aux_key(ns, key), val)?;
+            Ok(())
+        })
     }
 
     /// Put many `(key, val)` in namespace `ns` in ONE transaction (bulk ingest).
@@ -720,32 +831,29 @@ impl Store {
         if items.is_empty() {
             return Ok(());
         }
-        let mut w = self.env.write_txn()?;
-        for (k, v) in items {
-            self.aux.put(&mut w, &Self::aux_key(ns, k), v)?;
-        }
-        w.commit()?;
-        Ok(())
+        self.write_with_retry(|w| {
+            for (k, v) in items {
+                self.aux.put(w, &Self::aux_key(ns, k), v)?;
+            }
+            Ok(())
+        })
     }
 
     /// Get `key` from namespace `ns`.
     pub fn aux_get(&self, ns: &str, key: &[u8]) -> Result<Option<Vec<u8>>> {
-        let r = self.env.read_txn()?;
+        let (_rg, r) = self.ro_txn()?;
         Ok(self.aux.get(&r, &Self::aux_key(ns, key))?.map(|v| v.to_vec()))
     }
 
     /// Delete `key` from namespace `ns` (returns whether it existed). Used e.g. for a ref
     /// deletion pushed by a client.
     pub fn aux_delete(&self, ns: &str, key: &[u8]) -> Result<bool> {
-        let mut w = self.env.write_txn()?;
-        let existed = self.aux.delete(&mut w, &Self::aux_key(ns, key))?;
-        w.commit()?;
-        Ok(existed)
+        self.write_with_retry(|w| Ok(self.aux.delete(w, &Self::aux_key(ns, key))?))
     }
 
     /// All `(key, val)` in namespace `ns` (key without the namespace prefix).
     pub fn aux_iter(&self, ns: &str) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
-        let r = self.env.read_txn()?;
+        let (_rg, r) = self.ro_txn()?;
         let prefix = Self::aux_key(ns, b"");
         let mut out = Vec::new();
         for kv in self.aux.iter(&r)? {
@@ -771,7 +879,7 @@ impl Store {
     /// snapshot fast path) — the "racy git" guard against a same-size edit within one mtime
     /// tick of a snapshot. The epoch lives under a reserved NUL key (never a repo path).
     pub fn load_stat_cache(&self) -> Result<(std::collections::HashMap<String, StatEntry>, u64)> {
-        let r = self.env.read_txn()?;
+        let (_rg, r) = self.ro_txn()?;
         let mut map = std::collections::HashMap::new();
         let mut epoch = 0u64;
         for kv in self.stat_cache.iter(&r)? {
@@ -793,26 +901,26 @@ impl Store {
         if updates.is_empty() {
             return Ok(());
         }
-        let mut w = self.env.write_txn()?;
-        for (path, entry) in updates {
-            self.stat_cache.put(&mut w, path.as_bytes(), &encode_stat(entry))?;
-        }
-        self.stat_cache.put(&mut w, EPOCH_KEY, &epoch.to_le_bytes())?;
-        w.commit()?;
-        Ok(())
+        self.write_with_retry(|w| {
+            for (path, entry) in updates {
+                self.stat_cache.put(w, path.as_bytes(), &encode_stat(entry))?;
+            }
+            self.stat_cache.put(w, EPOCH_KEY, &epoch.to_le_bytes())?;
+            Ok(())
+        })
     }
 
     // ── refs (mutable named pointers) ────────────────────────────────────────
 
     pub fn set_ref(&self, name: &str, id: &ObjectId) -> Result<()> {
-        let mut w = self.env.write_txn()?;
-        self.refs.put(&mut w, name.as_bytes(), &id.0)?;
-        w.commit()?;
-        Ok(())
+        self.write_with_retry(|w| {
+            self.refs.put(w, name.as_bytes(), &id.0)?;
+            Ok(())
+        })
     }
 
     pub fn get_ref(&self, name: &str) -> Result<Option<ObjectId>> {
-        let r = self.env.read_txn()?;
+        let (_rg, r) = self.ro_txn()?;
         match self.refs.get(&r, name.as_bytes())? {
             Some(b) if b.len() == 32 => {
                 let mut a = [0u8; 32];
@@ -824,14 +932,11 @@ impl Store {
     }
 
     pub fn delete_ref(&self, name: &str) -> Result<bool> {
-        let mut w = self.env.write_txn()?;
-        let existed = self.refs.delete(&mut w, name.as_bytes())?;
-        w.commit()?;
-        Ok(existed)
+        self.write_with_retry(|w| Ok(self.refs.delete(w, name.as_bytes())?))
     }
 
     pub fn list_refs(&self) -> Result<Vec<(String, ObjectId)>> {
-        let r = self.env.read_txn()?;
+        let (_rg, r) = self.ro_txn()?;
         let mut out = Vec::new();
         for kv in self.refs.iter(&r)? {
             let (name, idb) = kv?;
@@ -856,11 +961,23 @@ impl Store {
         // a separate transaction, so without this a GC in that gap would sweep the new-but-unrooted
         // objects and corrupt the committed change. Held for the whole mark+sweep.
         let _lock = self.flock(true)?;
-        let mut w = self.env.write_txn()?;
+        let (obj_removed, chunk_removed) = self.write_with_retry(|w| self.gc_sweep(w))?;
+        Ok(GcStats {
+            objects_removed: obj_removed as u64,
+            chunks_removed: chunk_removed as u64,
+            objects_kept: self.object_count()?,
+            chunks_kept: self.chunk_count()?,
+        })
+    }
+
+    /// The mark + sweep, in ONE write txn — driven by `gc` through `write_with_retry` so it holds the
+    /// resize guard (a concurrent grow can't remap under it) and shares the exclusive `gc.lock` its
+    /// caller took. Returns `(objects_removed, chunks_removed)`.
+    fn gc_sweep(&self, w: &mut RwTxn) -> Result<(usize, usize)> {
         let mut reach_obj: HashSet<[u8; 32]> = HashSet::new();
         let mut reach_chunk: HashSet<[u8; 32]> = HashSet::new();
         let mut stack: Vec<[u8; 32]> = Vec::new();
-        for kv in self.refs.iter(&w)? {
+        for kv in self.refs.iter(&*w)? {
             let (_, v) = kv?;
             if v.len() == 32 {
                 let mut a = [0u8; 32];
@@ -872,7 +989,7 @@ impl Store {
             if !reach_obj.insert(idb) {
                 continue;
             }
-            if let Some(bytes) = self.objects.get(&w, &idb)? {
+            if let Some(bytes) = self.objects.get(&*w, &idb)? {
                 match Object::decode(&unpack(bytes)?)? {
                     Object::Blob(_) => {}
                     Object::Tree(t) => {
@@ -904,13 +1021,13 @@ impl Store {
                         }
                     }
                 }
-            } else if let Some(stored) = self.deltas.get(&w, &idb)? {
+            } else if let Some(stored) = self.deltas.get(&*w, &idb)? {
                 // a delta blob is kept alive, and its base must be kept too (the delta can't be
                 // reconstructed without it) — push the base so reachability follows the edge.
                 if let Some((base, _)) = split_delta(&unpack(stored)?) {
                     stack.push(base.0);
                 }
-            } else if let Some(manifest) = self.blob_manifests.get(&w, &idb)? {
+            } else if let Some(manifest) = self.blob_manifests.get(&*w, &idb)? {
                 let mut i = 0usize;
                 if let Some(n) = read_uvarint(manifest, &mut i) {
                     for _ in 0..n {
@@ -930,28 +1047,21 @@ impl Store {
 
         // collect unreachable keys (mutating during iteration is unsafe), then sweep — all
         // still inside the same write txn `w`.
-        let del_obj = unreached(self.objects.iter(&w)?, &reach_obj)?;
-        let del_delta = unreached(self.deltas.iter(&w)?, &reach_obj)?;
-        let del_man = unreached(self.blob_manifests.iter(&w)?, &reach_obj)?;
-        let del_chunk = unreached(self.chunks.iter(&w)?, &reach_chunk)?;
+        let del_obj = unreached(self.objects.iter(&*w)?, &reach_obj)?;
+        let del_delta = unreached(self.deltas.iter(&*w)?, &reach_obj)?;
+        let del_man = unreached(self.blob_manifests.iter(&*w)?, &reach_obj)?;
+        let del_chunk = unreached(self.chunks.iter(&*w)?, &reach_chunk)?;
 
         for k in del_obj.iter().chain(del_delta.iter()).chain(del_man.iter()) {
             // an id is in exactly one of objects/deltas/blob_manifests; deleting a miss is a no-op
-            self.objects.delete(&mut w, k.as_slice())?;
-            self.deltas.delete(&mut w, k.as_slice())?;
-            self.blob_manifests.delete(&mut w, k.as_slice())?;
+            self.objects.delete(w, k.as_slice())?;
+            self.deltas.delete(w, k.as_slice())?;
+            self.blob_manifests.delete(w, k.as_slice())?;
         }
         for k in &del_chunk {
-            self.chunks.delete(&mut w, k.as_slice())?;
+            self.chunks.delete(w, k.as_slice())?;
         }
-        w.commit()?;
-
-        Ok(GcStats {
-            objects_removed: (del_obj.len() + del_delta.len() + del_man.len()) as u64,
-            chunks_removed: del_chunk.len() as u64,
-            objects_kept: self.object_count()?,
-            chunks_kept: self.chunk_count()?,
-        })
+        Ok((del_obj.len() + del_delta.len() + del_man.len(), del_chunk.len()))
     }
 }
 
@@ -1119,6 +1229,99 @@ mod tests {
         assert_eq!(parse_map_size("12X"), None);
         assert_eq!(parse_map_size("0"), None); // map_size(0) means "keep current" — reject it
         assert_eq!(parse_map_size("0G"), None);
+    }
+
+    #[test]
+    fn page_round_up_produces_a_valid_resize_size() {
+        let page = (unsafe { libc::sysconf(libc::_SC_PAGESIZE) }).max(1) as usize;
+        assert_eq!(page_round_up(1), page);
+        assert_eq!(page_round_up(page), page);
+        assert_eq!(page_round_up(page + 1), 2 * page);
+        // grow_map doubles a possibly-non-aligned map size (parse_map_size accepts e.g. 513K); the
+        // result must be page-aligned or heed's `resize` rejects it.
+        assert_eq!(page_round_up(513 * 1024) % page, 0);
+        assert_eq!(page_round_up(1_500_000) % page, 0);
+    }
+
+    /// ~8 KiB of INCOMPRESSIBLE bytes tagged with `seed` in the first 4 (the store deflates values,
+    /// so all-zero blobs would compress to nothing and never fill the map — defeating the test).
+    #[cfg(test)]
+    fn fill_blob(seed: u32) -> Vec<u8> {
+        let mut b = vec![0u8; 8 * 1024];
+        b[..4].copy_from_slice(&seed.to_le_bytes());
+        let mut x = (seed as u64) ^ 0x9e37_79b9_7f4a_7c15;
+        for byte in b[4..].iter_mut() {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17; // xorshift → pseudo-random, doesn't compress
+            *byte = x as u8;
+        }
+        b
+    }
+
+    #[test]
+    fn map_grows_online_instead_of_failing_when_full() {
+        let d = TmpDir::new();
+        // A deliberately tiny initial map: the writes below far exceed it, so without online growth
+        // on MDB_MAP_FULL they'd fail. Each blob is unique (a real write) and inline (< chunk cap).
+        let s = Store::open_with_map_size(&d.0, 512 * 1024).unwrap();
+        let mut ids = Vec::new();
+        for i in 0..300u32 {
+            ids.push(s.put(&Object::Blob(fill_blob(i))).unwrap());
+        }
+        assert!(s.env.info().map_size > 512 * 1024, "map should have grown online past its initial size");
+        // every blob survived the remap(s) and reads back correctly
+        for (i, id) in ids.iter().enumerate() {
+            match s.get(id).unwrap() {
+                Some(Object::Blob(b)) => assert_eq!(&b[..4], &(i as u32).to_le_bytes()),
+                other => panic!("blob {i} missing/wrong after grow: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn reads_stay_correct_while_the_map_grows_under_writes() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        let d = TmpDir::new();
+        let s = Store::open_with_map_size(&d.0, 512 * 1024).unwrap();
+        // seed known blobs the reader threads will hammer while the writer forces grows
+        let seeded: Vec<(u32, ObjectId)> = (0..8u32)
+            .map(|i| {
+                let mut b = vec![7u8; 1024];
+                b[..4].copy_from_slice(&i.to_le_bytes());
+                (i, s.put(&Object::Blob(b)).unwrap())
+            })
+            .collect();
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let readers: Vec<_> = (0..4)
+            .map(|_| {
+                let (s, stop, seeded) = (s.clone(), stop.clone(), seeded.clone());
+                std::thread::spawn(move || {
+                    while !stop.load(Ordering::Relaxed) {
+                        for (i, id) in &seeded {
+                            match s.get(id).unwrap() {
+                                // A resize while this read txn was live would be UB; if the RwLock
+                                // discipline is correct the bytes are always intact.
+                                Some(Object::Blob(b)) => assert_eq!(&b[..4], &i.to_le_bytes()),
+                                other => panic!("seeded blob {i} corrupt under concurrent grow: {other:?}"),
+                            }
+                        }
+                    }
+                })
+            })
+            .collect();
+
+        // flood unique incompressible blobs → several online grows while the readers are active
+        for i in 100..500u32 {
+            s.put(&Object::Blob(fill_blob(i))).unwrap();
+        }
+        stop.store(true, Ordering::Relaxed);
+        for r in readers {
+            r.join().unwrap();
+        }
+        assert!(s.env.info().map_size > 512 * 1024, "map grew during the concurrent run");
     }
 
     #[test]
