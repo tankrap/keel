@@ -49,6 +49,22 @@ impl Drop for FlockGuard {
 /// Default LMDB map size (address-space reservation; the file is sparse).
 const DEFAULT_MAP_SIZE: usize = 64 * 1024 * 1024 * 1024; // 64 GiB
 
+/// Parse a map-size string — raw bytes, or a `K`/`M`/`G`/`T` suffix (×1024, case-insensitive, with an
+/// optional trailing `i`/`b`, so `128G`, `128GiB`, `128gb` all mean 128 GiB). Returns `None` on junk.
+fn parse_map_size(s: &str) -> Option<usize> {
+    let s = s.trim().trim_end_matches(['b', 'B']).trim_end_matches(['i', 'I']);
+    let (num, mult) = match s.chars().last() {
+        Some(c) if c.eq_ignore_ascii_case(&'k') => (&s[..s.len() - 1], 1usize << 10),
+        Some(c) if c.eq_ignore_ascii_case(&'m') => (&s[..s.len() - 1], 1usize << 20),
+        Some(c) if c.eq_ignore_ascii_case(&'g') => (&s[..s.len() - 1], 1usize << 30),
+        Some(c) if c.eq_ignore_ascii_case(&'t') => (&s[..s.len() - 1], 1usize << 40),
+        _ => (s, 1),
+    };
+    // Reject 0: LMDB reads map_size(0) as "keep the current size", a footgun — treat it as junk so
+    // `open` falls back to the default instead.
+    num.trim().parse::<usize>().ok().map(|n| n.saturating_mul(mult)).filter(|&n| n > 0)
+}
+
 /// Blobs larger than this are stored as FastCDC chunk manifests (deduped);
 /// smaller blobs are inlined. `keel_core::MAX` is the FastCDC max chunk size, so
 /// below it a blob is at most one chunk and inlining is strictly cheaper.
@@ -61,6 +77,9 @@ pub enum StoreError {
     Decode(DecodeError),
     /// a stored object failed integrity verification (missing/altered chunk)
     Corrupt(ObjectId),
+    /// the LMDB map is full — the store outgrew its fixed address-space reservation. Distinct from
+    /// a generic `Db` error so callers/operators get an actionable message instead of `MDB_MAP_FULL`.
+    MapFull,
 }
 
 impl fmt::Display for StoreError {
@@ -70,12 +89,20 @@ impl fmt::Display for StoreError {
             StoreError::Io(e) => write!(f, "store io error: {e}"),
             StoreError::Decode(e) => write!(f, "corrupt object in store: {e}"),
             StoreError::Corrupt(id) => write!(f, "integrity failure for object {id}"),
+            StoreError::MapFull => write!(
+                f,
+                "store map is full; set KEEL_STORE_MAP_SIZE to a larger value (e.g. 128G) and reopen the store"
+            ),
         }
     }
 }
 impl std::error::Error for StoreError {}
 impl From<heed::Error> for StoreError {
     fn from(e: heed::Error) -> Self {
+        // Surface a full map as its own actionable error rather than an opaque `Db(MDB_MAP_FULL)`.
+        if matches!(e, heed::Error::Mdb(heed::MdbError::MapFull)) {
+            return StoreError::MapFull;
+        }
         StoreError::Db(e)
     }
 }
@@ -145,7 +172,14 @@ pub type StatEntry = (u64, u64, ObjectId);
 
 impl Store {
     pub fn open(path: &Path) -> Result<Store> {
-        Self::open_with_map_size(path, DEFAULT_MAP_SIZE)
+        // The map is a fixed address-space reservation (sparse on disk), so it can't grow online
+        // without quiescing every txn. Until that lands, let operators size it up front for a large
+        // repo/fleet via KEEL_STORE_MAP_SIZE; the 64 GiB default is ample for ordinary use.
+        let size = std::env::var("KEEL_STORE_MAP_SIZE")
+            .ok()
+            .and_then(|v| parse_map_size(&v))
+            .unwrap_or(DEFAULT_MAP_SIZE);
+        Self::open_with_map_size(path, size)
     }
 
     pub fn open_with_map_size(path: &Path, map_size: usize) -> Result<Store> {
@@ -1069,6 +1103,22 @@ mod tests {
 
     fn oid(b: u8) -> ObjectId {
         ObjectId([b; 32])
+    }
+
+    #[test]
+    fn parse_map_size_handles_suffixes_and_junk() {
+        assert_eq!(parse_map_size("1024"), Some(1024)); // raw bytes
+        assert_eq!(parse_map_size("128G"), Some(128 << 30));
+        assert_eq!(parse_map_size("128GiB"), Some(128 << 30));
+        assert_eq!(parse_map_size("128gb"), Some(128 << 30));
+        assert_eq!(parse_map_size("512M"), Some(512 << 20));
+        assert_eq!(parse_map_size("4K"), Some(4 << 10));
+        assert_eq!(parse_map_size(" 2T "), Some(2usize << 40));
+        assert_eq!(parse_map_size(""), None);
+        assert_eq!(parse_map_size("banana"), None);
+        assert_eq!(parse_map_size("12X"), None);
+        assert_eq!(parse_map_size("0"), None); // map_size(0) means "keep current" — reject it
+        assert_eq!(parse_map_size("0G"), None);
     }
 
     #[test]
