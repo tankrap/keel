@@ -223,6 +223,11 @@ impl BriefService {
     /// The agent's change just landed, so its reservations are done — free them immediately instead
     /// of waiting out the coordinator's TTL, so other agents can pick up those files right away. (The
     /// agent re-reserves on its next brief.)
+    ///
+    /// Correctness depends on `self.agent` being unique per concurrent session (the daemon assigns a
+    /// distinct id per request via [`set_agent`](Self::set_agent)). If two live sessions shared one
+    /// id, one landing would free the other's in-flight holds — this is why release-on-land, unlike
+    /// the TTL, makes the agent-id-uniqueness assumption load-bearing.
     fn release_on_land(&self) {
         self.coord.release_agent(&self.agent);
     }
