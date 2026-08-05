@@ -388,39 +388,8 @@ impl BriefService {
             })
             .collect();
 
-        // relevant prior sessions: sessions of changes that touched the target file OR its
-        // graph neighborhood (deps + rdeps) — this is how cross-file retrieval happens (a
-        // session that touched a dependency is surfaced for a task on the dependent). Dedup
-        // by session; keep only those that recorded a lesson.
-        let mut neighborhood = vec![file.to_string()];
-        neighborhood.extend(deps.iter().cloned());
-        neighborhood.extend(rdeps.iter().cloned());
-        let mut seen: HashSet<ObjectId> = HashSet::new();
-        // Also dedup by lesson text: two changes can link the same session (or repeat a `keel learn`
-        // lesson), and the graph pass can now reach a second such change the neighborhood never did —
-        // don't show the same lesson twice.
-        let mut seen_lessons: HashSet<String> = HashSet::new();
-        // (verified, help, timestamp, session) so we RANK by feedback: a lesson that INFORMED a
-        // verified-green change (help score, the flywheel's learned signal) leads, then verified,
-        // then most recent — the confirmed-useful lesson is what an agent should see first.
-        let mut cand: Vec<(bool, i64, u64, RelevantSession)> = Vec::new();
-        for f in &neighborhood {
-            for (cid, c) in self.repo.history_touching(f).map_err(to_io)? {
-                if seen.insert(cid) {
-                    if let Some(item) = self.session_candidate(cid, &c)? {
-                        if seen_lessons.insert(item.3.lesson.clone()) {
-                            cand.push(item);
-                        }
-                    }
-                }
-            }
-        }
-
-        // graph-overlap retrieval (NEW-1076, the flywheel): also surface sessions whose touched
-        // symbols/patterns overlap this task — the cross-domain retrieval the import-neighborhood
-        // pass structurally can't do (a refund task finds a gateway session sharing the `gateway`
-        // symbol even when their files aren't import-linked). The query tags come from the sliced
-        // defs + the task + the target path; scored against the persisted per-change tag index.
+        // Query tags — used both to retrieve graph-overlap sessions and to score every candidate's
+        // task-relevance for ranking. Drawn from the sliced defs + the task + the target path.
         let mut qtext = String::new();
         for d in &context {
             qtext.push_str(&d.symbol);
@@ -433,6 +402,36 @@ impl BriefService {
         qtext.push_str(file);
         let qsym = keel_store::sessiontag::symbols_from_text(&qtext);
         let qpat = keel_store::sessiontag::patterns_from_text(&qtext);
+        // A candidate's task-relevance: how much its indexed tags overlap the query (the same
+        // 2·|Δsym| + 2·|Δpat| score as retrieval), so a strongly-relevant session isn't buried.
+        let overlap_of = |cid: ObjectId| -> io::Result<i32> {
+            let (s, p) = keel_store::sessiontag::change_tags(self.repo.store(), cid).map_err(to_io)?;
+            Ok(2 * s.intersection(&qsym).count() as i32 + 2 * p.intersection(&qpat).count() as i32)
+        };
+
+        // Relevant prior sessions come from two passes: the file neighborhood (deps+rdeps — a session
+        // that touched the target or a dep/rdep) AND symbol/pattern overlap (cross-domain, even across
+        // unlinked files — the flywheel, NEW-1076). Dedup by change and by lesson text.
+        let mut neighborhood = vec![file.to_string()];
+        neighborhood.extend(deps.iter().cloned());
+        neighborhood.extend(rdeps.iter().cloned());
+        let mut seen: HashSet<ObjectId> = HashSet::new();
+        let mut seen_lessons: HashSet<String> = HashSet::new();
+        // (help, overlap, verified, timestamp, session): RANK by the flywheel's learned value first (a
+        // lesson that INFORMED a verified-green change), then task-relevance (overlap), then verified,
+        // then recency — the confirmed-useful, most-relevant lesson leads.
+        let mut cand: Vec<(i64, i32, bool, u64, RelevantSession)> = Vec::new();
+        for f in &neighborhood {
+            for (cid, c) in self.repo.history_touching(f).map_err(to_io)? {
+                if seen.insert(cid) {
+                    if let Some((verified, help, ts, sess)) = self.session_candidate(cid, &c)? {
+                        if seen_lessons.insert(sess.lesson.clone()) {
+                            cand.push((help, overlap_of(cid)?, verified, ts, sess));
+                        }
+                    }
+                }
+            }
+        }
         for (cid, _score) in
             keel_store::sessiontag::retrieve(self.repo.store(), &qsym, &qpat, 5).map_err(to_io)?
         {
@@ -440,17 +439,19 @@ impl BriefService {
                 continue; // already surfaced by the neighborhood pass
             }
             if let Some(c) = self.repo.change(cid).map_err(to_io)? {
-                if let Some(item) = self.session_candidate(cid, &c)? {
-                    if seen_lessons.insert(item.3.lesson.clone()) {
-                        cand.push(item);
+                if let Some((verified, help, ts, sess)) = self.session_candidate(cid, &c)? {
+                    if seen_lessons.insert(sess.lesson.clone()) {
+                        cand.push((help, overlap_of(cid)?, verified, ts, sess));
                     }
                 }
             }
         }
 
-        // rank: help score first (learned value), then verified, then recency
-        cand.sort_by(|a, b| b.1.cmp(&a.1).then(b.0.cmp(&a.0)).then(b.2.cmp(&a.2)));
-        let sessions: Vec<RelevantSession> = cand.into_iter().take(5).map(|(_, _, _, s)| s).collect();
+        // rank: learned value (help) → task-relevance (overlap) → verified → recency
+        cand.sort_by(|a, b| {
+            b.0.cmp(&a.0).then(b.1.cmp(&a.1)).then(b.2.cmp(&a.2)).then(b.3.cmp(&a.3))
+        });
+        let sessions: Vec<RelevantSession> = cand.into_iter().take(5).map(|t| t.4).collect();
 
         // pinned invariants for the symbols in play (target + sliced defs) — always served,
         // regardless of history, so a single curated pin steers every relevant future brief.
@@ -709,6 +710,54 @@ mod tests {
             "graph-overlap retrieval across unlinked files; got {:?}",
             b.sessions
         );
+
+        let _ = fs::remove_dir_all(&work);
+        let _ = fs::remove_dir_all(&store);
+    }
+
+    #[test]
+    fn brief_ranks_a_more_relevant_session_above_a_newer_less_relevant_one() {
+        let work = tmp("rwork");
+        let store = tmp("rstore");
+        // target references three domain symbols; two later sessions overlap it by different amounts.
+        fs::write(work.join("target.ts"), "export function build(gateway, ledger, invoice) {\n  return gateway.charge(ledger, invoice);\n}\n").unwrap();
+        let mut svc = match BriefService::open(&work, &store, &sidecar_dir()) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("skipping rank test: {e}");
+                return;
+            }
+        };
+        svc.commit("initial", "acct", 1).unwrap();
+        let sess = |lesson: &str| Session {
+            task: "t".into(),
+            model: "m".into(),
+            lesson: lesson.into(),
+            prompts: None,
+            context_served: None,
+            tool_calls: vec![],
+            tool_results: vec![],
+            verification: Verification::Unverified, // equal (no) feedback → overlap decides the order
+            tokens_in: 0,
+            tokens_out: 0,
+        };
+        // session A (older) touches all three domain symbols → HIGH overlap with the target.
+        fs::write(work.join("a.ts"), "export function payA(gateway, ledger, invoice) { return gateway.settle(ledger, invoice); }").unwrap();
+        svc.refresh().unwrap();
+        svc.commit_with_session("a", "acct", 2, sess("lesson-A high overlap")).unwrap();
+        // session B (NEWER) touches only gateway → LOW overlap. Recency alone would rank it first.
+        fs::write(work.join("b.ts"), "export function payB(gateway) { return gateway.ping(); }").unwrap();
+        svc.refresh().unwrap();
+        svc.commit_with_session("b", "acct", 3, sess("lesson-B low overlap")).unwrap();
+
+        let b = svc
+            .brief("build with gateway ledger invoice", "target.ts", Some("build"), 100_000, false)
+            .unwrap();
+        let pa = b.sessions.iter().position(|s| s.lesson.contains("lesson-A"));
+        let pb = b.sessions.iter().position(|s| s.lesson.contains("lesson-B"));
+        assert!(pa.is_some() && pb.is_some(), "both sessions retrieved; got {:?}", b.sessions);
+        // A (older, higher overlap) beats B (newer, lower overlap): overlap is a ranking signal now.
+        assert!(pa < pb, "the more task-relevant session ranks first; got {:?}", b.sessions);
 
         let _ = fs::remove_dir_all(&work);
         let _ = fs::remove_dir_all(&store);
