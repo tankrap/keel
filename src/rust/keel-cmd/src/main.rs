@@ -275,7 +275,7 @@ fn cmd_commit(args: &[String]) -> io::Result<()> {
     } else if let Some(lesson) = flag(args, "--lesson") {
         let s = Session {
             task: msg.to_string(),
-            model: "keel-cli".to_string(),
+            model: "keel".to_string(),
             lesson: lesson.to_string(),
             prompts: None,
             context_served: auto_ctx,

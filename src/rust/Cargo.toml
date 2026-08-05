@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["keel-core", "keel-store", "keel-resolve", "keel-graph", "keel-coord", "keel-brief", "keel-daemon", "keel-git", "keel-cmd", "keel-cli", "keel-net"]
+members = ["keel-store", "keel-resolve", "keel-graph", "keel-coord", "keel-brief", "keel-daemon", "keel-git", "keel-cmd", "keel-net"]
 
 [workspace.package]
 version = "0.1.0"

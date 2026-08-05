@@ -124,7 +124,6 @@ The Rust workspace lives under `src/rust`.
 - keel-net · transport over QUIC, for fetching objects by hash and streaming live events.
 - keel-daemon · keeld, which keeps the store, graph, and status warm so reads stay fast.
 - keel-cmd · the `keel` binary, a drop-in for git.
-- keel-core · shared types.
 
 Benchmarks live in `src/keel-bench`, and design notes in `src/docs`, including the [positioning](src/docs/positioning.md) for why keel exists and what is shipped versus planned.
 
