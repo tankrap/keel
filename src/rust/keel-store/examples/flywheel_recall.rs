@@ -249,11 +249,13 @@ fn main() {
         println!("    recall@1={}  recall@2={}  recall@3={}\n", pct(r1), pct(r2), pct(r3));
     }
 
-    println!("    Read it: the extractor is now FULLY REAL — real sym + real pat classifier holds");
-    println!("    recall@2=100%, recall@3=100%, MATCHING the validated hand-modeled baseline exactly.");
-    println!("    sym-only drops to 83%@3 (misses T-uuid, whose schema-create query symbols are disjoint");
-    println!("    from the session's); the real pattern classifier recovers it, identical to hand pat.");
-    println!("    The retrieval extractor's build risk (real tags → recall@k) is retired end to end.");
+    println!("    Read it (precisely): with BOTH halves real, the recall METRIC matches the validated");
+    println!("    hand-modeled baseline — recall@2=recall@3=100%. The real symbol extractor carries 5 of");
+    println!("    6 targets on its own; pat is decisive for exactly ONE (T-uuid, schema-create, disjoint");
+    println!("    symbols), rescued by the genuine `schema` signal. (The real pat TAGS differ from the");
+    println!("    hand tags on some items — they just don't change the ranking, since sym does the work.)");
+    println!("    This is one 12-item hand-built pool, so treat it as a strong first-cut signal that a");
+    println!("    real extractor holds recall@k — not a generalization claim across repos.");
     println!("╚═══ done ═══");
     let _ = std::fs::remove_dir_all(&dir);
 }

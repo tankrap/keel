@@ -91,23 +91,28 @@ pub fn patterns_from_text(text: &str) -> BTreeSet<String> {
     let lower = text.to_ascii_lowercase();
     let has = |sigs: &[&str]| sigs.iter().any(|s| lower.contains(s));
     let mut pats = BTreeSet::new();
-    // schema-create — DDL / migrations. Checked first: it's the most specific `db.`-family operation.
+    // The blocks are independent (a change can carry several classes); order is irrelevant. Signals
+    // err toward recall — `http`/`schema` will over-fire on urls / zod-style schemas, which is
+    // acceptable (a spurious class only adds a weak overlap the answerer ignores), but signals that
+    // fire on *pervasive* code (`.find(` = Array.find; bare `tax` matches `syntax`) are excluded.
+    // schema-create — DDL / migrations.
     if has(&[
         "create table", "createtable", "migrat", "alter table", "altercolumn", "add column",
         "schema", "create index", "createindex", "uuidv7", "auto-increment", "autoincrement",
     ]) {
         pats.insert("schema-create".into());
     }
-    // db-query — reads / filters / pagination.
-    if has(&[".query(", ".where(", "select ", "findmany", "findunique", ".find(", "queryraw", "keyset", "pagination", "order by", "orderby"]) {
+    // db-query — reads / filters / pagination. (`.find(` omitted: Array.prototype.find is everywhere.)
+    if has(&[".query(", ".where(", "select ", "findmany", "findunique", "queryraw", "keyset", "pagination", "order by", "orderby"]) {
         pats.insert("db-query".into());
     }
     // external-call — network / external service / message-bus calls.
     if has(&["fetch(", "axios", "http", ".send(", ".post(", "gateway.", "provider.", "enqueue", "analytics", "emailservice", "webhook", "requests.", "urllib", "i18n.render", "smsprovider"]) {
         pats.insert("external-call".into());
     }
-    // money — monetary values (kept tight; `amount`/`total` alone are too generic to include).
-    if has(&["cents", "price", "money", "invoice", "currency", " tax", "tax ", "monetary"]) {
+    // money — monetary values. Kept tight: `amount`/`total` are too generic, and bare `tax` would
+    // match `syntax`, so use unambiguous money words + specific tax compounds.
+    if has(&["cents", "price", "money", "invoice", "currency", "monetary", "taxrate", "tax_rate", "salestax", "regionaltax"]) {
         pats.insert("money".into());
     }
     pats
@@ -229,8 +234,11 @@ mod tests {
         assert!(p("return items.reduce((cents, it) => cents + it.priceCents, 0)").contains("money"));
         // no operation signal → no pattern (the classifier abstains rather than guessing).
         assert!(p("function add(a, b) { return a + b; }").is_empty());
-        // `amount`/`total` alone are too generic to imply money.
+        // `amount`/`total` alone are too generic to imply money; `syntax` must NOT match `tax`.
         assert!(!p("const total = amount + fee").contains("money"));
+        assert!(!p("// fix the syntax error in the parser").contains("money"));
+        // `.find(` (Array.prototype.find) must NOT read as a db-query.
+        assert!(!p("const u = users.find(x => x.active)").contains("db-query"));
     }
 
     use crate::repo::Repo;
