@@ -269,6 +269,9 @@ impl BriefService {
 
         // coordination: the working set the agent will edit (the target file). Reserve it
         // (piggybacked) or just peek — either way surface files held by other agents.
+        // Fetching a brief proves this agent is alive, so heartbeat all of its holds first — that's
+        // what keeps an active agent's earlier reservations from aging out under the coordinator's TTL.
+        self.coord.heartbeat(&self.agent);
         let working_set = [file.to_string()];
         let coordination = if reserve {
             self.coord.reserve(&self.agent, task, &working_set)
