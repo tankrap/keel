@@ -74,7 +74,18 @@ Solver, judge, trials, workers, and the Wilson z are pinned in [bench-config.jso
 
 ### Reproducibility manifest
 
-A benchmark is only a *proof* if its inputs are pinned and verifiable. `bench_manifest.py` computes a stable SHA-256 over every pinned input — each harness's scenario table plus the result-affecting config (models, trial/worker counts, Wilson z, scenario shape) — and every live report carries the exact `manifest_sha256` it was produced under. Anyone can `python3 run_suite.py --manifest` and confirm a later run used byte-identical inputs. It's deterministic by construction (canonical JSON → identical bytes → identical hash), needs no API or token, and `--dry-run` asserts that determinism. `test_manifest.py` locks the guarantees (deterministic, input-change → SHA-change, count-drift caught), and the CI gate runs both so a scenario-table drift or a broken harness fails the build. Bump `version` in `bench-config.json` whenever the pinned inputs change — the manifest SHA changes with it, so old reports stay comparable like-for-like.
+A benchmark is only a *proof* if the inputs that determine a result are pinned and verifiable. `bench_manifest.py` computes a stable SHA-256 over exactly those inputs, and every live report carries the `manifest_sha256` it was produced under. Anyone can `python3 run_suite.py --manifest` and confirm a later run used byte-identical inputs.
+
+What it binds, and why each matters:
+
+- **each harness's scenario table** (`SCEN`) — the conventions/tasks/lessons under test;
+- **each harness's source** — because the solver prompt, the per-scenario prompt assembly, and `max_tokens` live in the harness *code*, not in `SCEN`; two runs with different prompts must not share a SHA;
+- **`bench_common.py`'s source** — the shared dual-judge prompt, the `api()` defaults, and the `SOLVER`/`JUDGE`/`API_VERSION` constants the harnesses *actually call* (the run reads these, not the config's `models` block);
+- **the result-affecting config** — schema/version, the pinned model IDs (verified to equal the constants the code uses, so the config can't silently drift from the run), `trials`, the Wilson `z`, and each benchmark's shape.
+
+`workers` is deliberately **excluded** (pure parallelism — it changes wall-clock, never an outcome). Hashing source is conservative on purpose: a comment edit bumps the SHA (a harmless false "not reproducible"), the safe direction. **Not yet bound:** the *content* of the real corpus checkouts — pinning each corpus's git commit is the tracked follow-up; the gap is small because the solver prompt is built from `SCEN` (path/hint/task/lesson), not the file bytes, so a different checkout moves essentially only the retrieval-hit count, not the headline lift.
+
+It's deterministic by construction (canonical JSON → identical bytes → identical hash), needs no API or token, and `--dry-run` asserts that determinism. `test_manifest.py` locks the guarantees (deterministic, scenario/source/config change → SHA-change, `workers` change → SHA-*un*changed, config-vs-code model drift refused, count-drift caught), and the CI gate runs both so a scenario-table drift or a broken harness fails the build. Bump `version` in `bench-config.json` whenever the pinned inputs change.
 
 ### Reading the Wilson intervals
 

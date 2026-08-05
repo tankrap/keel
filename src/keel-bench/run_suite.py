@@ -91,7 +91,8 @@ def dry_run(cfg):
         return 1
     print(f"dry-run PASS — {len(cfg['benchmarks'])} harness(es) import and parse cleanly.")
     print(f"reproducibility manifest: {m1['manifest_sha256']}")
-    print("  (stable SHA over every pinned scenario table + the result-affecting config)")
+    print("  (stable SHA over each harness's scenarios + source (prompts, max_tokens),")
+    print("   the shared bench_common source (judge, model constants), and the config)")
     return 0
 
 
@@ -129,6 +130,9 @@ def markdown_report(cfg, summaries):
 
 def full_run(cfg, only=None):
     pin_env(cfg)
+    # Build (and validate) the manifest BEFORE spending any credits, so a config/harness drift or a
+    # config-vs-code model mismatch fails loudly here rather than after a full paid run.
+    manifest = bench_manifest.build_manifest(cfg)
     summaries = []
     for b in cfg["benchmarks"]:
         if only and b["id"] != only:
@@ -149,8 +153,8 @@ def full_run(cfg, only=None):
         "models": cfg["models"],
         "run": cfg["run"],
         # Pin the exact inputs this result was produced from: anyone can recompute the manifest and
-        # confirm a later run used byte-identical scenarios + config (reproducibility).
-        "manifest": bench_manifest.build_manifest(cfg),
+        # confirm a later run used byte-identical inputs (reproducibility).
+        "manifest": manifest,
         "benchmarks": summaries,
     }
     json_path = HERE / "bench-report.json"
