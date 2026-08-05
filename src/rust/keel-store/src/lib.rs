@@ -14,8 +14,7 @@
 //! Addressing note: the prototype used BLAKE2b to stay byte-identical with the Node
 //! reference store. This native store is greenfield (git backing is dropped), so we
 //! use BLAKE3 — faster on large blobs (SIMD + parallel tree hashing) and its tree
-//! structure enables verified incremental streaming. BLAKE2b remains only as a legacy
-//! interop path in `keel-core`.
+//! structure enables verified incremental streaming.
 
 pub mod chunk;
 pub mod delta;
