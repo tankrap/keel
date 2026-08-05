@@ -582,15 +582,17 @@ fn cmd_mirror_in(args: &[String]) -> io::Result<()> {
 /// (new keel-native commits self-index at commit time).
 fn cmd_reindex(args: &[String]) -> io::Result<()> {
     let (_, store_path) = root_store(args)?;
-    let store = keel_store::store::Store::open(&store_path).map_err(to_io)?;
+    // One env for the whole command (opening the store twice in a process is unsafe): open the Repo
+    // and thread its Store into the git-mirror steps, which take `&Store`.
+    let repo = Repo::open(&store_path).map_err(to_io)?;
+    let store = repo.store();
     // fold in any objects not yet mirrored (e.g. commits made via the git surface), then bridge
     if let Ok(top) = std::env::current_dir() {
         if top.join(".git").exists() {
-            let _ = ingest_repo(&store, top.to_str().unwrap_or("."), true);
+            let _ = ingest_repo(store, top.to_str().unwrap_or("."), true);
         }
     }
-    let b = keel_git::bridge::bridge(&store)?;
-    let repo = Repo::open(&store_path).map_err(to_io)?;
+    let b = keel_git::bridge::bridge(store)?;
     let tagged = keel_store::sessiontag::reindex_all(&repo).map_err(to_io)?;
     println!("keel reindexed: {} changes, {} trees, {} session-tag entries", b.commits, b.trees, tagged);
     Ok(())

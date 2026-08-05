@@ -143,10 +143,14 @@ pub fn change_tags(store: &Store, change: ObjectId) -> Result<(BTreeSet<String>,
     Ok((syms, pats))
 }
 
-/// (Re)index every change in history — the backfill for an existing repo and a repair path. Returns
-/// how many changes were indexed.
+/// (Re)index every change reachable from head — the backfill for an existing repo and a repair path.
+/// Walks the full DAG (`ancestors`, every parent edge), not just first-parent, so a merged-in side
+/// branch's changes are indexed too. Returns how many changes were indexed.
 pub fn reindex_all(repo: &Repo) -> Result<usize> {
-    let ids = repo.log()?;
+    let ids = match repo.head()? {
+        Some(h) => repo.ancestors(h)?,
+        None => Vec::new(),
+    };
     for id in &ids {
         index_change(repo, *id)?;
     }
