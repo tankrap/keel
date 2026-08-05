@@ -33,9 +33,10 @@ pub struct Provenance {
     pub verified: bool,
 }
 
-/// A relevant prior session surfaced for this task — retrieved from the graph neighborhood
-/// (a change that touched the target file or one of its deps/rdeps, including cross-file).
-/// Its `lesson` is the non-obvious constraint that makes the next agent correct.
+/// A relevant prior session surfaced for this task — retrieved either from the file-neighborhood
+/// (a change that touched the target or one of its deps/rdeps) or by symbol/pattern overlap (a
+/// session whose touched symbols/operation-patterns match the task, even across unlinked files,
+/// NEW-1076). Its `lesson` is the non-obvious constraint that makes the next agent correct.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RelevantSession {
     pub change: String,
@@ -395,6 +396,10 @@ impl BriefService {
         neighborhood.extend(deps.iter().cloned());
         neighborhood.extend(rdeps.iter().cloned());
         let mut seen: HashSet<ObjectId> = HashSet::new();
+        // Also dedup by lesson text: two changes can link the same session (or repeat a `keel learn`
+        // lesson), and the graph pass can now reach a second such change the neighborhood never did —
+        // don't show the same lesson twice.
+        let mut seen_lessons: HashSet<String> = HashSet::new();
         // (verified, help, timestamp, session) so we RANK by feedback: a lesson that INFORMED a
         // verified-green change (help score, the flywheel's learned signal) leads, then verified,
         // then most recent — the confirmed-useful lesson is what an agent should see first.
@@ -403,7 +408,9 @@ impl BriefService {
             for (cid, c) in self.repo.history_touching(f).map_err(to_io)? {
                 if seen.insert(cid) {
                     if let Some(item) = self.session_candidate(cid, &c)? {
-                        cand.push(item);
+                        if seen_lessons.insert(item.3.lesson.clone()) {
+                            cand.push(item);
+                        }
                     }
                 }
             }
@@ -434,7 +441,9 @@ impl BriefService {
             }
             if let Some(c) = self.repo.change(cid).map_err(to_io)? {
                 if let Some(item) = self.session_candidate(cid, &c)? {
-                    cand.push(item);
+                    if seen_lessons.insert(item.3.lesson.clone()) {
+                        cand.push(item);
+                    }
                 }
             }
         }
