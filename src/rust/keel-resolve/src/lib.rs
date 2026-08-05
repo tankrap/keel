@@ -478,6 +478,12 @@ mod tests {
                 return;
             }
         };
+        // The fix is comment/string-awareness from the TS scanner; without TS installed the sidecar
+        // takes the regex fallback (which over-matches by design), so skip rather than fail there.
+        if sc.health().unwrap().get("ts").map(|v| v.is_null()).unwrap_or(true) {
+            eprintln!("skipping import-edges test: typescript not installed in sidecar");
+            return;
+        }
         let dir = tmp();
         fs::write(dir.join("real.ts"), "export const r = 1;\n").unwrap();
         fs::write(dir.join("ghost.ts"), "export const g = 2;\n").unwrap();

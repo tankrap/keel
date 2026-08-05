@@ -69,7 +69,10 @@ async function importSpecifiers(src) {
     const ts = await ensureTs();
     return ts.preProcessFile(src, /*readImportFiles*/ true, /*detectJavaScriptImports*/ true)
       .importedFiles.map((f) => f.fileName);
-  } catch {
+  } catch (e) {
+    // Degrade to the over-matching regex, but log it (the daemon captures sidecar stderr) so a
+    // persistent compiler-load failure — which would silently reintroduce false edges — is visible.
+    console.error(`keel-resolve: import scan fell back to regex (${(e && e.message) || e})`);
     const out = [];
     IMPORT_RE.lastIndex = 0;
     let m;
