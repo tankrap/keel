@@ -22,6 +22,7 @@ pub mod ignorerules;
 pub mod livestatus;
 pub mod object;
 pub mod repo;
+pub mod sessiontag;
 pub mod snapshot;
 pub mod store;
 pub mod textdiff;
