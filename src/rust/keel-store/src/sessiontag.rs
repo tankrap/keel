@@ -130,7 +130,10 @@ const NS_SYMIDX: &str = "symidx";
 const NS_PATIDX: &str = "patidx";
 
 /// Extract a change's `sym` + `pat` tags, persist them keyed by the change id, and reconcile the
-/// inverted index. Idempotent (re-indexing recomputes and reconciles postings).
+/// inverted index. Idempotent (re-indexing recomputes and reconciles postings). The posting updates
+/// and the forward writes are separate txns (no cross-put atomicity); a crash mid-index can leave
+/// them transiently inconsistent, which only costs a harmless extra candidate or a recoverable miss —
+/// [`reindex_all`] is the repair path. The forward index (`symtag`/`pattag`) is the source of truth.
 pub fn index_change(repo: &Repo, change: ObjectId) -> Result<()> {
     let new_syms = changed_symbols(repo, change)?;
     let new_pats = operation_patterns(repo, change)?;
