@@ -294,6 +294,21 @@ impl Repo {
         Ok(out)
     }
 
+    /// The per-file changes a committed change introduced vs its **first parent** (Added / Modified /
+    /// Deleted), sorted by path. A root change (no parent) diffs against the empty tree, so every file
+    /// reads as Added. This is the touched-file set a session's symbol/pattern extractor works from.
+    pub fn change_files(&self, change: ObjectId) -> Result<Vec<PathChange>> {
+        let c = self.change(change)?.ok_or(StoreError::Corrupt(change))?;
+        let parent_tree = match c.parents.first() {
+            Some(p) => Some(self.change(*p)?.ok_or(StoreError::Corrupt(*p))?.tree),
+            None => None,
+        };
+        let mut out = Vec::new();
+        self.diff_trees(parent_tree, Some(c.tree), &HashMap::new(), "", &mut out, 0)?;
+        out.sort_by(|a, b| a.path.cmp(&b.path));
+        Ok(out)
+    }
+
     /// The entries of a tree object, or `[]` for `None` / a non-tree id.
     fn tree_entries(&self, tree: Option<ObjectId>) -> Result<Vec<TreeEntry>> {
         match tree {
@@ -778,6 +793,39 @@ mod tests {
         // and it must still be tracked in HEAD
         let head = repo.head().unwrap().unwrap();
         assert!(repo.file_at(head, "app.min.js").unwrap().is_some(), "tracked file dropped from HEAD");
+    }
+
+    #[test]
+    fn change_files_diffs_a_change_against_its_parent() {
+        let sd = TmpDir::new();
+        let work = TmpDir::new();
+        let repo = Repo::open(sd.path()).unwrap();
+        fs::write(work.path().join("a"), b"1").unwrap();
+        fs::write(work.path().join("b"), b"x").unwrap();
+        let c1 = repo.commit_dir(work.path(), "add", "acct", 1, None).unwrap();
+        fs::write(work.path().join("a"), b"2").unwrap(); // modify
+        fs::remove_file(work.path().join("b")).unwrap(); // delete
+        fs::write(work.path().join("c"), b"y").unwrap(); // add
+        let c2 = repo.commit_dir(work.path(), "edit", "acct", 2, None).unwrap();
+
+        let f = |c| {
+            repo.change_files(c)
+                .unwrap()
+                .into_iter()
+                .map(|p| (p.path, p.kind))
+                .collect::<Vec<_>>()
+        };
+        // a root change: every file is Added.
+        assert_eq!(f(c1), vec![("a".into(), ChangeKind::Added), ("b".into(), ChangeKind::Added)]);
+        // vs the parent: add/modify/delete are all detected.
+        assert_eq!(
+            f(c2),
+            vec![
+                ("a".into(), ChangeKind::Modified),
+                ("b".into(), ChangeKind::Deleted),
+                ("c".into(), ChangeKind::Added),
+            ]
+        );
     }
 
     #[test]
