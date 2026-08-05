@@ -199,7 +199,9 @@ impl BriefService {
 
     /// Commit the current working tree (so future briefs have provenance).
     pub fn commit(&mut self, intent: &str, author: &str, timestamp: u64) -> io::Result<ObjectId> {
-        self.repo.commit_dir(&self.root, intent, author, timestamp, None).map_err(to_io)
+        let id = self.repo.commit_dir(&self.root, intent, author, timestamp, None).map_err(to_io)?;
+        self.release_on_land();
+        Ok(id)
     }
 
     /// Commit the working tree together with the agent `session` that produced it — the
@@ -212,7 +214,22 @@ impl BriefService {
         session: Session,
     ) -> io::Result<ObjectId> {
         let sid = self.repo.store().put(&Object::Session(session)).map_err(to_io)?;
-        self.repo.commit_dir(&self.root, intent, author, timestamp, Some(sid)).map_err(to_io)
+        let id =
+            self.repo.commit_dir(&self.root, intent, author, timestamp, Some(sid)).map_err(to_io)?;
+        self.release_on_land();
+        Ok(id)
+    }
+
+    /// The agent's change just landed, so its reservations are done — free them immediately instead
+    /// of waiting out the coordinator's TTL, so other agents can pick up those files right away. (The
+    /// agent re-reserves on its next brief.)
+    ///
+    /// Correctness depends on `self.agent` being unique per concurrent session (the daemon assigns a
+    /// distinct id per request via [`set_agent`](Self::set_agent)). If two live sessions shared one
+    /// id, one landing would free the other's in-flight holds — this is why release-on-land, unlike
+    /// the TTL, makes the agent-id-uniqueness assumption load-bearing.
+    fn release_on_land(&self) {
+        self.coord.release_agent(&self.agent);
     }
 
     /// Start fs-watching the working tree so [`refresh`](Self::refresh) becomes O(changed)
@@ -501,6 +518,12 @@ mod tests {
         let b2 = svc.brief("edit y", "y.ts", None, 10_000, true).unwrap();
         assert!(b2.coordination.is_empty());
         assert_eq!(coord.peek("bystander", &["y.ts".to_string()]).len(), 1, "y.ts is now reserved");
+
+        // "me" lands its change → its reservations release immediately (release-on-land), no TTL wait
+        svc.commit("land y", "acct", 3).unwrap();
+        assert_eq!(coord.peek("bystander", &["y.ts".to_string()]).len(), 0, "y.ts freed on land");
+        // but only the landing agent's holds — "other" still holds x.ts
+        assert_eq!(coord.peek("bystander", &["x.ts".to_string()]).len(), 1, "other's hold untouched");
 
         let _ = fs::remove_dir_all(&work);
         let _ = fs::remove_dir_all(&store);
