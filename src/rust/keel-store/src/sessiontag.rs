@@ -3,9 +3,11 @@
 //! A prior session is only useful to a future task if we can *find* it. The validated retrieval is
 //! deterministic graph overlap: `score = 2·|shared symbols| + 2·|shared operation-patterns|`, take
 //! top-k. That was proven with hand-modeled tags (0→72%); this module is the real extractor the
-//! productionization rests on — given a committed change, derive the `sym` set (the identifiers it
-//! touched) it should be retrievable by. The bar is **recall@k**, not precision: coarse over-
-//! extraction is fine because a strong answerer disambiguates the small top-k.
+//! productionization rests on — given a committed change, derive both its `sym` set (the identifiers
+//! it touched, [`changed_symbols`]) and its `pat` set (the operation class it performed,
+//! [`operation_patterns`]). The bar is **recall@k**, not precision: coarse over-extraction is fine
+//! because a strong answerer disambiguates the small top-k. The `examples/flywheel_recall` harness
+//! shows real sym + real pat holds recall@2=@3=100% on the validated pool.
 
 use crate::object::ObjectId;
 use crate::repo::{ChangeKind, Repo};
@@ -23,10 +25,15 @@ use std::collections::BTreeSet;
 /// whose only changed tokens are stopwords/short. Rename (delete+add) and pure deletion DO produce
 /// tags (both sides / the parent content are mined).
 pub fn changed_symbols(repo: &Repo, change: ObjectId) -> Result<BTreeSet<String>> {
+    Ok(symbols_from_text(&change_text(repo, change)?))
+}
+
+/// The concatenated changed-line text across every file a change touched (added/removed lines on a
+/// modify; whole file on add/delete) — the raw material both the symbol and pattern extractors mine.
+fn change_text(repo: &Repo, change: ObjectId) -> Result<String> {
     let c = repo.change(change)?.ok_or(StoreError::Corrupt(change))?;
     let parent = c.parents.first().copied();
-
-    let mut syms = BTreeSet::new();
+    let mut all = String::new();
     for pc in repo.change_files(change)? {
         let new = if pc.kind == ChangeKind::Deleted {
             None
@@ -37,9 +44,10 @@ pub fn changed_symbols(repo: &Repo, change: ObjectId) -> Result<BTreeSet<String>
             (ChangeKind::Added, _) | (_, None) => None,
             (_, Some(p)) => repo.file_bytes_at(p, &pc.path)?,
         };
-        collect_symbols(&changed_text(old.as_deref(), new.as_deref()), &mut syms);
+        all.push_str(&changed_text(old.as_deref(), new.as_deref()));
+        all.push('\n');
     }
-    Ok(syms)
+    Ok(all)
 }
 
 /// The salient split domain words in arbitrary `text` — the query-side extractor (a new task's target
@@ -63,6 +71,46 @@ fn collect_symbols(text: &str, out: &mut BTreeSet<String>) {
             }
         }
     }
+}
+
+/// The operation-pattern class(es) a change performed — the `pat` half of its retrieval tags. This
+/// is the coarse *kind* of operation, which lets a task retrieve a prior session whose symbols are
+/// disjoint (e.g. a new CREATE-TABLE retrieves a UUID-policy session — both `schema-create`). Drawn
+/// from a small controlled vocabulary; classified by signal keywords in the change's text. See
+/// [`patterns_from_text`].
+pub fn operation_patterns(repo: &Repo, change: ObjectId) -> Result<BTreeSet<String>> {
+    Ok(patterns_from_text(&change_text(repo, change)?))
+}
+
+/// The operation-pattern class(es) evident in arbitrary `text` — the query-side classifier (a new
+/// task's target code / description) and the shared core of [`operation_patterns`]. A change can
+/// match several classes; retrieval scores on any overlap. Deliberately signal-keyword based (cheap,
+/// deterministic, auditable) — a first cut the recall@k experiment measures before escalating to an
+/// AST/model classifier.
+pub fn patterns_from_text(text: &str) -> BTreeSet<String> {
+    let lower = text.to_ascii_lowercase();
+    let has = |sigs: &[&str]| sigs.iter().any(|s| lower.contains(s));
+    let mut pats = BTreeSet::new();
+    // schema-create — DDL / migrations. Checked first: it's the most specific `db.`-family operation.
+    if has(&[
+        "create table", "createtable", "migrat", "alter table", "altercolumn", "add column",
+        "schema", "create index", "createindex", "uuidv7", "auto-increment", "autoincrement",
+    ]) {
+        pats.insert("schema-create".into());
+    }
+    // db-query — reads / filters / pagination.
+    if has(&[".query(", ".where(", "select ", "findmany", "findunique", ".find(", "queryraw", "keyset", "pagination", "order by", "orderby"]) {
+        pats.insert("db-query".into());
+    }
+    // external-call — network / external service / message-bus calls.
+    if has(&["fetch(", "axios", "http", ".send(", ".post(", "gateway.", "provider.", "enqueue", "analytics", "emailservice", "webhook", "requests.", "urllib", "i18n.render", "smsprovider"]) {
+        pats.insert("external-call".into());
+    }
+    // money — monetary values (kept tight; `amount`/`total` alone are too generic to include).
+    if has(&["cents", "price", "money", "invoice", "currency", " tax", "tax ", "monetary"]) {
+        pats.insert("money".into());
+    }
+    pats
 }
 
 /// Split an identifier into lowercased component words on `_` and camelCase/PascalCase boundaries:
@@ -170,6 +218,21 @@ const STOPWORDS: &[&str] = &[
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn patterns_from_text_classifies_the_operation_kind() {
+        let p = patterns_from_text;
+        assert!(p("return gateway.charge(order.amount)").contains("external-call"));
+        assert!(p("await analyticsQueue.enqueue({ event })").contains("external-call"));
+        assert!(p("db.alterColumn('users', 'id', uuidv7())").contains("schema-create"));
+        assert!(p("Define the schema for a new orders table").contains("schema-create"));
+        assert!(p("return db.query('accounts').where({ tenantId })").contains("db-query"));
+        assert!(p("return items.reduce((cents, it) => cents + it.priceCents, 0)").contains("money"));
+        // no operation signal → no pattern (the classifier abstains rather than guessing).
+        assert!(p("function add(a, b) { return a + b; }").is_empty());
+        // `amount`/`total` alone are too generic to imply money.
+        assert!(!p("const total = amount + fee").contains("money"));
+    }
+
     use crate::repo::Repo;
     use crate::testutil::TmpDir;
     use std::fs;
