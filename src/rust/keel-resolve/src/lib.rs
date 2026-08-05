@@ -86,12 +86,17 @@ impl Sidecar {
             let tag = script.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
             std::thread::spawn(move || {
                 let mut r = BufReader::new(stderr);
-                let mut line = String::new();
+                let mut buf = Vec::new();
                 loop {
-                    line.clear();
-                    match r.read_line(&mut line) {
-                        Ok(0) | Err(_) => break, // EOF or read error — child's stderr is done
+                    buf.clear();
+                    // Read raw bytes, not `read_line`: a non-UTF-8 stderr line would make `read_line`
+                    // return an error, and stopping the drain there could let the child fill the pipe
+                    // buffer and block on `write` → stall its stdout → a wrongful wedge. `read_until`
+                    // + lossy decode never stops on bad bytes; only a true EOF/IO error ends it.
+                    match r.read_until(b'\n', &mut buf) {
+                        Ok(0) | Err(_) => break, // EOF or a real pipe error — child's stderr is done
                         Ok(_) => {
+                            let line = String::from_utf8_lossy(&buf);
                             let trimmed = line.trim_end();
                             if !trimmed.is_empty() {
                                 eprintln!("[keel-resolve sidecar {tag}] {trimmed}");
