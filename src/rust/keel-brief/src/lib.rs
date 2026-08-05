@@ -432,7 +432,7 @@ impl BriefService {
                 }
             }
         }
-        for (cid, _score) in
+        for (cid, score) in
             keel_store::sessiontag::retrieve(self.repo.store(), &qsym, &qpat, 5).map_err(to_io)?
         {
             if !seen.insert(cid) {
@@ -441,7 +441,8 @@ impl BriefService {
             if let Some(c) = self.repo.change(cid).map_err(to_io)? {
                 if let Some((verified, help, ts, sess)) = self.session_candidate(cid, &c)? {
                     if seen_lessons.insert(sess.lesson.clone()) {
-                        cand.push((help, overlap_of(cid)?, verified, ts, sess));
+                        // `score` from `retrieve` IS this candidate's overlap — no need to recompute.
+                        cand.push((help, score, verified, ts, sess));
                     }
                 }
             }
