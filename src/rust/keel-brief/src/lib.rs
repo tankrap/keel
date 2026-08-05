@@ -14,7 +14,7 @@
 use keel_coord::{Conflict, PredictedConflict};
 use keel_graph::LiveGraph;
 use keel_resolve::{Resolve, Router, SliceDef};
-use keel_store::{Object, ObjectId, Repo, Session, StoreError, Verification};
+use keel_store::{Change, Object, ObjectId, Repo, Session, StoreError, Verification};
 use std::collections::HashSet;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -33,9 +33,10 @@ pub struct Provenance {
     pub verified: bool,
 }
 
-/// A relevant prior session surfaced for this task — retrieved from the graph neighborhood
-/// (a change that touched the target file or one of its deps/rdeps, including cross-file).
-/// Its `lesson` is the non-obvious constraint that makes the next agent correct.
+/// A relevant prior session surfaced for this task — retrieved either from the file-neighborhood
+/// (a change that touched the target or one of its deps/rdeps) or by symbol/pattern overlap (a
+/// session whose touched symbols/operation-patterns match the task, even across unlinked files,
+/// NEW-1076). Its `lesson` is the non-obvious constraint that makes the next agent correct.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RelevantSession {
     pub change: String,
@@ -235,6 +236,55 @@ impl BriefService {
         self.release_on_land();
     }
 
+    /// Build a ranking candidate `(verified, help, timestamp, session)` for a change — from its linked
+    /// Session (path a) or a post-hoc `keel learn` lesson (path b) — or `None` if it recorded no
+    /// lesson. Shared by the file-neighborhood and graph-overlap retrieval passes. Verification
+    /// prefers the post-hoc side-table (CI result) over the change's committed state.
+    fn session_candidate(
+        &self,
+        cid: ObjectId,
+        c: &Change,
+    ) -> io::Result<Option<(bool, i64, u64, RelevantSession)>> {
+        let verified_of = |baked: Verification| -> Verification {
+            match self.repo.store().verification(&cid) {
+                Ok(Verification::Unverified) => baked,
+                Ok(v) => v,
+                Err(_) => baked,
+            }
+        };
+        let help = self.repo.store().lesson_help(&cid).map_err(to_io)?;
+        // (a) a keel-native session object linked to the change
+        if let Some(sid) = c.session {
+            if let Some(Object::Session(s)) = self.repo.store().get(&sid).map_err(to_io)? {
+                if !s.lesson.is_empty() {
+                    let verified = matches!(s.verification, Verification::Green)
+                        || matches!(verified_of(c.verification), Verification::Green);
+                    return Ok(Some((verified, help, c.timestamp, RelevantSession {
+                        change: cid.to_hex(),
+                        task: s.task,
+                        lesson: s.lesson,
+                        verified,
+                        has_context: s.context_served.is_some(),
+                    })));
+                }
+            }
+        }
+        // (b) a post-hoc lesson attached via `keel learn` — works on git-driven immutable history
+        if let Some((t, lesson)) = self.repo.store().lesson(&cid).map_err(to_io)? {
+            if !lesson.is_empty() {
+                let verified = matches!(verified_of(c.verification), Verification::Green);
+                return Ok(Some((verified, help, c.timestamp, RelevantSession {
+                    change: cid.to_hex(),
+                    task: t,
+                    lesson,
+                    verified,
+                    has_context: false,
+                })));
+            }
+        }
+        Ok(None)
+    }
+
     /// The agent's change just landed, so its reservations are done — free them immediately instead
     /// of waiting out the coordinator's TTL, so other agents can pick up those files right away. (The
     /// agent re-reserves on its next brief.)
@@ -346,49 +396,58 @@ impl BriefService {
         neighborhood.extend(deps.iter().cloned());
         neighborhood.extend(rdeps.iter().cloned());
         let mut seen: HashSet<ObjectId> = HashSet::new();
+        // Also dedup by lesson text: two changes can link the same session (or repeat a `keel learn`
+        // lesson), and the graph pass can now reach a second such change the neighborhood never did —
+        // don't show the same lesson twice.
+        let mut seen_lessons: HashSet<String> = HashSet::new();
         // (verified, help, timestamp, session) so we RANK by feedback: a lesson that INFORMED a
         // verified-green change (help score, the flywheel's learned signal) leads, then verified,
         // then most recent — the confirmed-useful lesson is what an agent should see first.
         let mut cand: Vec<(bool, i64, u64, RelevantSession)> = Vec::new();
         for f in &neighborhood {
             for (cid, c) in self.repo.history_touching(f).map_err(to_io)? {
-                if !seen.insert(cid) {
-                    continue; // one session per change
-                }
-                let help = self.repo.store().lesson_help(&cid).map_err(to_io)?;
-                // (a) a keel-native session object linked to the change
-                if let Some(sid) = c.session {
-                    if let Some(Object::Session(s)) = self.repo.store().get(&sid).map_err(to_io)? {
-                        if !s.lesson.is_empty() {
-                            let verified = matches!(s.verification, Verification::Green)
-                                || matches!(verify_of(&cid, c.verification), Verification::Green);
-                            cand.push((verified, help, c.timestamp, RelevantSession {
-                                change: cid.to_hex(),
-                                task: s.task,
-                                lesson: s.lesson,
-                                verified,
-                                has_context: s.context_served.is_some(),
-                            }));
-                            continue;
+                if seen.insert(cid) {
+                    if let Some(item) = self.session_candidate(cid, &c)? {
+                        if seen_lessons.insert(item.3.lesson.clone()) {
+                            cand.push(item);
                         }
-                    }
-                }
-                // (b) a post-hoc lesson attached via `keel learn` — the path that works on
-                // git-driven history (immutable changes can't carry a session, so it's a side-table)
-                if let Some((task, lesson)) = self.repo.store().lesson(&cid).map_err(to_io)? {
-                    if !lesson.is_empty() {
-                        let verified = matches!(verify_of(&cid, c.verification), Verification::Green);
-                        cand.push((verified, help, c.timestamp, RelevantSession {
-                            change: cid.to_hex(),
-                            task,
-                            lesson,
-                            verified,
-                            has_context: false,
-                        }));
                     }
                 }
             }
         }
+
+        // graph-overlap retrieval (NEW-1076, the flywheel): also surface sessions whose touched
+        // symbols/patterns overlap this task — the cross-domain retrieval the import-neighborhood
+        // pass structurally can't do (a refund task finds a gateway session sharing the `gateway`
+        // symbol even when their files aren't import-linked). The query tags come from the sliced
+        // defs + the task + the target path; scored against the persisted per-change tag index.
+        let mut qtext = String::new();
+        for d in &context {
+            qtext.push_str(&d.symbol);
+            qtext.push('\n');
+            qtext.push_str(&d.text);
+            qtext.push('\n');
+        }
+        qtext.push_str(task);
+        qtext.push('\n');
+        qtext.push_str(file);
+        let qsym = keel_store::sessiontag::symbols_from_text(&qtext);
+        let qpat = keel_store::sessiontag::patterns_from_text(&qtext);
+        for (cid, _score) in
+            keel_store::sessiontag::retrieve(self.repo.store(), &qsym, &qpat, 5).map_err(to_io)?
+        {
+            if !seen.insert(cid) {
+                continue; // already surfaced by the neighborhood pass
+            }
+            if let Some(c) = self.repo.change(cid).map_err(to_io)? {
+                if let Some(item) = self.session_candidate(cid, &c)? {
+                    if seen_lessons.insert(item.3.lesson.clone()) {
+                        cand.push(item);
+                    }
+                }
+            }
+        }
+
         // rank: help score first (learned value), then verified, then recency
         cand.sort_by(|a, b| b.1.cmp(&a.1).then(b.0.cmp(&a.0)).then(b.2.cmp(&a.2)));
         let sessions: Vec<RelevantSession> = cand.into_iter().take(5).map(|(_, _, _, s)| s).collect();
@@ -600,6 +659,55 @@ mod tests {
             b2.sessions.iter().any(|s| s.lesson.contains("settled value")),
             "cross-file retrieval via rdeps; got {:?}",
             b2.sessions
+        );
+
+        let _ = fs::remove_dir_all(&work);
+        let _ = fs::remove_dir_all(&store);
+    }
+
+    #[test]
+    fn brief_retrieves_by_symbol_overlap_across_unlinked_files() {
+        let work = tmp("gwork");
+        let store = tmp("gstore");
+        // refund.ts exists first; payment.ts is added later by the SESSION commit — with NO import
+        // between them, so neither is in the other's graph neighborhood.
+        fs::write(work.join("refund.ts"), "export function refund(order) {\n  return gateway.refund(order);\n}\n").unwrap();
+
+        let mut svc = match BriefService::open(&work, &store, &sidecar_dir()) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("skipping graph-overlap test: {e}");
+                return;
+            }
+        };
+        svc.commit("initial", "acct", 1).unwrap();
+        // ADD payment.ts and land a session with a gateway lesson — as a new file, its whole content
+        // (the gateway/charge domain words) is mined into the session's tags. (Auto-indexed at commit.)
+        fs::write(work.join("payment.ts"), "export function chargeGateway(order) {\n  return gateway.charge(order);\n}\n").unwrap();
+        svc.refresh().unwrap();
+        let session = Session {
+            task: "fix flaky charges".into(),
+            model: "claude".into(),
+            lesson: "the payment gateway needs a settle delay before charge".into(),
+            prompts: None,
+            context_served: None,
+            tool_calls: vec![],
+            tool_results: vec![],
+            verification: Verification::Green,
+            tokens_in: 0,
+            tokens_out: 0,
+        };
+        svc.commit_with_session("gateway settle", "acct", 2, session).unwrap();
+
+        // refund.ts is NOT an import-neighbor of payment.ts, so the file-neighborhood pass cannot
+        // reach the gateway session — only symbol-overlap retrieval (shared `gateway`/`payment`) can.
+        let b = svc
+            .brief("implement refund via the payment gateway", "refund.ts", Some("refund"), 100_000, false)
+            .unwrap();
+        assert!(
+            b.sessions.iter().any(|s| s.lesson.contains("settle delay")),
+            "graph-overlap retrieval across unlinked files; got {:?}",
+            b.sessions
         );
 
         let _ = fs::remove_dir_all(&work);

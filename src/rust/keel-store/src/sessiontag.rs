@@ -157,6 +157,38 @@ pub fn reindex_all(repo: &Repo) -> Result<usize> {
     Ok(ids.len())
 }
 
+/// Retrieve the indexed changes whose tags best overlap the query — `score = 2·|shared sym| +
+/// 2·|shared pat|` — highest first, limited to `k` and score > 0. This is the deterministic graph
+/// retrieval NEW-1076 validated (recall@k over a small candidate set; a strong reader disambiguates).
+/// It surfaces a session whose *symbols/patterns* match even when its files aren't import-neighbors
+/// of the target — the cross-domain retrieval the file-neighborhood pass structurally can't do.
+pub fn retrieve(
+    store: &Store,
+    query_sym: &BTreeSet<String>,
+    query_pat: &BTreeSet<String>,
+    k: usize,
+) -> Result<Vec<(ObjectId, i32)>> {
+    let mut scored: Vec<(ObjectId, i32)> = Vec::new();
+    for (kbytes, symbytes) in store.aux_iter(NS_SYM)? {
+        if kbytes.len() != 32 {
+            continue;
+        }
+        let mut id = [0u8; 32];
+        id.copy_from_slice(&kbytes);
+        let s = split_tags(&symbytes).intersection(query_sym).count() as i32;
+        let pats = store.aux_get(NS_PAT, &id)?.map(|b| split_tags(&b)).unwrap_or_default();
+        let p = pats.intersection(query_pat).count() as i32;
+        let score = 2 * s + 2 * p;
+        if score > 0 {
+            scored.push((ObjectId(id), score));
+        }
+    }
+    // highest score first; deterministic id tiebreak (matches the validated lab's ordering)
+    scored.sort_by(|a, b| b.1.cmp(&a.1).then(a.0 .0.cmp(&b.0 .0)));
+    scored.truncate(k);
+    Ok(scored)
+}
+
 /// Tags are newline-joined — a tag (a lowercased identifier word, or a `pat` class like
 /// `external-call`) never contains a newline — and sorted by `BTreeSet` iteration, so the encoding
 /// is stable.
