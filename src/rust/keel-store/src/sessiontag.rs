@@ -37,18 +37,32 @@ pub fn changed_symbols(repo: &Repo, change: ObjectId) -> Result<BTreeSet<String>
             (ChangeKind::Added, _) | (_, None) => None,
             (_, Some(p)) => repo.file_bytes_at(p, &pc.path)?,
         };
-        for tok in identifiers(&changed_text(old.as_deref(), new.as_deref())) {
-            // Split camelCase / snake_case into component words so `chargeGateway` and `refundGateway`
-            // both surface `gateway` — the shared domain word retrieval overlaps on. Whole-identifier
-            // matching would miss it (the validated tags are split domain words, not raw identifiers).
-            for word in split_identifier(tok) {
-                if is_salient(&word) {
-                    syms.insert(word);
-                }
+        collect_symbols(&changed_text(old.as_deref(), new.as_deref()), &mut syms);
+    }
+    Ok(syms)
+}
+
+/// The salient split domain words in arbitrary `text` — the query-side extractor (a new task's target
+/// code / task description), and the shared core of [`changed_symbols`]. Same tokenize → camelCase/
+/// snake split → salience filter, so a session (indexed from its diff) and a task (from its code)
+/// produce comparable tags to overlap.
+pub fn symbols_from_text(text: &str) -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
+    collect_symbols(text, &mut out);
+    out
+}
+
+/// Tokenize `text`, split each identifier into component words, keep the salient ones. Splitting
+/// `chargeGateway`/`refundGateway` both to `gateway` is what lets retrieval overlap on the shared
+/// domain word — whole-identifier matching would miss it.
+fn collect_symbols(text: &str, out: &mut BTreeSet<String>) {
+    for tok in identifiers(text) {
+        for word in split_identifier(tok) {
+            if is_salient(&word) {
+                out.insert(word);
             }
         }
     }
-    Ok(syms)
 }
 
 /// Split an identifier into lowercased component words on `_` and camelCase/PascalCase boundaries:
