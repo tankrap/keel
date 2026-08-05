@@ -309,7 +309,11 @@ pub fn checkout(store: &Store, tree_id: ObjectId, dir: &Path) -> Result<()> {
 /// Cap on directory nesting when walking a tree from the store. Tree objects can come from an
 /// untrusted remote; without a bound a deeply-nested crafted tree overflows the native stack and
 /// aborts the process. Real repos nest only a few dozen levels deep, so this is far above any need.
-pub(crate) const MAX_TREE_DEPTH: u32 = 1024;
+/// It must be low enough that the recursion returns the depth error *before* exhausting the stack —
+/// an unoptimized (debug/test) build has large frames and only a ~2 MiB thread stack, where 1024
+/// levels overflow before the guard fires. 256 keeps ~10× margin over real trees and stays safe in
+/// every build profile.
+pub(crate) const MAX_TREE_DEPTH: u32 = 256;
 
 fn checkout_depth(store: &Store, tree_id: ObjectId, dir: &Path, depth: u32) -> Result<()> {
     if depth > MAX_TREE_DEPTH {
@@ -325,6 +329,21 @@ fn checkout_depth(store: &Store, tree_id: ObjectId, dir: &Path, depth: u32) -> R
             return Err(StoreError::Corrupt(tree_id)); // unsafe entry name — refuse to escape `dir`
         }
         let p = dir.join(&e.name);
+        // Never write *through* a pre-existing symlink at `p`: a crafted tree can place a symlink
+        // entry (e.g. `x -> /outside`) and then a dir/file entry of the same name (or a later
+        // checkout into the same dir can), and `create_dir_all`/`fs::write` would otherwise follow it
+        // and escape the checkout root — arbitrary file write, distinct from the name-based traversal
+        // guard above. Drop any symlink (or type-mismatched entry) at `p` before touching it.
+        if let Ok(meta) = fs::symlink_metadata(&p) {
+            let want_dir = e.mode == MODE_DIR;
+            if meta.file_type().is_symlink() || meta.is_dir() != want_dir {
+                if meta.is_dir() {
+                    fs::remove_dir_all(&p)?;
+                } else {
+                    fs::remove_file(&p)?;
+                }
+            }
+        }
         if e.mode == MODE_DIR {
             checkout_depth(store, e.id, &p, depth + 1)?;
         } else {
@@ -509,6 +528,48 @@ mod tests {
         assert!(std::fs::symlink_metadata(out.path().join("link.txt")).unwrap().file_type().is_symlink());
         assert_eq!(std::fs::read_link(out.path().join("link.txt")).unwrap().to_str(), Some("real.txt"));
         assert_eq!(id1, snapshot(&s, out.path()).unwrap(), "symlink round-trips to the same address");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn checkout_refuses_to_write_through_a_symlink() {
+        // A crafted tree places a symlink `x -> <outside dir>`; a later checkout into the same dir
+        // materializes a directory `x` containing `pwned`. `create_dir_all` must NOT follow the
+        // symlink and write into the outside dir (arbitrary file write outside the checkout root).
+        let sd = TmpDir::new();
+        let out = TmpDir::new();
+        let outside = TmpDir::new();
+        let s = Store::open(sd.path()).unwrap();
+
+        let target = outside.path().to_string_lossy().into_owned();
+        let link_blob = s.put(&Object::Blob(target.into_bytes())).unwrap();
+        let t1 = s
+            .put(&Object::Tree(Tree {
+                entries: vec![TreeEntry { name: "x".into(), mode: MODE_SYMLINK, id: link_blob }],
+            }))
+            .unwrap();
+
+        let file_blob = s.put(&Object::Blob(b"OWNED".to_vec())).unwrap();
+        let subtree = s
+            .put(&Object::Tree(Tree {
+                entries: vec![TreeEntry { name: "pwned".into(), mode: MODE_FILE, id: file_blob }],
+            }))
+            .unwrap();
+        let t2 = s
+            .put(&Object::Tree(Tree {
+                entries: vec![TreeEntry { name: "x".into(), mode: MODE_DIR, id: subtree }],
+            }))
+            .unwrap();
+
+        checkout(&s, t1, out.path()).unwrap(); // `x` is now a symlink to `outside`
+        checkout(&s, t2, out.path()).unwrap(); // `x` should become a real dir, not be followed
+
+        assert!(!outside.path().join("pwned").exists(), "checkout escaped the root through a symlink");
+        assert!(out.path().join("x").join("pwned").exists(), "file must land inside the checkout");
+        assert!(
+            out.path().join("x").symlink_metadata().unwrap().file_type().is_dir(),
+            "`x` must be replaced by a real directory"
+        );
     }
 
     #[test]

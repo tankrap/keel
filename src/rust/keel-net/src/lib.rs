@@ -22,6 +22,12 @@ const OP_GET: u8 = 0x01;
 const OP_SUBSCRIBE: u8 = 0x02;
 const ALPN: &[u8] = b"keel/1";
 
+/// Hard ceiling on a length-prefixed frame the client will allocate for. The server accepts *any*
+/// cert (`AcceptAny`), so a malicious or MITM'd peer can put an arbitrary u64/u32 on the wire; without
+/// a cap `vec![0u8; n]` reserves it up front and aborts the process before a single byte is read.
+/// Mirrors keel-git's `MAX_OBJECT_SIZE`.
+const MAX_FRAME: usize = 4 * 1024 * 1024 * 1024;
+
 type Error = Box<dyn std::error::Error + Send + Sync>;
 type Result<T> = std::result::Result<T, Error>;
 
@@ -179,6 +185,9 @@ impl Client {
         let mut len = [0u8; 8];
         recv.read_exact(&mut len).await?;
         let n = u64::from_le_bytes(len) as usize;
+        if n > MAX_FRAME {
+            return Err("object length exceeds frame limit".into());
+        }
         let mut buf = vec![0u8; n];
         recv.read_exact(&mut buf).await?;
         Ok(Some(buf))
@@ -318,5 +327,32 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(ev, b"reserve src/auth/login.ts by alice");
+    }
+
+    #[tokio::test]
+    async fn client_rejects_oversized_frame_instead_of_aborting() {
+        // The client trusts any server cert (`AcceptAny`), so a malicious or MITM'd peer can put an
+        // arbitrary u64 length on the wire. Without the MAX_FRAME cap the client would `vec![0u8; n]`
+        // and abort the process before reading a byte. It must return an error instead.
+        let (cfg, _) = server_config().unwrap();
+        let endpoint = Endpoint::server(cfg, "127.0.0.1:0".parse().unwrap()).unwrap();
+        let addr = endpoint.local_addr().unwrap();
+        tokio::spawn(async move {
+            if let Some(incoming) = endpoint.accept().await {
+                if let Ok(conn) = incoming.await {
+                    if let Ok((mut send, mut recv)) = conn.accept_bi().await {
+                        let mut req = [0u8; 33]; // OP_GET + 32-byte oid
+                        let _ = recv.read_exact(&mut req).await;
+                        let _ = send.write_all(&[1u8]).await; // "found"
+                        let _ = send.write_all(&u64::MAX.to_le_bytes()).await; // absurd length
+                        let _ = send.finish();
+                        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                    }
+                }
+            }
+        });
+        let client = Client::connect(addr).await.unwrap();
+        let res = client.get_object(&ObjectId([7u8; 32])).await;
+        assert!(res.is_err(), "oversized frame must be rejected, got {res:?}");
     }
 }

@@ -869,6 +869,17 @@ fn cmd_serve(args: &[String]) -> io::Result<()> {
     Ok(())
 }
 
+/// Ceiling on a request body `keel serve` will buffer. Without it a client can drive the process to
+/// OOM by declaring a huge `Content-Length` (or streaming an unterminated chunked body) and feeding
+/// bytes. Generous by default so a legitimate `git push` isn't rejected; override with
+/// `KEEL_SERVE_MAX_BODY` (bytes) for larger packs.
+fn max_body() -> usize {
+    std::env::var("KEEL_SERVE_MAX_BODY")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(2 * 1024 * 1024 * 1024)
+}
+
 /// Handle one HTTP request on `stream` and route it to the git smart-HTTP handlers.
 fn serve_conn(mut stream: std::net::TcpStream, store: &keel_store::store::Store) -> io::Result<()> {
     use std::io::Read;
@@ -913,11 +924,18 @@ fn serve_conn(mut stream: std::net::TcpStream, store: &keel_store::store::Store)
     }
     // body: whatever came after the headers, plus whatever else the client sends. git uses
     // chunked transfer-encoding for the upload-pack POST, so decode that; otherwise Content-Length.
+    let cap = max_body();
+    if content_length > cap {
+        return respond(&mut stream, "413 Payload Too Large", "text/plain", b"");
+    }
     let mut raw = buf[headers_end..].to_vec();
     let body = if chunked {
         loop {
             if let Some(decoded) = decode_chunked(&raw) {
                 break decoded;
+            }
+            if raw.len() > cap {
+                return respond(&mut stream, "413 Payload Too Large", "text/plain", b"");
             }
             let n = stream.read(&mut tmp)?;
             if n == 0 {
@@ -1039,11 +1057,15 @@ fn decode_chunked(raw: &[u8]) -> Option<Vec<u8>> {
         if size == 0 {
             return Some(out); // last chunk (trailers, if any, ignored)
         }
-        if i + size + 2 > raw.len() {
-            return None; // chunk body not fully arrived yet
+        // Use checked arithmetic: `size` is an attacker-controlled hex value, so `i + size + 2`
+        // can overflow, wrap past the bounds check, and then panic on an inverted slice range —
+        // and with `panic = "abort"` that would take down the whole `keel serve` process.
+        let end = i.checked_add(size)?;
+        if end > raw.len() || end + 2 > raw.len() {
+            return None; // chunk body (+ trailing CRLF) not fully arrived yet
         }
-        out.extend_from_slice(&raw[i..i + size]);
-        i += size + 2; // data + trailing CRLF
+        out.extend_from_slice(&raw[i..end]);
+        i = end + 2; // data + trailing CRLF
     }
 }
 
@@ -2098,5 +2120,23 @@ mod tests {
         assert!(h.contains("prior sessions"));
         assert!(h.contains("settle before charge"));
         assert!(h.contains("invariants"), "pinned invariants rendered");
+    }
+
+    #[test]
+    fn decode_chunked_roundtrips_a_normal_body() {
+        // "5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n" → "hello world"
+        let raw = b"5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n";
+        assert_eq!(decode_chunked(raw), Some(b"hello world".to_vec()));
+    }
+
+    #[test]
+    fn decode_chunked_rejects_overflowing_chunk_size_without_panicking() {
+        // An attacker-controlled chunk size near usize::MAX must not wrap the bounds check into a
+        // panic (which, with panic=abort, would take down the whole `keel serve` process). It should
+        // simply report "not fully arrived yet" (None).
+        let raw = b"fffffffffffffff0\r\nshort";
+        assert_eq!(decode_chunked(raw), None);
+        // usize::MAX itself, and a value one below, both exercise the checked_add / end+2 guards.
+        assert_eq!(decode_chunked(b"ffffffffffffffff\r\nx"), None);
     }
 }
