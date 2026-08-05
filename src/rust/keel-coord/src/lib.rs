@@ -11,6 +11,13 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+/// How long a reservation lives without renewal before it's considered abandoned and swept. Agents
+/// renew implicitly every time they re-fetch a brief (`reserve`) or explicitly via `renew`, so an
+/// actively-worked hold never expires; a crashed or wandered-off agent's holds free themselves after
+/// this, instead of blocking others forever as stale conflicts.
+const DEFAULT_TTL: Duration = Duration::from_secs(300);
 
 /// A file wanted by the caller but currently held by another agent.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -31,16 +38,31 @@ pub struct PredictedConflict {
     pub dir: String,
 }
 
+/// One held file: the holder, its task, and when the hold was last taken or renewed (for TTL expiry).
+struct Reservation {
+    agent: String,
+    task: String,
+    at: Instant,
+}
+
 #[derive(Default)]
 struct Registry {
-    held: HashMap<String, (String, String)>, // file → (agent, task)
+    held: HashMap<String, Reservation>, // file → reservation
 }
 
 /// A shared reservation registry. Cheap to clone (shares one registry), so every agent's
 /// brief service holds a handle to the same coordinator.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct Coordinator {
     inner: Arc<Mutex<Registry>>,
+    ttl: Duration,
+}
+
+impl Default for Coordinator {
+    fn default() -> Self {
+        // NB: a derived Default would give ttl = Duration::ZERO → every reservation expires instantly.
+        Coordinator { inner: Arc::new(Mutex::new(Registry::default())), ttl: DEFAULT_TTL }
+    }
 }
 
 impl Coordinator {
@@ -48,33 +70,61 @@ impl Coordinator {
         Coordinator::default()
     }
 
+    /// Override the reservation TTL (default 300s): a hold not renewed within this window is swept.
+    /// Tune shorter for faster reclamation after a crash, longer for slow tasks between brief fetches.
+    pub fn with_ttl(mut self, ttl: Duration) -> Self {
+        self.ttl = ttl;
+        self
+    }
+
     /// Reserve `files` for `agent`/`task`. Files held by a *different* agent are returned
     /// as conflicts and left with their current holder (the caller backs off). Free files
     /// — or files already held by `agent` — are reserved to `agent`. Idempotent.
     pub fn reserve(&self, agent: &str, task: &str, files: &[String]) -> Vec<Conflict> {
         let mut reg = self.inner.lock().unwrap();
+        sweep(&mut reg, self.ttl); // reclaim abandoned holds before deciding conflicts
         let mut conflicts = Vec::new();
         for f in files {
             match reg.held.get(f) {
-                Some((a, t)) if a != agent => {
-                    conflicts.push(Conflict { file: f.clone(), agent: a.clone(), task: t.clone() });
+                Some(r) if r.agent != agent => {
+                    conflicts.push(Conflict { file: f.clone(), agent: r.agent.clone(), task: r.task.clone() });
                 }
+                // free, or already ours — (re)take it and refresh the TTL (a brief fetch = heartbeat)
                 _ => {
-                    reg.held.insert(f.clone(), (agent.to_string(), task.to_string()));
+                    reg.held.insert(
+                        f.clone(),
+                        Reservation { agent: agent.to_string(), task: task.to_string(), at: Instant::now() },
+                    );
                 }
             }
         }
         conflicts
     }
 
+    /// Heartbeat: refresh the TTL on `files` still held by `agent`, without taking new ones — for a
+    /// long task that keeps working without re-fetching a brief. Files it no longer holds are ignored.
+    pub fn renew(&self, agent: &str, files: &[String]) {
+        let mut reg = self.inner.lock().unwrap();
+        sweep(&mut reg, self.ttl);
+        let now = Instant::now();
+        for f in files {
+            if let Some(r) = reg.held.get_mut(f) {
+                if r.agent == agent {
+                    r.at = now;
+                }
+            }
+        }
+    }
+
     /// Who (other than `agent`) currently holds any of `files` — no reservation taken.
     pub fn peek(&self, agent: &str, files: &[String]) -> Vec<Conflict> {
-        let reg = self.inner.lock().unwrap();
+        let mut reg = self.inner.lock().unwrap();
+        sweep(&mut reg, self.ttl);
         files
             .iter()
             .filter_map(|f| match reg.held.get(f) {
-                Some((a, t)) if a != agent => {
-                    Some(Conflict { file: f.clone(), agent: a.clone(), task: t.clone() })
+                Some(r) if r.agent != agent => {
+                    Some(Conflict { file: f.clone(), agent: r.agent.clone(), task: r.task.clone() })
                 }
                 _ => None,
             })
@@ -83,14 +133,14 @@ impl Coordinator {
 
     /// Release everything held by `agent` (e.g. when its work lands).
     pub fn release_agent(&self, agent: &str) {
-        self.inner.lock().unwrap().held.retain(|_, (a, _)| a != agent);
+        self.inner.lock().unwrap().held.retain(|_, r| r.agent != agent);
     }
 
     /// Release specific `files` held by `agent`.
     pub fn release_files(&self, agent: &str, files: &[String]) {
         let mut reg = self.inner.lock().unwrap();
         for f in files {
-            if reg.held.get(f).is_some_and(|(a, _)| a == agent) {
+            if reg.held.get(f).is_some_and(|r| r.agent == agent) {
                 reg.held.remove(f);
             }
         }
@@ -102,18 +152,19 @@ impl Coordinator {
     /// in this module — consider elsewhere" signal that lets a fleet self-spread. The
     /// coordinator is the single ordered authority, so this view is consistent by construction.
     pub fn predict(&self, agent: &str, files: &[String]) -> Vec<PredictedConflict> {
-        let reg = self.inner.lock().unwrap();
+        let mut reg = self.inner.lock().unwrap();
+        sweep(&mut reg, self.ttl);
         let want: HashSet<&str> = files.iter().map(String::as_str).collect();
         let want_dirs: HashSet<&str> = files.iter().map(|f| dir_of(f)).collect();
         let mut out: Vec<PredictedConflict> = reg
             .held
             .iter()
-            .filter(|(held, (a, _))| a != agent && !want.contains(held.as_str()))
+            .filter(|(held, r)| r.agent != agent && !want.contains(held.as_str()))
             .filter(|(held, _)| want_dirs.contains(dir_of(held)))
-            .map(|(held, (a, t))| PredictedConflict {
+            .map(|(held, r)| PredictedConflict {
                 held_file: held.clone(),
-                agent: a.clone(),
-                task: t.clone(),
+                agent: r.agent.clone(),
+                task: r.task.clone(),
                 dir: dir_of(held).to_string(),
             })
             .collect();
@@ -122,8 +173,17 @@ impl Coordinator {
     }
 
     pub fn held_count(&self) -> usize {
-        self.inner.lock().unwrap().held.len()
+        let mut reg = self.inner.lock().unwrap();
+        sweep(&mut reg, self.ttl);
+        reg.held.len()
     }
+}
+
+/// Drop reservations not renewed within `ttl` — an agent that crashed or wandered off shouldn't hold
+/// files forever. Called on every registry access, so expiry is lazy (no background thread needed).
+fn sweep(reg: &mut Registry, ttl: Duration) {
+    let now = Instant::now();
+    reg.held.retain(|_, r| now.duration_since(r.at) < ttl);
 }
 
 /// The directory portion of a repo-relative path (everything before the last `/`), or `""`
@@ -199,5 +259,24 @@ mod tests {
         assert!(c.reserve("alice", "t", &files(&["a.ts"])).is_empty());
         assert!(c.reserve("alice", "t", &files(&["a.ts"])).is_empty(), "re-reserving own file is fine");
         assert_eq!(c.held_count(), 1);
+    }
+
+    #[test]
+    fn abandoned_reservations_expire_but_a_heartbeat_keeps_them() {
+        let ttl = Duration::from_millis(100);
+        let c = Coordinator::new().with_ttl(ttl);
+        c.reserve("alice", "t", &files(&["a.ts"]));
+        assert_eq!(c.peek("bob", &files(&["a.ts"])).len(), 1, "held right after reserve");
+
+        // renew before expiry keeps it alive past the original TTL window
+        std::thread::sleep(Duration::from_millis(60));
+        c.renew("alice", &files(&["a.ts"]));
+        std::thread::sleep(Duration::from_millis(60)); // 120ms since reserve, but only 60 since renew
+        assert_eq!(c.peek("bob", &files(&["a.ts"])).len(), 1, "heartbeat kept the hold alive");
+
+        // stop renewing → it's reclaimed, so bob can take it
+        std::thread::sleep(Duration::from_millis(160));
+        assert_eq!(c.held_count(), 0, "abandoned hold swept after ttl");
+        assert!(c.reserve("bob", "t2", &files(&["a.ts"])).is_empty(), "bob takes the freed file");
     }
 }
