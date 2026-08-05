@@ -60,7 +60,9 @@ fn parse_map_size(s: &str) -> Option<usize> {
         Some(c) if c.eq_ignore_ascii_case(&'t') => (&s[..s.len() - 1], 1usize << 40),
         _ => (s, 1),
     };
-    num.trim().parse::<usize>().ok().map(|n| n.saturating_mul(mult))
+    // Reject 0: LMDB reads map_size(0) as "keep the current size", a footgun — treat it as junk so
+    // `open` falls back to the default instead.
+    num.trim().parse::<usize>().ok().map(|n| n.saturating_mul(mult)).filter(|&n| n > 0)
 }
 
 /// Blobs larger than this are stored as FastCDC chunk manifests (deduped);
@@ -1115,6 +1117,8 @@ mod tests {
         assert_eq!(parse_map_size(""), None);
         assert_eq!(parse_map_size("banana"), None);
         assert_eq!(parse_map_size("12X"), None);
+        assert_eq!(parse_map_size("0"), None); // map_size(0) means "keep current" — reject it
+        assert_eq!(parse_map_size("0G"), None);
     }
 
     #[test]

@@ -38,9 +38,10 @@ fn blob(tag: usize, i: usize, payload: usize) -> Object {
 
 /// Run `writers` threads, each doing `ops` puts, against stores produced by `make_store(thread_idx)`.
 /// A barrier aligns the start so we time steady-state contention, not thread spawn. Returns wall secs,
-/// or `None` if any writer errored (so the sweep prints a gap for that row instead of aborting).
-fn run(writers: usize, ops: usize, payload: usize, make_store: impl Fn(usize) -> Arc<Store>) -> Option<f64> {
-    let stores: Vec<Arc<Store>> = (0..writers).map(&make_store).collect();
+/// or `None` if any store failed to open (e.g. the OS per-process mmap/fd limit on many envs) or any
+/// writer errored — so the sweep prints a gap for that row instead of aborting.
+fn run(writers: usize, ops: usize, payload: usize, make_store: impl Fn(usize) -> Option<Arc<Store>>) -> Option<f64> {
+    let stores: Vec<Arc<Store>> = (0..writers).map(&make_store).collect::<Option<_>>()?;
     let barrier = Arc::new(Barrier::new(writers + 1));
     let mut handles = Vec::with_capacity(writers);
     for (tag, store) in stores.into_iter().enumerate() {
@@ -73,9 +74,12 @@ fn tmp(name: &str) -> std::path::PathBuf {
     std::env::temp_dir().join(format!("keel-writers-{}-{name}", std::process::id()))
 }
 
-fn open(path: &std::path::Path) -> Arc<Store> {
+/// Open a fresh store, or `None` if it can't be opened — the sharded case opens N envs at once and
+/// the OS caps how many a process may map/hold, so a failure here is data (it bounds sharding), not a
+/// reason to abort the sweep.
+fn open(path: &std::path::Path) -> Option<Arc<Store>> {
     let _ = std::fs::remove_dir_all(path);
-    Arc::new(Store::open_with_map_size(path, BENCH_MAP_SIZE).expect("open store"))
+    Store::open_with_map_size(path, BENCH_MAP_SIZE).ok().map(Arc::new)
 }
 
 fn main() {
@@ -112,7 +116,10 @@ fn main() {
 
         // A: N writers → one shared env (all threads get a clone of the same store).
         let shared_store = open(&tmp("shared"));
-        let shared_tps = run(w, ops, payload, |_| Arc::clone(&shared_store)).map(|s| total / s);
+        let shared_tps = shared_store
+            .as_ref()
+            .and_then(|s| run(w, ops, payload, |_| Some(Arc::clone(s))))
+            .map(|secs| total / secs);
 
         // B: N writers → one env per writer (the sharding mitigation).
         let sharded_tps = run(w, ops, payload, |t| open(&tmp(&format!("shard{t}")))).map(|s| total / s);
@@ -142,14 +149,19 @@ fn main() {
 
     println!("    ────────┴────────────────┴────────────────┴───────────┴──────────────────");
     println!();
-    println!("    Reading it (commits/s ≈ txns/s ÷ ~2 — a commit is an object put_many + a ref advance):");
-    println!("    · 'shared vs 1-wtr' > 1 ⇒ LMDB's group commit coalesces fsyncs across concurrent");
-    println!("      committers, so the single-writer lock is NOT a 1-writer-flat ceiling — one shared");
-    println!("      env keeps climbing and plateaus at the fsync/IO ceiling, not the write lock.");
-    println!("    · 'shard×' > 1 ⇒ one env per repo raises the absolute ceiling further (writers run");
-    println!("      parallel across envs). Worth it only if a single repo must exceed the shared ceiling.");
-    println!("    · A '—' sharded row is this process hitting the OS per-process mmap/fd limit on many");
-    println!("      simultaneous envs — a real constraint for sharding: a daemon serving many repos");
-    println!("      needs an LRU env cache, not one permanently-open env per repo.");
+    println!("    Reading it (keel fuses a change's objects + ref advance into ONE write txn via");
+    println!("    apply/apply_cas, so commits/s ≈ txns/s — not ÷2):");
+    println!("    · LMDB is single-writer: one env holds the writer lock through the WHOLE txn —");
+    println!("      hash + deflate + put + the commit fsync — so writers to the 'shared' env fully");
+    println!("      serialize. That column is a single repo's commit ceiling; LMDB has no group");
+    println!("      commit, so for a durable workload 'shared vs 1-wtr' should sit near 1.0.");
+    println!("    · DURABILITY CAVEAT: on macOS/APFS, fsync does not force stable storage (that needs");
+    println!("      F_FULLFSYNC, which LMDB doesn't issue), so absolute txns/s here are inflated by the");
+    println!("      page cache and 'shared vs 1-wtr' can drift above 1.0. Read the SHAPE, not the rate;");
+    println!("      for a true durable ceiling, measure on a filesystem where fsync is honored.");
+    println!("    · 'shard×' > 1 ⇒ one env per repo = independent writer locks = real cross-repo");
+    println!("      parallelism — the lever if one host must exceed a single repo's serialized rate.");
+    println!("      A '—' sharded row is the OS per-process mmap/fd limit on many simultaneous envs, so");
+    println!("      many-repo sharding needs an LRU env cache, not one permanently-open env per repo.");
     println!("╚═══ done ═══");
 }
