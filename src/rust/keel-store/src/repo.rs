@@ -399,7 +399,18 @@ impl Repo {
     /// First-parent history changes (newest first) that modified `path` — i.e. where the
     /// file's content differs from the first parent's (covers add / modify / remove).
     pub fn history_touching(&self, path: &str) -> Result<Vec<(ObjectId, Change)>> {
+        self.history_touching_limited(path, usize::MAX)
+    }
+
+    /// Like [`history_touching`](Self::history_touching), but stops after `max` matching changes
+    /// (newest first). Each commit costs a `change` load plus up to two `path_in_tree` walks, so a
+    /// caller that only needs the last few — a brief's provenance, `keel why --limit N` — should bound
+    /// it rather than walk the whole log and discard the tail.
+    pub fn history_touching_limited(&self, path: &str, max: usize) -> Result<Vec<(ObjectId, Change)>> {
         let mut out = Vec::new();
+        if max == 0 {
+            return Ok(out);
+        }
         for id in self.log()? {
             let c = match self.change(id)? {
                 Some(c) => c,
@@ -415,6 +426,9 @@ impl Repo {
             };
             if here != parent_here {
                 out.push((id, c));
+                if out.len() >= max {
+                    break;
+                }
             }
         }
         Ok(out)
@@ -824,6 +838,16 @@ mod tests {
 
         assert!(repo.file_at(c2, "a").unwrap().is_some());
         assert_eq!(repo.file_at(c2, "missing").unwrap(), None);
+
+        // early-stop returns the newest `max` matches and no more (and 0 → empty).
+        let a_last1: Vec<_> =
+            repo.history_touching_limited("a", 1).unwrap().into_iter().map(|(id, _)| id).collect();
+        assert_eq!(a_last1, vec![c2], "limit 1 → just the newest change touching a");
+        assert!(repo.history_touching_limited("a", 0).unwrap().is_empty(), "limit 0 → empty");
+        // a limit at/above the true count matches the unbounded walk.
+        let a_last9: Vec<_> =
+            repo.history_touching_limited("a", 9).unwrap().into_iter().map(|(id, _)| id).collect();
+        assert_eq!(a_last9, vec![c2, c1], "limit ≥ count → same as unbounded");
     }
 
     #[test]
