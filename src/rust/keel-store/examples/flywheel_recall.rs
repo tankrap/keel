@@ -12,7 +12,7 @@
 //! LLM / API key — recall@k is a pure function of the tags. Run: `cargo run -p keel-store --release
 //! --example flywheel_recall`.
 
-use keel_store::sessiontag::{changed_symbols, symbols_from_text};
+use keel_store::sessiontag::{changed_symbols, operation_patterns, patterns_from_text, symbols_from_text};
 use keel_store::Repo;
 use std::collections::BTreeSet;
 
@@ -161,16 +161,22 @@ fn pool() -> Vec<Item> {
 struct Tagged {
     id: String,
     sym: BTreeSet<String>,
-    pat: BTreeSet<String>,
+    pat: BTreeSet<String>,      // hand-modeled (the validated lab's tags)
+    real_pat: BTreeSet<String>, // extracted by the real classifier (increment 2)
 }
 
 /// score = 2·|shared sym| + 2·|shared pat|; deterministic sort, id tiebreak — the validated ranking.
-fn rank(query_sym: &BTreeSet<String>, query_pat: &BTreeSet<String>, pool: &[Tagged], use_pat: bool) -> Vec<String> {
+fn rank(
+    query_sym: &BTreeSet<String>,
+    query_pat: &BTreeSet<String>,
+    pool: &[Tagged],
+    session_pat: fn(&Tagged) -> &BTreeSet<String>,
+) -> Vec<String> {
     let mut scored: Vec<(i32, &str)> = pool
         .iter()
         .map(|c| {
             let s = c.sym.intersection(query_sym).count() as i32;
-            let p = if use_pat { c.pat.intersection(query_pat).count() as i32 } else { 0 };
+            let p = session_pat(c).intersection(query_pat).count() as i32;
             (2 * s + 2 * p, c.id.as_str())
         })
         .collect();
@@ -191,16 +197,27 @@ fn main() {
     // Commit each session's code as its own change (a distinct file per item, so each change's diff
     // is exactly that session's code), and extract its sym set from the real production extractor.
     let mut tagged: Vec<Tagged> = Vec::new();
-    let mut queries: Vec<(String, BTreeSet<String>, BTreeSet<String>)> = Vec::new(); // (target id, qsym, qpat)
+    let mut queries: Vec<(String, BTreeSet<String>, BTreeSet<String>, BTreeSet<String>)> = Vec::new(); // (id, qsym, qpat_hand, qpat_real)
     for (i, it) in items.iter().enumerate() {
         std::fs::write(work.join(format!("{}.js", it.id)), it.code).unwrap();
         let c = repo.commit_dir(&work, it.id, "bench", (i + 1) as u64, None).unwrap();
         let sym = changed_symbols(&repo, c).unwrap();
-        tagged.push(Tagged { id: it.id.to_string(), sym, pat: it.pat.iter().map(|s| s.to_string()).collect() });
+        let real_pat = operation_patterns(&repo, c).unwrap();
+        tagged.push(Tagged {
+            id: it.id.to_string(),
+            sym,
+            pat: it.pat.iter().map(|s| s.to_string()).collect(),
+            real_pat,
+        });
 
         if let Some(q) = &it.query {
-            let qsym = symbols_from_text(&format!("{}\n{}", q.stub, q.task));
-            queries.push((it.id.to_string(), qsym, q.pat.iter().map(|s| s.to_string()).collect()));
+            let qtext = format!("{}\n{}", q.stub, q.task);
+            queries.push((
+                it.id.to_string(),
+                symbols_from_text(&qtext),
+                q.pat.iter().map(|s| s.to_string()).collect(),
+                patterns_from_text(&qtext),
+            ));
         }
     }
 
@@ -209,11 +226,17 @@ fn main() {
         tagged.len(), queries.len(), tagged.len() - queries.len());
     println!("    baseline to beat: hand-modeled tags gave recall@1=0, recall@2=83%, recall@3=100%\n");
 
-    for (mode, use_pat) in [("sym-only", false), ("sym+pat", true)] {
+    let empty: BTreeSet<String> = BTreeSet::new();
+    for mode in ["sym-only", "sym+pat(hand-modeled)", "sym+pat(REAL classifier)"] {
         let (mut r1, mut r2, mut r3) = (0, 0, 0);
         println!("    ── {mode} ──");
-        for (tid, qsym, qpat) in &queries {
-            let ranked = rank(qsym, qpat, &tagged, use_pat);
+        for (tid, qsym, qpat_hand, qpat_real) in &queries {
+            let (qpat, spat): (&BTreeSet<String>, fn(&Tagged) -> &BTreeSet<String>) = match mode {
+                "sym-only" => (&empty, |t| &t.pat),
+                "sym+pat(hand-modeled)" => (qpat_hand, |t| &t.pat),
+                _ => (qpat_real, |t| &t.real_pat),
+            };
+            let ranked = rank(qsym, qpat, &tagged, spat);
             let pos = ranked.iter().position(|id| id == tid).map(|p| p + 1).unwrap_or(usize::MAX);
             if pos <= 1 { r1 += 1; }
             if pos <= 2 { r2 += 1; }
@@ -226,11 +249,13 @@ fn main() {
         println!("    recall@1={}  recall@2={}  recall@3={}\n", pct(r1), pct(r2), pct(r3));
     }
 
-    println!("    Read it (state it precisely): the REAL symbol extractor ALONE holds recall@3=83% —");
-    println!("    swapping it in for the hand-modeled sym tags does NOT degrade recall (it improves");
-    println!("    recall@1 0→33% and recall@2). The 100%@k2 is real-sym + STILL-hand-modeled pat; the");
-    println!("    one sym-only miss (T-uuid, schema-create) is the pattern-retrieved case, which is");
-    println!("    exactly what increment 2 (the real pat classifier) must recover.");
+    println!("    Read it (precisely): with BOTH halves real, the recall METRIC matches the validated");
+    println!("    hand-modeled baseline — recall@2=recall@3=100%. The real symbol extractor carries 5 of");
+    println!("    6 targets on its own; pat is decisive for exactly ONE (T-uuid, schema-create, disjoint");
+    println!("    symbols), rescued by the genuine `schema` signal. (The real pat TAGS differ from the");
+    println!("    hand tags on some items — they just don't change the ranking, since sym does the work.)");
+    println!("    This is one 12-item hand-built pool, so treat it as a strong first-cut signal that a");
+    println!("    real extractor holds recall@k — not a generalization claim across repos.");
     println!("╚═══ done ═══");
     let _ = std::fs::remove_dir_all(&dir);
 }
