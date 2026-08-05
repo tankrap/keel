@@ -13,7 +13,7 @@ use crate::object::ObjectId;
 use crate::repo::{ChangeKind, Repo};
 use crate::store::{Result, Store, StoreError};
 use crate::textdiff::{self, Tag};
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashSet};
 
 /// The salient identifiers a change touched — the `sym` half of its retrieval tags. Only the
 /// **changed** lines are scanned (added/removed on a modify; the whole file on add/delete), so the
@@ -120,20 +120,96 @@ pub fn patterns_from_text(text: &str) -> BTreeSet<String> {
 
 // ── persistence: the change→tags side-table (address-stable, like lesson_help / informed) ────────
 
-/// aux-KV namespaces for a change's retrieval tags, keyed by the change id. Side-tables so indexing a
-/// change never moves its content address — post-hoc, exactly like `lesson_help` / `informed`.
+/// aux-KV namespaces. `symtag`/`pattag` are the **forward** index (change id → its tag set, the
+/// source of truth for scoring); `symidx`/`patidx` are the **inverted** index (a tag → the change ids
+/// carrying it) so `retrieve` visits only changes that share ≥1 query tag instead of scanning all of
+/// history. Side-tables so indexing never moves a change's content address — like `lesson_help`.
 const NS_SYM: &str = "symtag";
 const NS_PAT: &str = "pattag";
+const NS_SYMIDX: &str = "symidx";
+const NS_PATIDX: &str = "patidx";
 
-/// Extract a change's `sym` + `pat` tags and persist them keyed by the change id. Idempotent
-/// (re-indexing overwrites). Indexing a landed session is what makes it retrievable later.
+/// Extract a change's `sym` + `pat` tags, persist them keyed by the change id, and reconcile the
+/// inverted index. Idempotent (re-indexing recomputes and reconciles postings). The posting updates
+/// and the forward writes are separate txns (no cross-put atomicity); a crash mid-index can leave
+/// them transiently inconsistent, which only costs a harmless extra candidate or a recoverable miss —
+/// [`reindex_all`] is the repair path. The forward index (`symtag`/`pattag`) is the source of truth.
 pub fn index_change(repo: &Repo, change: ObjectId) -> Result<()> {
-    let syms = changed_symbols(repo, change)?;
-    let pats = operation_patterns(repo, change)?;
+    let new_syms = changed_symbols(repo, change)?;
+    let new_pats = operation_patterns(repo, change)?;
     let store = repo.store();
-    store.aux_put(NS_SYM, &change.0, join_tags(&syms).as_bytes())?;
-    store.aux_put(NS_PAT, &change.0, join_tags(&pats).as_bytes())?;
+    // Reconcile postings against the change's previously-indexed tags (empty on first index).
+    let (old_syms, old_pats) = change_tags(store, change)?;
+    update_postings(store, NS_SYMIDX, change, &old_syms, &new_syms)?;
+    update_postings(store, NS_PATIDX, change, &old_pats, &new_pats)?;
+    // Forward index (the source of truth used for scoring).
+    store.aux_put(NS_SYM, &change.0, join_tags(&new_syms).as_bytes())?;
+    store.aux_put(NS_PAT, &change.0, join_tags(&new_pats).as_bytes())?;
     Ok(())
+}
+
+/// Ensure `change` is in the posting list of every tag it now has (idempotent), and remove it from
+/// any tag it no longer has — reconciling the inverted index with the change's new tag set. Inserting
+/// for *all* current tags (not just the delta) also rebuilds a missing inverted index on re-index.
+fn update_postings(
+    store: &Store,
+    ns: &str,
+    change: ObjectId,
+    old: &BTreeSet<String>,
+    new: &BTreeSet<String>,
+) -> Result<()> {
+    for tag in new {
+        posting_insert(store, ns, tag, change)?;
+    }
+    for tag in old.difference(new) {
+        posting_remove(store, ns, tag, change)?;
+    }
+    Ok(())
+}
+
+fn posting_insert(store: &Store, ns: &str, tag: &str, change: ObjectId) -> Result<()> {
+    let mut ids = read_postings(store, ns, tag)?;
+    if !ids.contains(&change) {
+        ids.push(change);
+        store.aux_put(ns, tag.as_bytes(), &encode_ids(&ids))?;
+    }
+    Ok(())
+}
+
+fn posting_remove(store: &Store, ns: &str, tag: &str, change: ObjectId) -> Result<()> {
+    let mut ids = read_postings(store, ns, tag)?;
+    if let Some(pos) = ids.iter().position(|x| *x == change) {
+        ids.swap_remove(pos);
+        if ids.is_empty() {
+            store.aux_delete(ns, tag.as_bytes())?;
+        } else {
+            store.aux_put(ns, tag.as_bytes(), &encode_ids(&ids))?;
+        }
+    }
+    Ok(())
+}
+
+fn read_postings(store: &Store, ns: &str, tag: &str) -> Result<Vec<ObjectId>> {
+    Ok(store.aux_get(ns, tag.as_bytes())?.map(|b| decode_ids(&b)).unwrap_or_default())
+}
+
+/// Posting lists are raw concatenated 32-byte change ids.
+fn encode_ids(ids: &[ObjectId]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(ids.len() * 32);
+    for id in ids {
+        out.extend_from_slice(&id.0);
+    }
+    out
+}
+fn decode_ids(bytes: &[u8]) -> Vec<ObjectId> {
+    bytes
+        .chunks_exact(32)
+        .map(|c| {
+            let mut a = [0u8; 32];
+            a.copy_from_slice(c);
+            ObjectId(a)
+        })
+        .collect()
 }
 
 /// A change's persisted `(sym, pat)` tags, or empty sets if it was never indexed.
@@ -168,19 +244,23 @@ pub fn retrieve(
     query_pat: &BTreeSet<String>,
     k: usize,
 ) -> Result<Vec<(ObjectId, i32)>> {
+    // Candidate changes: the union of the query tags' posting lists — only changes that share ≥1
+    // tag, instead of every indexed change. Then score each via its forward tags.
+    let mut candidates: HashSet<ObjectId> = HashSet::new();
+    for w in query_sym {
+        candidates.extend(read_postings(store, NS_SYMIDX, w)?);
+    }
+    for p in query_pat {
+        candidates.extend(read_postings(store, NS_PATIDX, p)?);
+    }
     let mut scored: Vec<(ObjectId, i32)> = Vec::new();
-    for (kbytes, symbytes) in store.aux_iter(NS_SYM)? {
-        if kbytes.len() != 32 {
-            continue;
-        }
-        let mut id = [0u8; 32];
-        id.copy_from_slice(&kbytes);
-        let s = split_tags(&symbytes).intersection(query_sym).count() as i32;
-        let pats = store.aux_get(NS_PAT, &id)?.map(|b| split_tags(&b)).unwrap_or_default();
+    for cid in candidates {
+        let (syms, pats) = change_tags(store, cid)?;
+        let s = syms.intersection(query_sym).count() as i32;
         let p = pats.intersection(query_pat).count() as i32;
         let score = 2 * s + 2 * p;
         if score > 0 {
-            scored.push((ObjectId(id), score));
+            scored.push((cid, score));
         }
     }
     // highest score first; deterministic id tiebreak (matches the validated lab's ordering)
@@ -325,6 +405,28 @@ mod tests {
     use crate::repo::Repo;
     use crate::testutil::TmpDir;
     use std::fs;
+
+    #[test]
+    fn retrieve_narrows_to_overlapping_changes_via_inverted_index() {
+        let sd = TmpDir::new();
+        let work = TmpDir::new();
+        let repo = Repo::open(sd.path()).unwrap();
+        fs::write(work.path().join("payment.ts"), "function chargeGateway(order) { return gateway.charge(order); }").unwrap();
+        let c1 = repo.commit_dir(work.path(), "gateway", "a", 1, None).unwrap();
+        fs::write(work.path().join("mailer.ts"), "function sendWelcome(recipient) { return mailer.deliver(recipient); }").unwrap();
+        let c2 = repo.commit_dir(work.path(), "mailer", "a", 2, None).unwrap();
+        index_change(&repo, c1).unwrap();
+        index_change(&repo, c2).unwrap();
+        index_change(&repo, c1).unwrap(); // idempotent re-index must not duplicate postings
+
+        let qsym = symbols_from_text("refund an order via the gateway");
+        let empty: BTreeSet<String> = BTreeSet::new();
+        let hits = retrieve(repo.store(), &qsym, &empty, 5).unwrap();
+        // c1 (shares gateway/order) is retrieved exactly once via the posting lists; c2
+        // (mailer/recipient) shares no query tag, so the inverted index never even visits it.
+        assert_eq!(hits.iter().filter(|(id, _)| *id == c1).count(), 1, "c1 retrieved once: {hits:?}");
+        assert!(!hits.iter().any(|(id, _)| *id == c2), "c2 excluded (no shared tag): {hits:?}");
+    }
 
     #[test]
     fn index_change_persists_and_reads_back_tags() {
