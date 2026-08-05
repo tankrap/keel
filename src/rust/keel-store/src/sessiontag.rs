@@ -11,7 +11,7 @@
 
 use crate::object::ObjectId;
 use crate::repo::{ChangeKind, Repo};
-use crate::store::{Result, StoreError};
+use crate::store::{Result, Store, StoreError};
 use crate::textdiff::{self, Tag};
 use std::collections::BTreeSet;
 
@@ -116,6 +116,55 @@ pub fn patterns_from_text(text: &str) -> BTreeSet<String> {
         pats.insert("money".into());
     }
     pats
+}
+
+// ── persistence: the change→tags side-table (address-stable, like lesson_help / informed) ────────
+
+/// aux-KV namespaces for a change's retrieval tags, keyed by the change id. Side-tables so indexing a
+/// change never moves its content address — post-hoc, exactly like `lesson_help` / `informed`.
+const NS_SYM: &str = "symtag";
+const NS_PAT: &str = "pattag";
+
+/// Extract a change's `sym` + `pat` tags and persist them keyed by the change id. Idempotent
+/// (re-indexing overwrites). Indexing a landed session is what makes it retrievable later.
+pub fn index_change(repo: &Repo, change: ObjectId) -> Result<()> {
+    let syms = changed_symbols(repo, change)?;
+    let pats = operation_patterns(repo, change)?;
+    let store = repo.store();
+    store.aux_put(NS_SYM, &change.0, join_tags(&syms).as_bytes())?;
+    store.aux_put(NS_PAT, &change.0, join_tags(&pats).as_bytes())?;
+    Ok(())
+}
+
+/// A change's persisted `(sym, pat)` tags, or empty sets if it was never indexed.
+pub fn change_tags(store: &Store, change: ObjectId) -> Result<(BTreeSet<String>, BTreeSet<String>)> {
+    let syms = store.aux_get(NS_SYM, &change.0)?.map(|b| split_tags(&b)).unwrap_or_default();
+    let pats = store.aux_get(NS_PAT, &change.0)?.map(|b| split_tags(&b)).unwrap_or_default();
+    Ok((syms, pats))
+}
+
+/// (Re)index every change reachable from head — the backfill for an existing repo and a repair path.
+/// Walks the full DAG (`ancestors`, every parent edge), not just first-parent, so a merged-in side
+/// branch's changes are indexed too. Returns how many changes were indexed.
+pub fn reindex_all(repo: &Repo) -> Result<usize> {
+    let ids = match repo.head()? {
+        Some(h) => repo.ancestors(h)?,
+        None => Vec::new(),
+    };
+    for id in &ids {
+        index_change(repo, *id)?;
+    }
+    Ok(ids.len())
+}
+
+/// Tags are newline-joined — a tag (a lowercased identifier word, or a `pat` class like
+/// `external-call`) never contains a newline — and sorted by `BTreeSet` iteration, so the encoding
+/// is stable.
+fn join_tags(tags: &BTreeSet<String>) -> String {
+    tags.iter().cloned().collect::<Vec<_>>().join("\n")
+}
+fn split_tags(bytes: &[u8]) -> BTreeSet<String> {
+    String::from_utf8_lossy(bytes).lines().filter(|l| !l.is_empty()).map(String::from).collect()
 }
 
 /// Split an identifier into lowercased component words on `_` and camelCase/PascalCase boundaries:
@@ -244,6 +293,32 @@ mod tests {
     use crate::repo::Repo;
     use crate::testutil::TmpDir;
     use std::fs;
+
+    #[test]
+    fn index_change_persists_and_reads_back_tags() {
+        let sd = TmpDir::new();
+        let work = TmpDir::new();
+        let repo = Repo::open(sd.path()).unwrap();
+        fs::write(
+            work.path().join("payment.ts"),
+            "export function chargeGateway(order) { return gateway.charge(order.amount); }",
+        )
+        .unwrap();
+        let c = repo.commit_dir(work.path(), "charge", "acct", 1, None).unwrap();
+
+        // not indexed yet → empty tags
+        let (s0, p0) = change_tags(repo.store(), c).unwrap();
+        assert!(s0.is_empty() && p0.is_empty());
+
+        index_change(&repo, c).unwrap();
+        let (syms, pats) = change_tags(repo.store(), c).unwrap();
+        assert!(syms.contains("gateway") && syms.contains("charge"), "syms: {syms:?}");
+        assert!(pats.contains("external-call"), "pats: {pats:?}");
+
+        // reindex_all re-derives them (idempotent) and reports the count
+        assert_eq!(reindex_all(&repo).unwrap(), 1);
+        assert_eq!(change_tags(repo.store(), c).unwrap().0, syms);
+    }
 
     #[test]
     fn changed_symbols_extracts_split_domain_words_from_changed_lines() {

@@ -200,7 +200,7 @@ impl BriefService {
     /// Commit the current working tree (so future briefs have provenance).
     pub fn commit(&mut self, intent: &str, author: &str, timestamp: u64) -> io::Result<ObjectId> {
         let id = self.repo.commit_dir(&self.root, intent, author, timestamp, None).map_err(to_io)?;
-        self.release_on_land();
+        self.index_and_release(id);
         Ok(id)
     }
 
@@ -216,8 +216,23 @@ impl BriefService {
         let sid = self.repo.store().put(&Object::Session(session)).map_err(to_io)?;
         let id =
             self.repo.commit_dir(&self.root, intent, author, timestamp, Some(sid)).map_err(to_io)?;
-        self.release_on_land();
+        self.index_and_release(id);
         Ok(id)
+    }
+
+    /// On land: index the change's retrieval tags (sym + pat) so the session is findable by a future
+    /// task (NEW-1076), then free the agent's reservations. Indexing derives from the change's diff,
+    /// so it's cheap and self-contained (no sidecar).
+    ///
+    /// **Best-effort**: the change is already committed and the ref advanced, so an indexing failure
+    /// must NOT be reported as a commit failure or block reservation release — an unindexed change is
+    /// merely un-retrievable until `keel reindex`. (Mirrors how `brief()` degrades via `context_error`
+    /// rather than failing the whole fetch.)
+    fn index_and_release(&self, change: ObjectId) {
+        if let Err(e) = keel_store::sessiontag::index_change(&self.repo, change) {
+            eprintln!("keel: session-tag indexing failed for {} (recoverable via `keel reindex`): {e}", change.to_hex());
+        }
+        self.release_on_land();
     }
 
     /// The agent's change just landed, so its reservations are done — free them immediately instead
