@@ -1324,6 +1324,50 @@ mod tests {
         assert!(s.env.info().map_size > 512 * 1024, "map grew during the concurrent run");
     }
 
+    /// The real cross-process case: this test process opens the store at a tiny map, a SEPARATE
+    /// child process (a re-exec of the test binary) opens the same dir and writes enough to grow the
+    /// file, then this process's next txn hits MDB_MAP_RESIZED — which `ro_txn` must adopt-and-retry
+    /// rather than surface. (Two processes is LMDB's supported multi-process mode; opening one env
+    /// twice *in a process* would be UB, which is why this can't be a plain unit test.)
+    #[test]
+    fn cross_process_map_resized_is_recovered() {
+        const CHILD_ENV: &str = "KEEL_TEST_RESIZE_CHILD_DIR";
+        let sentinel = || Object::Blob(b"resize-sentinel".to_vec());
+
+        // Child mode (this test, re-exec'd with the env set): grow the file from another process.
+        if let Ok(dir) = std::env::var(CHILD_ENV) {
+            // A generous map so the CHILD never itself grows — it just writes ~4.8 MiB of pages, far
+            // past the parent's 512 KiB, so the parent's meta-size check trips MDB_MAP_RESIZED.
+            let c = Store::open_with_map_size(std::path::Path::new(&dir), 64 * 1024 * 1024).unwrap();
+            c.put(&sentinel()).unwrap();
+            for i in 0..600u32 {
+                c.put(&Object::Blob(fill_blob(i))).unwrap();
+            }
+            std::process::exit(0);
+        }
+
+        // Parent: open at a tiny 512 KiB map and do NOTHING that would adopt a new size yet.
+        let d = TmpDir::new();
+        let parent = Store::open_with_map_size(&d.0, 512 * 1024).unwrap();
+
+        // Re-exec ourselves as the child grower (a genuine second process on the same env). The
+        // filter must be the FULL test path — libtest's `--exact` matches the whole name.
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["store::tests::cross_process_map_resized_is_recovered", "--exact", "--test-threads=1"])
+            .env(CHILD_ENV, &d.0)
+            .status()
+            .unwrap();
+        assert!(status.success(), "child grower process failed");
+
+        // The parent's env is still mapped at 512 KiB while the file is now ~5 MiB, so this get's
+        // txn-open returns MDB_MAP_RESIZED; recovery must adopt the peer's size and read the sentinel.
+        match parent.get(&sentinel().id()).unwrap() {
+            Some(Object::Blob(b)) => assert_eq!(b, b"resize-sentinel"),
+            other => panic!("sentinel unreadable after a peer grew the map (MAP_RESIZED not handled?): {other:?}"),
+        }
+        assert!(parent.env.info().map_size > 512 * 1024, "parent adopted the peer's grown map size");
+    }
+
     #[test]
     fn gc_is_excluded_while_a_commit_lock_is_held() {
         use std::sync::atomic::{AtomicBool, Ordering};
