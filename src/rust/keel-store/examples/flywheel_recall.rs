@@ -226,10 +226,11 @@ fn main() {
         println!("    recall@1={}  recall@2={}  recall@3={}\n", pct(r1), pct(r2), pct(r3));
     }
 
-    println!("    Read it: recall@3 = 100% means the right prior session is always in the top-3 the");
-    println!("    agent sees (a strong answerer disambiguates the trap). sym-only vs sym+pat shows how");
-    println!("    much the pattern classifier (increment 2) must add — the pattern-retrieved cases");
-    println!("    (schema-create/db-query with disjoint symbols) are exactly where sym-only should drop.");
+    println!("    Read it (state it precisely): the REAL symbol extractor ALONE holds recall@3=83% —");
+    println!("    swapping it in for the hand-modeled sym tags does NOT degrade recall (it improves");
+    println!("    recall@1 0→33% and recall@2). The 100%@k2 is real-sym + STILL-hand-modeled pat; the");
+    println!("    one sym-only miss (T-uuid, schema-create) is the pattern-retrieved case, which is");
+    println!("    exactly what increment 2 (the real pat classifier) must recover.");
     println!("╚═══ done ═══");
     let _ = std::fs::remove_dir_all(&dir);
 }
