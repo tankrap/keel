@@ -34,7 +34,7 @@ rl.on("line", async (line) => {
       const ts = await ensureTs().catch(() => null);
       respond({ id, ok: true, result: { lang: "ts", version: "0.2", ts: ts ? ts.version : null } });
     } else if (req.op === "imports") {
-      respond({ id, ok: true, result: { targets: resolveImports(req.dir, req.file) } });
+      respond({ id, ok: true, result: { targets: await resolveImports(req.dir, req.file) } });
     } else if (req.op === "slice") {
       const defs = await doSlice(req.dir, req.file, req.symbol, req.depth ?? 2);
       respond({ id, ok: true, result: { defs } });
@@ -52,19 +52,38 @@ function respond(o) {
   process.stdout.write(JSON.stringify(o) + "\n");
 }
 
-// ── relative imports (cheap edges, no compiler) ──────────────────────────────
+// ── relative imports (quick edges) ───────────────────────────────────────────
+//
+// Specifiers come from the TypeScript scanner (`ts.preProcessFile`), so import-like text inside
+// comments or string literals does NOT produce a false edge — the regex below can't tell those
+// apart and over-matched (bad rdeps → wrong blast radius in a brief). The regex is kept only as a
+// fallback for when the compiler can't be loaded.
 
 const IMPORT_RE =
   /import\s+[^'"]*from\s*['"]([^'"]+)['"]|export\s+[^'"]*from\s*['"]([^'"]+)['"]|require\(\s*['"]([^'"]+)['"]\s*\)|import\s*['"]([^'"]+)['"]/g;
 
-function resolveImports(dir, file) {
+/// Module specifiers imported/required/re-exported by `src`. Uses the TS preprocessor (comment- and
+/// string-aware); on any compiler-load failure, falls back to the cheap regex (may over-match).
+async function importSpecifiers(src) {
+  try {
+    const ts = await ensureTs();
+    return ts.preProcessFile(src, /*readImportFiles*/ true, /*detectJavaScriptImports*/ true)
+      .importedFiles.map((f) => f.fileName);
+  } catch {
+    const out = [];
+    IMPORT_RE.lastIndex = 0;
+    let m;
+    while ((m = IMPORT_RE.exec(src)) !== null) out.push(m[1] || m[2] || m[3] || m[4]);
+    return out.filter(Boolean);
+  }
+}
+
+async function resolveImports(dir, file) {
   const src = fs.readFileSync(path.join(dir, file), "utf8");
   const out = [];
   const seen = new Set();
-  let m;
-  while ((m = IMPORT_RE.exec(src)) !== null) {
-    const spec = m[1] || m[2] || m[3] || m[4];
-    if (!spec || !spec.startsWith(".")) continue;
+  for (const spec of await importSpecifiers(src)) {
+    if (!spec || !spec.startsWith(".")) continue; // relative only; bare/external specifiers omitted
     const resolved = resolveRelative(dir, file, spec);
     if (resolved && !seen.has(resolved)) {
       seen.add(resolved);
