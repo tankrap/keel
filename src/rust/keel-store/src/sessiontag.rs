@@ -17,6 +17,11 @@ use std::collections::BTreeSet;
 /// **changed** lines are scanned (added/removed on a modify; the whole file on add/delete), so the
 /// set reflects what the session actually worked on, not the ambient file. Tokens are lowercased and
 /// filtered to salient identifiers (drops language keywords, common noise, and short tokens).
+///
+/// Known recall gaps (empty set), acceptable for a coarse, recall-oriented extractor: a mode-only
+/// change (`chmod +x` — same bytes, no changed lines), a binary-only change (skipped), and a change
+/// whose only changed tokens are stopwords/short. Rename (delete+add) and pure deletion DO produce
+/// tags (both sides / the parent content are mined).
 pub fn changed_symbols(repo: &Repo, change: ObjectId) -> Result<BTreeSet<String>> {
     let c = repo.change(change)?.ok_or(StoreError::Corrupt(change))?;
     let parent = c.parents.first().copied();
