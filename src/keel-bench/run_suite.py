@@ -25,6 +25,8 @@ HERE = pathlib.Path(__file__).resolve().parent
 CONFIG_PATH = HERE / "bench-config.json"
 sys.path.insert(0, str(HERE))  # so `import flywheel_bench` / `corpus_bench` resolve
 
+import bench_manifest  # noqa: E402  (after sys.path insert so it resolves)
+
 
 def load_config():
     return json.loads(CONFIG_PATH.read_text())
@@ -77,11 +79,20 @@ def dry_run(cfg):
         else:
             print(f"  ✓ {b['id']:<20} ({b['module']}): {b['scenarios']} scenarios × arity {b['scenario_arity']} OK")
     print()
-    if ok:
-        print(f"dry-run PASS — {len(cfg['benchmarks'])} harness(es) import and parse cleanly.")
-        return 0
-    print("dry-run FAIL — see problems above.")
-    return 1
+    if not ok:
+        print("dry-run FAIL — see problems above.")
+        return 1
+    # Reproducibility: the manifest must be deterministic (identical inputs → identical SHA). Build it
+    # twice and confirm, so `--dry-run` verifies the suite is verifiable for free (no API).
+    m1 = bench_manifest.build_manifest(cfg)
+    m2 = bench_manifest.build_manifest(cfg)
+    if m1 != m2:
+        print("dry-run FAIL — reproducibility manifest is non-deterministic.")
+        return 1
+    print(f"dry-run PASS — {len(cfg['benchmarks'])} harness(es) import and parse cleanly.")
+    print(f"reproducibility manifest: {m1['manifest_sha256']}")
+    print("  (stable SHA over every pinned scenario table + the result-affecting config)")
+    return 0
 
 
 def markdown_report(cfg, summaries):
@@ -93,6 +104,7 @@ def markdown_report(cfg, summaries):
            f"- generated: {ts}",
            f"- solver: `{cfg['models']['solver']}` · judge: `{cfg['models']['judge']}`",
            f"- trials: {cfg['run']['trials']} · workers: {cfg['run']['workers']} · Wilson z: {cfg['run']['wilson_z']}",
+           f"- reproducibility manifest: `{bench_manifest.build_manifest(cfg)['manifest_sha256']}`",
            ""]
     for s in summaries:
         b = ref.get(s["id"], {})
@@ -136,6 +148,9 @@ def full_run(cfg, only=None):
         "generated_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
         "models": cfg["models"],
         "run": cfg["run"],
+        # Pin the exact inputs this result was produced from: anyone can recompute the manifest and
+        # confirm a later run used byte-identical scenarios + config (reproducibility).
+        "manifest": bench_manifest.build_manifest(cfg),
         "benchmarks": summaries,
     }
     json_path = HERE / "bench-report.json"
@@ -150,10 +165,15 @@ def main():
     ap = argparse.ArgumentParser(description="keel flywheel benchmark suite runner")
     ap.add_argument("--dry-run", action="store_true",
                     help="import harnesses + validate scenario tables; make NO API calls")
+    ap.add_argument("--manifest", action="store_true",
+                    help="print the reproducibility manifest (SHA over pinned inputs); make NO API calls")
     ap.add_argument("--only", metavar="ID", help="run a single benchmark by its config id")
     args = ap.parse_args()
 
     cfg = load_config()
+    if args.manifest:
+        print(json.dumps(bench_manifest.build_manifest(cfg), indent=2))
+        return 0
     if args.dry_run:
         return dry_run(cfg)
     return full_run(cfg, only=args.only)
