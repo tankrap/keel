@@ -13,11 +13,13 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-/// How long a reservation lives without renewal before it's considered abandoned and swept. Agents
-/// renew implicitly every time they re-fetch a brief (`reserve`) or explicitly via `renew`, so an
-/// actively-worked hold never expires; a crashed or wandered-off agent's holds free themselves after
-/// this, instead of blocking others forever as stale conflicts.
-const DEFAULT_TTL: Duration = Duration::from_secs(300);
+/// How long a reservation lives without a heartbeat before it's considered abandoned and swept. The
+/// brief service calls [`Coordinator::heartbeat`] on every fetch, so an actively-working agent (which
+/// keeps fetching briefs) never loses a hold; a crashed or wandered-off agent stops heartbeating and
+/// its holds free themselves after this, instead of blocking others forever as stale conflicts. Ten
+/// minutes is far longer than the gap between an active agent's brief fetches, so false expiry of a
+/// live hold doesn't happen in practice.
+const DEFAULT_TTL: Duration = Duration::from_secs(600);
 
 /// A file wanted by the caller but currently held by another agent.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -101,17 +103,17 @@ impl Coordinator {
         conflicts
     }
 
-    /// Heartbeat: refresh the TTL on `files` still held by `agent`, without taking new ones — for a
-    /// long task that keeps working without re-fetching a brief. Files it no longer holds are ignored.
-    pub fn renew(&self, agent: &str, files: &[String]) {
+    /// Heartbeat: refresh the TTL on **every** file `agent` still holds. The brief service calls this
+    /// on each fetch — an agent that's actively working keeps fetching briefs, so all of its holds
+    /// stay alive; only one that has crashed or gone idle stops heartbeating and ages out. This is
+    /// what keeps the TTL from reclaiming a live reservation whose file just isn't being re-briefed.
+    pub fn heartbeat(&self, agent: &str) {
         let mut reg = self.inner.lock().unwrap();
         sweep(&mut reg, self.ttl);
         let now = Instant::now();
-        for f in files {
-            if let Some(r) = reg.held.get_mut(f) {
-                if r.agent == agent {
-                    r.at = now;
-                }
+        for r in reg.held.values_mut() {
+            if r.agent == agent {
+                r.at = now;
             }
         }
     }
@@ -263,20 +265,21 @@ mod tests {
 
     #[test]
     fn abandoned_reservations_expire_but_a_heartbeat_keeps_them() {
-        let ttl = Duration::from_millis(100);
-        let c = Coordinator::new().with_ttl(ttl);
-        c.reserve("alice", "t", &files(&["a.ts"]));
+        // Generous margins (≥250ms against a 400ms ttl) so scheduler jitter on a loaded runner can't
+        // flip an assertion — thread::sleep only guarantees a lower bound, so overshoot is the risk.
+        let c = Coordinator::new().with_ttl(Duration::from_millis(400));
+        c.reserve("alice", "t", &files(&["a.ts", "b.ts"]));
         assert_eq!(c.peek("bob", &files(&["a.ts"])).len(), 1, "held right after reserve");
 
-        // renew before expiry keeps it alive past the original TTL window
-        std::thread::sleep(Duration::from_millis(60));
-        c.renew("alice", &files(&["a.ts"]));
-        std::thread::sleep(Duration::from_millis(60)); // 120ms since reserve, but only 60 since renew
-        assert_eq!(c.peek("bob", &files(&["a.ts"])).len(), 1, "heartbeat kept the hold alive");
+        // a heartbeat well within the ttl refreshes ALL of alice's holds, not just one file
+        std::thread::sleep(Duration::from_millis(150));
+        c.heartbeat("alice");
+        std::thread::sleep(Duration::from_millis(150)); // 300ms since reserve, only 150 since heartbeat
+        assert_eq!(c.peek("bob", &files(&["a.ts", "b.ts"])).len(), 2, "heartbeat kept both holds alive");
 
-        // stop renewing → it's reclaimed, so bob can take it
-        std::thread::sleep(Duration::from_millis(160));
-        assert_eq!(c.held_count(), 0, "abandoned hold swept after ttl");
+        // stop heartbeating → both age out and free up
+        std::thread::sleep(Duration::from_millis(650));
+        assert_eq!(c.held_count(), 0, "abandoned holds swept after ttl");
         assert!(c.reserve("bob", "t2", &files(&["a.ts"])).is_empty(), "bob takes the freed file");
     }
 }
