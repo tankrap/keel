@@ -21,6 +21,7 @@ use std::io::{self, BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc::{self, RecvTimeoutError};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 /// Safety net against a hung/wedged sidecar. A resolver that stops answering must not
@@ -56,6 +57,9 @@ pub struct Sidecar {
     /// Lines pumped off the child's stdout by a background reader thread, so `call` can
     /// wait on them with a timeout — a plain `read_line` on a pipe can't be timed out.
     rx: mpsc::Receiver<io::Result<String>>,
+    /// The sidecar's most recent stderr line, captured by a drain thread. Folded into a crash
+    /// error so "sidecar closed" becomes "sidecar closed: <the node error it printed>".
+    last_stderr: Arc<Mutex<Option<String>>>,
     next_id: u64,
     timeout: Duration,
     /// `None` while healthy. Set when the sidecar becomes unusable; a crash is healed on the
@@ -70,9 +74,39 @@ impl Sidecar {
             .arg(script)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
+            .stderr(Stdio::piped())
             .spawn()?;
         let stdin = child.stdin.take().expect("stdin was piped");
+        // Drain the sidecar's stderr rather than inheriting it (which would silently interleave
+        // node output into the daemon's own stderr). Each line is forwarded, tagged, to our stderr
+        // so it's still visible with context, and the latest is kept for a crash error's `hint`.
+        let last_stderr = Arc::new(Mutex::new(None::<String>));
+        if let Some(stderr) = child.stderr.take() {
+            let slot = Arc::clone(&last_stderr);
+            let tag = script.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            std::thread::spawn(move || {
+                let mut r = BufReader::new(stderr);
+                let mut buf = Vec::new();
+                loop {
+                    buf.clear();
+                    // Read raw bytes, not `read_line`: a non-UTF-8 stderr line would make `read_line`
+                    // return an error, and stopping the drain there could let the child fill the pipe
+                    // buffer and block on `write` → stall its stdout → a wrongful wedge. `read_until`
+                    // + lossy decode never stops on bad bytes; only a true EOF/IO error ends it.
+                    match r.read_until(b'\n', &mut buf) {
+                        Ok(0) | Err(_) => break, // EOF or a real pipe error — child's stderr is done
+                        Ok(_) => {
+                            let line = String::from_utf8_lossy(&buf);
+                            let trimmed = line.trim_end();
+                            if !trimmed.is_empty() {
+                                eprintln!("[keel-resolve sidecar {tag}] {trimmed}");
+                                *slot.lock().unwrap_or_else(|p| p.into_inner()) = Some(trimmed.to_string());
+                            }
+                        }
+                    }
+                }
+            });
+        }
         let mut stdout = BufReader::new(child.stdout.take().expect("stdout was piped"));
         // Pump stdout on a dedicated thread. A blocking `read_line` on a child pipe has
         // no timeout, so the thread converts each line into a channel send that `call`
@@ -99,10 +133,20 @@ impl Sidecar {
             child,
             stdin,
             rx,
+            last_stderr,
             next_id: 0,
             timeout: DEFAULT_TIMEOUT,
             dead: None,
         })
+    }
+
+    /// `: <last stderr line>` if the sidecar printed one, else empty — appended to a crash error so
+    /// the failure carries the node-side reason instead of an opaque "sidecar closed".
+    fn stderr_hint(&self) -> String {
+        match self.last_stderr.lock().unwrap_or_else(|p| p.into_inner()).as_deref() {
+            Some(s) if !s.is_empty() => format!(": {s}"),
+            _ => String::new(),
+        }
     }
 
     /// Override the per-request timeout (default 120s). The daemon can tune this to its
@@ -172,7 +216,10 @@ impl Sidecar {
             }
             Err(RecvTimeoutError::Disconnected) => {
                 self.kill_dead(DeadKind::Crashed); // reader thread ended = child closed stdout
-                return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "resolver sidecar closed"));
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    format!("resolver sidecar closed{}", self.stderr_hint()),
+                ));
             }
         };
         let v: Value = serde_json::from_str(resp.trim())

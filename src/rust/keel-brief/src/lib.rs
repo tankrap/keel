@@ -278,8 +278,9 @@ impl BriefService {
         let predicted = self.coord.predict(&self.agent, &working_set);
 
         // history of the target, newest first; verification prefers the post-hoc side-table
-        // (CI result) over the change's committed state.
-        let touching = self.repo.history_touching(file).map_err(to_io)?;
+        // (CI result) over the change's committed state. Only the newest few are used below
+        // (verification = first; provenance = first 5), so cap the walk instead of scanning all history.
+        let touching = self.repo.history_touching_limited(file, 5).map_err(to_io)?;
         let verify_of = |id: &ObjectId, baked: Verification| -> Verification {
             match self.repo.store().verification(id) {
                 Ok(Verification::Unverified) => baked, // nothing recorded → fall back to committed

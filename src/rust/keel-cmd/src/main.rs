@@ -1089,7 +1089,7 @@ fn cmd_why(args: &[String]) -> io::Result<()> {
     let repo = Repo::open(&store).map_err(to_io)?;
 
     let mut recs: Vec<Value> = Vec::new();
-    for (cid, c) in repo.history_touching(&path).map_err(to_io)?.iter().take(limit) {
+    for (cid, c) in repo.history_touching_limited(&path, limit).map_err(to_io)?.iter() {
         // Authoritative verification is the side-table (set by `keel verify`), not the change's
         // commit-time field which stays Unverified.
         let verif = match repo.store().verification(cid).map_err(to_io)? {
