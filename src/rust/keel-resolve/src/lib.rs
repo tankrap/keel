@@ -467,6 +467,43 @@ mod tests {
     }
 
     #[test]
+    fn imports_ignore_comments_and_strings() {
+        // The TS scanner (preProcessFile) must not treat import-like text in comments or string
+        // literals as edges — the old regex did, producing false deps/rdeps. `ghost.ts` exists on
+        // disk, so the ONLY reason it's excluded is comment/string awareness, not a resolve miss.
+        let mut sc = match Sidecar::spawn(&script()) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("skipping resolver test: node not available ({e})");
+                return;
+            }
+        };
+        // The fix is comment/string-awareness from the TS scanner; without TS installed the sidecar
+        // takes the regex fallback (which over-matches by design), so skip rather than fail there.
+        if sc.health().unwrap().get("ts").map(|v| v.is_null()).unwrap_or(true) {
+            eprintln!("skipping import-edges test: typescript not installed in sidecar");
+            return;
+        }
+        let dir = tmp();
+        fs::write(dir.join("real.ts"), "export const r = 1;\n").unwrap();
+        fs::write(dir.join("ghost.ts"), "export const g = 2;\n").unwrap();
+        let src = "import { r } from \"./real\";\n\
+                   // import { g } from \"./ghost\";\n\
+                   /* import { g } from \"./ghost\"; */\n\
+                   const s = \"import x from './ghost'\";\n\
+                   const t = `require(\"./ghost\")`;\n";
+        fs::write(dir.join("a.ts"), src).unwrap();
+
+        let targets = sc.imports(&dir, "a.ts").unwrap();
+        assert!(targets.iter().any(|t| t == "real.ts"), "real import resolved; got {targets:?}");
+        assert!(
+            !targets.iter().any(|t| t == "ghost.ts"),
+            "no false edge from a commented-out or stringified import; got {targets:?}"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn slice_resolves_cross_file_through_reexport() {
         let mut sc = match Sidecar::spawn(&script()) {
             Ok(s) => s,
