@@ -576,8 +576,10 @@ fn cmd_mirror_in(args: &[String]) -> io::Result<()> {
 }
 
 /// `keel reindex` — rebuild keel's native fused-graph history (Change/Tree DAG) from the git
-/// objects already in the mirror. Run after commits made through the git surface so `keel brief`
-/// / `keel native log` / provenance see them.
+/// objects already in the mirror, then (re)build the session-retrieval index (sym + pat tags) over
+/// that history. Run after commits made through the git surface so `keel brief` / `keel native log` /
+/// provenance see them; also the backfill for a repo whose changes predate the retrieval index
+/// (new keel-native commits self-index at commit time).
 fn cmd_reindex(args: &[String]) -> io::Result<()> {
     let (_, store_path) = root_store(args)?;
     let store = keel_store::store::Store::open(&store_path).map_err(to_io)?;
@@ -588,7 +590,9 @@ fn cmd_reindex(args: &[String]) -> io::Result<()> {
         }
     }
     let b = keel_git::bridge::bridge(&store)?;
-    println!("keel graph reindexed: {} changes, {} trees", b.commits, b.trees);
+    let repo = Repo::open(&store_path).map_err(to_io)?;
+    let tagged = keel_store::sessiontag::reindex_all(&repo).map_err(to_io)?;
+    println!("keel reindexed: {} changes, {} trees, {} session-tag entries", b.commits, b.trees, tagged);
     Ok(())
 }
 
