@@ -353,7 +353,7 @@ fn cmd_capture(args: &[String]) -> io::Result<()> {
         .iter()
         .find(|a| !a.starts_with('-'))
         .cloned()
-        .ok_or_else(|| io::Error::other("usage: keel capture <session-log> [--tool claude|aider] [--commit] (a Claude Code .jsonl or Aider chat history)"))?;
+        .ok_or_else(|| io::Error::other("usage: keel capture <session-log> [--tool claude|aider] [--commit] [--no-scrub] (a Claude Code .jsonl or Aider chat history; secrets are scrubbed before storage unless --no-scrub)"))?;
     let text = std::fs::read_to_string(&log)?;
     let tool = match flag(args, "--tool").unwrap_or("auto") {
         "auto" => detect_tool(&log, &text),
@@ -371,6 +371,10 @@ fn cmd_capture(args: &[String]) -> io::Result<()> {
     if let Some(l) = flag(args, "--lesson") {
         universal["lesson"] = json!(l);
     }
+    // Capture-time secret scrubbing BEFORE anything is written or content-addressed (NEW-1088). On by
+    // default because a transcript/tool-output can carry live credentials and the store is immutable;
+    // `--no-scrub` opts out for a fully private/local store.
+    let redacted = if has(args, "--no-scrub") { 0 } else { scrub_value(&mut universal) };
     let task = universal.get("task").and_then(Value::as_str).unwrap_or("(captured session)").to_string();
 
     // Emit the universal JSON to a file if asked (feeds `keel commit --session <file>`).
@@ -390,9 +394,10 @@ fn cmd_capture(args: &[String]) -> io::Result<()> {
             repo.store().set_lesson(&cid, &task, lesson).map_err(to_io)?;
         }
         if has(args, "--json") {
-            println!("{}", render_json(&json!({ "ok": true, "change": cid.to_hex(), "session": sid.to_hex(), "tool": tool })));
+            println!("{}", render_json(&json!({ "ok": true, "change": cid.to_hex(), "session": sid.to_hex(), "tool": tool, "redacted": redacted })));
         } else {
-            println!("captured {} session → change {} (session {})", tool, short(&cid.to_hex()), short(&sid.to_hex()));
+            let note = if redacted > 0 { format!(" · redacted {redacted} secret(s)") } else { String::new() };
+            println!("captured {} session → change {} (session {}){}", tool, short(&cid.to_hex()), short(&sid.to_hex()), note);
         }
         return Ok(());
     }
@@ -403,16 +408,19 @@ fn cmd_capture(args: &[String]) -> io::Result<()> {
         "task": universal.get("task"), "model": universal.get("model"),
         "tokens_in": universal.get("tokens_in"), "tokens_out": universal.get("tokens_out"),
         "tool_calls": universal.get("tool_calls").and_then(Value::as_array).map(|a| a.len()).unwrap_or(0),
+        "redacted": redacted,
     });
     if has(args, "--json") {
         println!("{}", render_json(&summary));
     } else {
+        let note = if redacted > 0 { format!(" · redacted {redacted} secret(s)") } else { String::new() };
         println!(
-            "captured {} session: task={:?} model={} tools={} (add --commit to record it, or -o file.json)",
+            "captured {} session: task={:?} model={} tools={}{} (add --commit to record it, or -o file.json)",
             tool,
             universal.get("task").and_then(Value::as_str).unwrap_or(""),
             universal.get("model").and_then(Value::as_str).unwrap_or("?"),
             universal.get("tool_calls").and_then(Value::as_array).map(|a| a.len()).unwrap_or(0),
+            note,
         );
     }
     Ok(())
@@ -510,6 +518,154 @@ fn truncate_task(t: &str) -> String {
         format!("{}…", first.chars().take(199).collect::<String>())
     } else {
         first.to_string()
+    }
+}
+
+// ── capture-time secret scrubbing (NEW-1088) ──────────────────────────────────────────────────
+// A captured transcript + its tool OUTPUTS can carry live credentials, and once a session is
+// content-addressed into the immutable store the bytes cannot be pulled back out. So we redact
+// well-known secret shapes BEFORE anything is `put()`. High precision on purpose: agent transcripts
+// are full of git/BLAKE3 hashes and `token = getToken()` code, so we match only distinctive,
+// prefixed credentials + PEM blocks + JWTs — shapes that don't collide with hex hashes or
+// identifiers. Un-prefixed high-entropy secrets (e.g. a bare AWS secret) and PII are a documented
+// follow-on; over-redaction would corrupt the very code the flywheel retrieves.
+
+/// A byte that can appear in a token body (the credential charset). `-`/`_` included so a full token
+/// is consumed as one unit.
+fn is_tok(c: u8) -> bool {
+    c.is_ascii_alphanumeric() || c == b'-' || c == b'_'
+}
+
+/// Length of the run of token bytes starting at `i`.
+fn tok_run(b: &[u8], i: usize) -> usize {
+    let mut j = i;
+    while j < b.len() && is_tok(b[j]) {
+        j += 1;
+    }
+    j - i
+}
+
+/// Try to match a known credential shape at `b[i..]` (caller guarantees a token boundary before `i`).
+/// Returns `(matched_len, placeholder)` on a hit. Each prefixed matcher consumes the whole trailing
+/// token run and requires a minimum body length so short lookalikes (`sk-spinner`) don't match.
+fn match_secret_at(b: &[u8], i: usize) -> Option<(usize, &'static str)> {
+    let starts = |p: &[u8]| b[i..].starts_with(p);
+    // (prefix, min body length after the prefix)
+    const PREFIXED: &[(&[u8], usize)] = &[
+        (b"sk-", 20),           // OpenAI / Anthropic (sk-ant-…, sk-proj-…) — all share sk-
+        (b"ghp_", 36), (b"gho_", 36), (b"ghu_", 36), (b"ghs_", 36), (b"ghr_", 36), // GitHub tokens
+        (b"github_pat_", 20),   // GitHub fine-grained PAT
+        (b"glpat-", 20),        // GitLab PAT
+        (b"AIza", 35),          // Google API key
+        (b"xoxb-", 10), (b"xoxa-", 10), (b"xoxp-", 10), (b"xoxr-", 10), (b"xoxs-", 10), // Slack
+    ];
+    for (prefix, min_body) in PREFIXED {
+        if starts(prefix) {
+            let body = tok_run(b, i + prefix.len());
+            if body >= *min_body {
+                return Some((prefix.len() + body, "[REDACTED-SECRET]"));
+            }
+        }
+    }
+    // AWS access-key IDs: AKIA/ASIA + exactly 16 uppercase-alnum, ending at a boundary.
+    for prefix in [b"AKIA".as_slice(), b"ASIA".as_slice()] {
+        if starts(prefix) {
+            let s = i + prefix.len();
+            let run = tok_run(b, s);
+            let all_upper = b[s..s + run].iter().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit());
+            if run == 16 && all_upper {
+                return Some((prefix.len() + 16, "[REDACTED-SECRET]"));
+            }
+        }
+    }
+    // JWT: three base64url segments (header starts `eyJ`) joined by dots.
+    if starts(b"eyJ") {
+        let s1 = tok_run(b, i);
+        if s1 >= 12 && b.get(i + s1) == Some(&b'.') {
+            let s2 = tok_run(b, i + s1 + 1);
+            if s2 >= 8 && b.get(i + s1 + 1 + s2) == Some(&b'.') {
+                let s3 = tok_run(b, i + s1 + 1 + s2 + 1);
+                if s3 >= 8 {
+                    return Some((s1 + 1 + s2 + 1 + s3, "[REDACTED-JWT]"));
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Redact PEM private-key blocks (`-----BEGIN … PRIVATE KEY-----` … `-----END … PRIVATE KEY-----`).
+/// Returns the byte length of the whole block at `i` if one starts there.
+fn match_pem_at(b: &[u8], i: usize) -> Option<usize> {
+    const OPEN: &[u8] = b"-----BEGIN ";
+    if !b[i..].starts_with(OPEN) {
+        return None;
+    }
+    // the opening line must be a PRIVATE KEY header
+    let line_end = b[i..].iter().position(|&c| c == b'\n').map(|p| i + p)?;
+    if !b[i..line_end].windows(11).any(|w| w == b"PRIVATE KEY") {
+        return None;
+    }
+    // find the matching END line and consume through its trailing dashes/newline
+    let rest = &b[line_end..];
+    let end_rel = rest.windows(9).position(|w| w == b"-----END ")? + line_end;
+    let after = b[end_rel..].iter().position(|&c| c == b'\n').map(|p| end_rel + p + 1);
+    // if the END line has no trailing newline, run to the end of the last dash run
+    let end = after.unwrap_or_else(|| {
+        let dashes = b[end_rel..].iter().position(|&c| c != b'-' && !c.is_ascii_alphanumeric() && c != b' ');
+        dashes.map(|p| end_rel + p).unwrap_or(b.len())
+    });
+    Some(end - i)
+}
+
+/// Redact well-known secret shapes in `text`. Returns the scrubbed copy and the number of redactions.
+/// Precise by design (see the module note above) — it will not touch hashes, identifiers, or prose.
+fn scrub_secrets(text: &str) -> (String, usize) {
+    let b = text.as_bytes();
+    let n = b.len();
+    let mut out = String::with_capacity(n);
+    let mut i = 0;
+    let mut count = 0usize;
+    while i < n {
+        if let Some(len) = match_pem_at(b, i) {
+            out.push_str("[REDACTED-PRIVATE-KEY]");
+            i += len;
+            count += 1;
+            continue;
+        }
+        // token matchers require a boundary before `i` so we redact whole tokens, not word suffixes
+        let boundary = i == 0 || !is_tok(b[i - 1]);
+        if boundary {
+            if let Some((len, placeholder)) = match_secret_at(b, i) {
+                out.push_str(placeholder);
+                i += len;
+                count += 1;
+                continue;
+            }
+        }
+        // copy one UTF-8 scalar verbatim (matchers above are ASCII-only, so this is safe)
+        let ch = text[i..].chars().next().unwrap();
+        let clen = ch.len_utf8();
+        out.push_str(&text[i..i + clen]);
+        i += clen;
+    }
+    (out, count)
+}
+
+/// Recursively scrub every string in a captured-session JSON value, in place. Returns the total
+/// number of redactions across all fields, so `keel capture` can report that scrubbing happened.
+fn scrub_value(v: &mut Value) -> usize {
+    match v {
+        Value::String(s) => {
+            let (scrubbed, n) = scrub_secrets(s);
+            if n > 0 {
+                *s = scrubbed;
+            }
+            n
+        }
+        Value::Array(a) => a.iter_mut().map(scrub_value).sum(),
+        Value::Object(o) => o.iter_mut().map(|(_, val)| scrub_value(val)).sum(),
+        _ => 0,
     }
 }
 
@@ -2169,6 +2325,87 @@ mod tests {
         assert_eq!(decode_chunked(raw), None);
         // usize::MAX itself, and a value one below, both exercise the checked_add / end+2 guards.
         assert_eq!(decode_chunked(b"ffffffffffffffff\r\nx"), None);
+    }
+
+    // Build credential fixtures at RUNTIME from split parts so no full-credential literal ever lives
+    // in the committed source — otherwise GitHub push-protection (correctly!) rejects the test data.
+    // Each half is inert on its own; only the concatenation matches a secret shape, which is exactly
+    // what the scrubber operates on.
+    #[test]
+    fn scrub_redacts_known_credential_shapes() {
+        let secrets = [
+            format!("sk-ant-{}", "api03-abcDEF1234567890abcDEF1234567890xyz"), // Anthropic
+            format!("sk-proj-{}", "abcDEF1234567890abcDEF1234567890"),         // OpenAI project key
+            format!("ghp_{}", "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789ab"),        // GitHub token
+            format!("github_pat_{}", "11ABCDEF0123456789_abcDEFghiJKL"),        // GitHub fine-grained PAT
+            format!("glpat-{}", "ABCDEF0123456789xyzw"),                        // GitLab PAT
+            format!("AKIA{}", "IOSFODNN7EXAMPLE"),                              // AWS access key id
+            format!("AIza{}", "SyD-ABCDEFGHIJKLMNOPQRSTUVWXYZ012345"),          // Google API key
+            format!("xoxb-{}", "1234567890-ABCDEFabcdef"),                      // Slack bot token
+        ];
+        for s in &secrets {
+            let (out, n) = scrub_secrets(&format!("key = {s} end"));
+            assert_eq!(n, 1, "expected exactly one redaction for {s:?} → {out:?}");
+            assert!(!out.contains(s.as_str()), "secret leaked through: {out:?}");
+            assert!(out.contains("[REDACTED"), "no marker for {s:?}: {out:?}");
+            assert!(out.starts_with("key = ") && out.ends_with(" end"), "surrounding text mangled: {out:?}");
+        }
+    }
+
+    #[test]
+    fn scrub_redacts_jwt_and_pem_but_preserves_context() {
+        // assembled at runtime (see note above); each segment is inert alone
+        let jwt = format!("{}.{}.{}", "eyJhbGciOiJIUzI1NiJ9", "eyJzdWIiOiIxMjM0NTY3ODkwIn0",
+                          "SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJVadQssw5c");
+        let (out, n) = scrub_secrets(&format!("Authorization: Bearer {jwt}"));
+        assert_eq!(n, 1);
+        assert!(out.contains("[REDACTED-JWT]") && !out.contains(&jwt));
+        assert!(out.starts_with("Authorization: Bearer "));
+
+        let k = "PRIVATE KEY";
+        let pem = format!("-----BEGIN RSA {k}-----\nMIIEpAIBAAKCAQEA\nfakefakefake\n-----END RSA {k}-----\n");
+        let (out2, n2) = scrub_secrets(&format!("here it is:\n{pem}done"));
+        assert_eq!(n2, 1);
+        assert!(out2.contains("[REDACTED-PRIVATE-KEY]") && !out2.contains("MIIEpAIBAAKCAQEA"));
+        assert!(out2.starts_with("here it is:\n") && out2.ends_with("done"));
+    }
+
+    #[test]
+    fn scrub_does_not_over_redact_hashes_or_code() {
+        // the false-positive cases that make a generic scrubber unusable on agent transcripts:
+        // git/BLAKE3 hashes, code assignments, model ids, and prose must all pass through untouched.
+        let safe = [
+            "commit cef17d88a6bfe55852dbb49f474f6330558f64a8",       // 40-hex git sha
+            "blob c2c5fa841aadc9356dbfbe96640333451f6f9554adad8a95814cdfe05b5f335c", // 64-hex BLAKE3
+            "let token = getToken(); const secret = readSecret();",  // code assignments
+            "solver claude-opus-4-8, judge claude-sonnet-5",         // model ids
+            "the password is stored in the vault, ask the admin",    // prose containing 'password'
+            "function helper(x: number): number { return x * 2; }",  // ordinary code
+            "sk-spinner and xox-menu are CSS classes",               // short prefix lookalikes
+        ];
+        for s in safe {
+            let (out, n) = scrub_secrets(s);
+            assert_eq!(n, 0, "false positive on {s:?} → {out:?}");
+            assert_eq!(out, s, "text changed with no redaction: {out:?}");
+        }
+    }
+
+    #[test]
+    fn scrub_value_recurses_and_counts() {
+        let gh = format!("ghp_{}", "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789ab");
+        let aws = format!("AKIA{}", "IOSFODNN7EXAMPLE");
+        let anth = format!("sk-ant-{}", "api03-abcDEF1234567890abcDEF1234567890xyz");
+        let mut v = json!({
+            "task": format!("deploy with {gh}"),
+            "tokens_in": 42,
+            "tool_results": ["clean output", format!("leaked {aws} here")],
+            "nested": { "prompts": anth }
+        });
+        let n = scrub_value(&mut v);
+        assert_eq!(n, 3, "expected 3 redactions across nested fields");
+        let dump = serde_json::to_string(&v).unwrap();
+        assert!(!dump.contains("ghp_") && !dump.contains("AKIA") && !dump.contains("sk-ant-"));
+        assert_eq!(v["tokens_in"], json!(42), "non-string fields untouched");
     }
 
     #[test]
