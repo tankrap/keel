@@ -90,6 +90,14 @@ KV=$("$KEEL" native version 2>/dev/null)
 KVOK=$(print -r -- "$KV" | python3 -c "import sys,json;d=json.load(sys.stdin);print(int(bool(d.get('version')) and isinstance(d.get('dirty'),bool) and 'git_commit' in d))" 2>/dev/null)
 if [ "${KVOK:-0}" = "1" ]; then pass "keel native version ok ($(print -r -- "$KV" | python3 -c "import sys,json;d=json.load(sys.stdin);print(d['version'],(d.get('git_commit_short') or 'no-commit'))" 2>/dev/null))"; else fail "keel native version invalid"; fi
 
+section "capture — secrets are scrubbed before content-addressing (NEW-1088)"
+# assemble a fake credential at runtime so this script itself carries no secret literal
+FAKE="ghp_""ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789ab"
+printf '{"task":"ci","prompts":"ran with %s here","tool_results":["out %s"]}\n' "$FAKE" "$FAKE" > "$TMP/sess.json"
+"$KEEL" native commit --session "$TMP/sess.json" --root "$TMP/repo" -m "ci session" >/dev/null 2>&1
+LEAKS=$(grep -rl "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789ab" "$TMP/repo/.keel" 2>/dev/null | wc -l | tr -d ' ')
+if [ "${LEAKS:-1}" = "0" ]; then pass "commit --session scrubbed the token (0 raw occurrences in store)"; else fail "secret leaked into store ($LEAKS file(s))"; fi
+
 section "benchmark suite — reproducibility manifest + compare + dry-run (no API)"
 BENCH=~/keel/src/keel-bench
 if python3 "$BENCH/test_manifest.py" >/dev/null 2>&1 && python3 "$BENCH/test_compare.py" >/dev/null 2>&1 \
