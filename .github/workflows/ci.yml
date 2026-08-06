@@ -26,11 +26,17 @@ jobs:
         with:
           components: clippy, rustfmt
 
-      # Some keel-resolve / keel-graph paths shell out to the Node resolver sidecar.
+      # Some keel-resolve / keel-graph tests shell out to the Node resolver sidecar, which needs the
+      # TypeScript compiler (and tree-sitter grammars) present — node_modules is gitignored, so CI
+      # installs them from the committed lockfile. --legacy-peer-deps: tree-sitter-c and the newer
+      # grammars declare conflicting (peerOptional) tree-sitter ranges, which strict `npm ci` rejects.
       - name: Install Node (resolver sidecar)
         uses: actions/setup-node@v4
         with:
           node-version: '20'
+      - name: Install resolver sidecar deps
+        working-directory: src/rust/keel-resolve/sidecar
+        run: npm ci --legacy-peer-deps
 
       - name: Cache cargo + target
         uses: Swatinem/rust-cache@v2
