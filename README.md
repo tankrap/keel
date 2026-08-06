@@ -1,14 +1,44 @@
 # keel
 
-keel is version control for AI-written code. It is git-compatible, so a plain `git push` to a keel repo lands as a normal keel commit, and clone, fetch, pull, and push all work unchanged.
+**Version control built for AI-written code — git-compatible, session-aware.**
 
-git records what changed: a commit, a message, and a diff, and leaves the rest for you to reconstruct. keel records the work session that produced the change, and keeps git underneath as the compatibility layer.
+[![CI](https://github.com/tankrap/keel/actions/workflows/ci.yml/badge.svg)](https://github.com/tankrap/keel/actions/workflows/ci.yml)
+[![License: MPL 2.0](https://img.shields.io/badge/License-MPL_2.0-blue.svg)](LICENSE)
+![Built with Rust](https://img.shields.io/badge/built_with-Rust-orange.svg)
 
-The difference shows up on read. git hands you a diff. keel answers a different question, what an agent needs to do the next task, and returns it in one fetch: the relevant code, the dependency graph, a record of who wrote what, and the lessons earlier sessions learned in this repo. git leaves you to assemble that from diff, blame, and log.
+keel is git-compatible: `clone`, `fetch`, `pull`, and `push` all work unchanged, and a plain `git push` to a keel repo lands as a native keel commit. Underneath that compatible surface, keel records the **work session** that produced each change — the task, the model, the tools it ran, what it verified — so context, memory, review, and coordination become first-class objects instead of things you reconstruct from a diff.
+
+The difference shows up on read. git hands you a diff. keel answers a different question — *what an agent needs to do the next task* — and returns it in one fetch: the relevant code, the dependency graph, a record of who wrote what, and the lessons earlier sessions learned in this repo. git leaves you to assemble that from diff, blame, and log.
+
+## Quickstart
+
+```bash
+# build the keel + keeld binaries
+cd src/rust && cargo build --release       # → target/release/{keel,keeld}
+
+# a keel repo IS a git repo — every git command you know still works
+keel clone <url>                           # or: keel init
+keel add -A && keel commit -m "…"
+
+# the value-add: one fetch with everything an agent needs for a task —
+# the relevant code slice, deps/blast-radius, who touched it, and prior lessons
+keel brief --file src/server.rs --symbol handle_request
+
+# review the work, not the diff — block by block, each citing its proof
+keel walkthrough <change>
+```
+
+## What you get
+
+- **Context in one read** — `keel brief` returns the relevant code slice, dependency graph, provenance, and prior-session lessons in a single fetch (hundreds of tokens), instead of a dozen `blame` / `log` / `grep` calls.
+- **Memory that compounds** — a convention learned in one session is surfaced automatically on the next related task. Measured lift: **64% → 93%** convention-compliance across four languages ([benchmarks](#benchmarks-that-matter)).
+- **Sessions and reviews as history** — how a change was made (task, model, tools, verification) and its review verdict are queryable objects in the repo, not chat logs that vanish when the terminal closes.
+- **Warm and fast** — the `keeld` daemon keeps the index and dependency graph hot, so `keel status` on an 80k-file tree is under 10 ms.
+- **git underneath** — objects are byte-identical to git, so you adopt keel without throwing away history, habits, or tooling.
 
 ## Benchmarks that matter
 
-Everything here is measured on real repositories and reproducible from `src/keel-bench`. Full numbers, with 95% confidence intervals, are in [SUITE-RESULTS.md](src/keel-bench/SUITE-RESULTS.md).
+Everything here is measured on real repositories and reproducible. The convention-following numbers come from the live-LLM suite in `src/keel-bench` (full numbers, with 95% confidence intervals, in [SUITE-RESULTS.md](src/keel-bench/SUITE-RESULTS.md)); the speed, scale, and robustness numbers come from the free, no-API benchmarks you can run in one command with [`src/rust/run-benches.sh`](src/rust/run-benches.sh).
 
 ### Does it make agents more correct?
 
