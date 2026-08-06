@@ -265,9 +265,17 @@ fn cmd_commit(args: &[String]) -> io::Result<()> {
     // Attach an agent session: --session <file.json> captures a full session (transcript,
     // tool calls/results, tokens, lesson, verification); --lesson is the minimal form. Either
     // way, auto-link the last brief's served context (unless the session file set its own).
+    // Secrets are scrubbed before content-addressing here too (NEW-1088), on by default; --no-scrub
+    // opts out (with a warning) for a fully private/local store.
+    let scrub = if has(args, "--no-scrub") {
+        eprintln!("keel: warning — --no-scrub: storing the session unredacted; any secrets it contains will be permanent in the immutable store");
+        false
+    } else {
+        true
+    };
     let auto_ctx = last_brief_blob(&repo, &root);
     let session_id = if let Some(path) = flag(args, "--session") {
-        let mut s = session_from_file(&repo, path, msg, flag(args, "--lesson"))?;
+        let mut s = session_from_file(&repo, path, msg, flag(args, "--lesson"), scrub)?;
         if s.context_served.is_none() {
             s.context_served = auto_ctx;
         }
@@ -276,7 +284,7 @@ fn cmd_commit(args: &[String]) -> io::Result<()> {
         let s = Session {
             task: msg.to_string(),
             model: "keel".to_string(),
-            lesson: lesson.to_string(),
+            lesson: if scrub { scrub_secrets(lesson).0 } else { lesson.to_string() },
             prompts: None,
             context_served: auto_ctx,
             tool_calls: vec![],
@@ -300,18 +308,22 @@ fn cmd_commit(args: &[String]) -> io::Result<()> {
 /// Session holds their ids. Shape:
 /// `{ task?, model?, lesson?, prompts?, context_served?, tool_calls?[], tool_results?[],
 ///    tokens_in?, tokens_out?, verification?: "green"|"red"|"unverified" }`
-fn session_from_file(repo: &Repo, path: &str, msg: &str, lesson_override: Option<&str>) -> io::Result<Session> {
+fn session_from_file(repo: &Repo, path: &str, msg: &str, lesson_override: Option<&str>, scrub: bool) -> io::Result<Session> {
     let raw = std::fs::read_to_string(path)?;
     let v: Value = serde_json::from_str(&raw).map_err(|e| io::Error::other(format!("session json: {e}")))?;
-    session_from_value(repo, &v, msg, lesson_override)
+    session_from_value(repo, &v, msg, lesson_override, scrub)
 }
 
 /// Build a [`Session`] from an already-parsed universal capture object (see [`session_from_file`]
 /// for the shape). Shared by `commit --session` and the `capture` adapters.
-fn session_from_value(repo: &Repo, v: &Value, msg: &str, lesson_override: Option<&str>) -> io::Result<Session> {
+fn session_from_value(repo: &Repo, v: &Value, msg: &str, lesson_override: Option<&str>, scrub: bool) -> io::Result<Session> {
     let s = |k: &str| v.get(k).and_then(Value::as_str);
+    // The single choke point before any session text is content-addressed: scrub secrets here too
+    // (unless the caller already scrubbed, or --no-scrub), so `keel commit --session <file>` — a
+    // hand-supplied session file — gets the same protection as `keel capture` (NEW-1088).
+    let scrub_txt = |t: &str| -> String { if scrub { scrub_secrets(t).0 } else { t.to_string() } };
     let blob = |text: &str| -> io::Result<ObjectId> {
-        repo.store().put(&Object::Blob(text.as_bytes().to_vec())).map_err(to_io)
+        repo.store().put(&Object::Blob(scrub_txt(text).into_bytes())).map_err(to_io)
     };
     let opt_blob = |k: &str| -> io::Result<Option<ObjectId>> {
         match s(k) {
@@ -331,9 +343,9 @@ fn session_from_value(repo: &Repo, v: &Value, msg: &str, lesson_override: Option
         _ => Verification::Unverified,
     };
     Ok(Session {
-        task: s("task").unwrap_or(msg).to_string(),
+        task: scrub_txt(s("task").unwrap_or(msg)),
         model: s("model").unwrap_or("unknown").to_string(),
-        lesson: lesson_override.or_else(|| s("lesson")).unwrap_or("").to_string(),
+        lesson: scrub_txt(lesson_override.or_else(|| s("lesson")).unwrap_or("")),
         prompts: opt_blob("prompts")?,
         context_served: opt_blob("context_served")?,
         tool_calls: blob_list("tool_calls")?,
@@ -393,7 +405,9 @@ fn cmd_capture(args: &[String]) -> io::Result<()> {
     if has(args, "--commit") {
         let (root, store) = root_store(args)?;
         let repo = Repo::open(&store).map_err(to_io)?;
-        let session = session_from_value(&repo, &universal, &task, lesson.as_deref())?;
+        // scrub=false: cmd_capture already scrubbed `universal` (and the lesson) above, respecting
+        // --no-scrub — don't double-work.
+        let session = session_from_value(&repo, &universal, &task, lesson.as_deref(), false)?;
         let sid = repo.store().put(&Object::Session(session)).map_err(to_io)?;
         let author = flag(args, "--author").unwrap_or("capture");
         let ts = now_secs();
