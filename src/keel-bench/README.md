@@ -61,6 +61,10 @@ python3 run_suite.py
 # Live, one benchmark by id:
 python3 run_suite.py --only corpus-django
 
+# Route the SAME pinned models through OpenRouter instead of the Anthropic API
+# (key at ~/.openrouter). Only the transport changes, so results stay comparable.
+python3 run_suite.py --provider openrouter
+
 # A single harness directly (same pinned defaults):
 python3 flywheel_bench.py          # synthetic
 python3 corpus_bench.py            # vs code
@@ -74,7 +78,11 @@ python3 flywheel_adversarial.py    # adversarial control (standalone)
 
 Prerequisites for a live run:
 
-- An Anthropic key at `~/.claude-token`, read lazily and never printed or logged.
+- An API key, read lazily and never printed or logged. The transport is chosen with `--provider`
+  (or the `BENCH_PROVIDER` env): `anthropic` (default) reads `~/.claude-token` and calls the native
+  Messages API; `openrouter` reads `~/.openrouter` and calls OpenRouter's OpenAI-compatible endpoint,
+  mapping the pinned model ids to their `anthropic/…` OpenRouter slugs. Same models, same scenarios —
+  only the wire transport differs, so a run over either provider stays comparable to the reference.
 - The keel release binary at `~/keel/src/rust/target/release/keel` (override with `KEEL_BIN`), built with `cargo build --release` in `src/rust`.
 - For the real corpora, a checkout of each repo. vs code defaults to `~/keel-vscode-demo`, django to `~/keel-django-demo`, prometheus to `~/keel-go-demo`, tokio to `~/keel-rust-demo`. Point at your own with `CORPUS_SRC`.
 

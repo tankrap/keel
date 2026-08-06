@@ -1,0 +1,75 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# Cancel superseded runs on the same ref.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rust:
+    name: rust · build · test · clippy
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: src/rust
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (stable + clippy + rustfmt)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      # Some keel-resolve / keel-graph paths shell out to the Node resolver sidecar.
+      - name: Install Node (resolver sidecar)
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Cache cargo + target
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src/rust
+
+      # Advisory only: the examples use deliberate compact formatting, so a diff here is informational,
+      # not a failure.
+      - name: rustfmt (advisory)
+        run: cargo fmt --all -- --check || echo "::warning::rustfmt drift (advisory, non-blocking)"
+        continue-on-error: true
+
+      - name: clippy (deny warnings)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: test
+        run: cargo test --workspace
+
+  bench-harness:
+    name: bench harness · self-tests + dry-run
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: src/keel-bench
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      # All free — no API key, no network. Locks the manifest, the compare/equivalence logic, and the
+      # provider (transport) wiring, then imports every harness and validates its scenario table.
+      - name: manifest self-test
+        run: python3 test_manifest.py
+      - name: compare self-test
+        run: python3 test_compare.py
+      - name: provider wiring self-test
+        run: python3 test_provider.py
+      - name: suite dry-run (no API calls)
+        run: python3 run_suite.py --dry-run
