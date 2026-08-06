@@ -627,11 +627,22 @@ fn match_pem_at(b: &[u8], i: usize) -> Option<usize> {
         return None;
     }
     // find the matching END line and consume through its trailing dashes/newline. If the transcript
-    // was TRUNCATED before the END line, redact from BEGIN to EOF rather than leaking the partial key.
+    // was TRUNCATED before the END line, redact the partial key — but BOUND the window (next blank
+    // line, or a max block size) so a transcript that merely *mentions* a BEGIN header with no END
+    // later doesn't swallow everything to EOF. A real key block has no blank line and fits the cap.
     let rest = &b[line_end..];
     let end_rel = match rest.windows(9).position(|w| w == b"-----END ") {
         Some(p) => p + line_end,
-        None => return Some(b.len() - i),
+        None => {
+            const MAX_PEM: usize = 8192; // > any real private key's base64
+            let cap = (i + MAX_PEM).min(b.len());
+            let end = b[line_end..cap]
+                .windows(2)
+                .position(|w| w == b"\n\n")
+                .map(|p| line_end + p + 1)
+                .unwrap_or(cap);
+            return Some(end - i);
+        }
     };
     let after = b[end_rel..].iter().position(|&c| c == b'\n').map(|p| end_rel + p + 1);
     // if the END line has no trailing newline, run to the end of the last dash run
@@ -2399,6 +2410,13 @@ mod tests {
         let (out3, n3) = scrub_secrets(&truncated);
         assert_eq!(n3, 1, "truncated PEM must be redacted: {out3:?}");
         assert!(out3.contains("[REDACTED-PRIVATE-KEY]") && !out3.contains("MIIEpAIBAAKCAQEA"));
+
+        // A transcript that merely MENTIONS a BEGIN header (no END, no key body) must be BOUNDED to
+        // the paragraph, not swallow everything to EOF — the tail after a blank line survives.
+        let mention = format!("PEM files start with -----BEGIN RSA {k}----- then base64.\n\nUnrelated tail kept.");
+        let (out4, _n4) = scrub_secrets(&mention);
+        assert!(out4.contains("[REDACTED-PRIVATE-KEY]"), "the header line is redacted");
+        assert!(out4.contains("Unrelated tail kept."), "content after the blank line is NOT swallowed: {out4:?}");
     }
 
     #[test]
