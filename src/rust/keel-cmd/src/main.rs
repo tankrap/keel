@@ -1704,6 +1704,28 @@ fn first_positional(args: &[String]) -> Option<&str> {
     None
 }
 
+/// All positional arguments in order, skipping flags and the values consumed by value-flags — the
+/// multi-positional companion to [`first_positional`], so `keel vfs --root DIR <change> ls <path>`
+/// yields `[<change>, ls, <path>]`, not `[DIR, <change>, ls, <path>]`.
+fn positionals(args: &[String]) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        let a = args[i].as_str();
+        if VALUE_FLAGS.contains(&a) {
+            i += 2;
+            continue;
+        }
+        if a.starts_with('-') {
+            i += 1;
+            continue;
+        }
+        out.push(a);
+        i += 1;
+    }
+    out
+}
+
 /// Every value that follows a repeated flag (`--label a --label b` → ["a","b"]).
 fn flag_all(args: &[String], name: &str) -> Vec<String> {
     let mut out = Vec::new();
@@ -2158,12 +2180,13 @@ fn render_walkthrough_human(v: &Value) -> String {
 /// fetched (`fetched N tree(s), M blob(s), K byte(s)`) — the evidence that access is lazy rather than
 /// a whole-repo read.
 fn cmd_vfs(args: &[String]) -> io::Result<()> {
-    let pos: Vec<&String> = args.iter().filter(|a| !a.starts_with('-')).collect();
+    let pos = positionals(args);
     let change = pos
         .first()
+        .copied()
         .ok_or_else(|| io::Error::other("usage: keel vfs <change> <ls|stat|cat> <path> [--json]"))?;
-    let op = pos.get(1).map(|s| s.as_str()).unwrap_or("ls");
-    let path = pos.get(2).map(|s| s.as_str()).unwrap_or("");
+    let op = pos.get(1).copied().unwrap_or("ls");
+    let path = pos.get(2).copied().unwrap_or("");
     let json = has(args, "--json");
 
     let (_, store) = root_store(args)?;
@@ -3151,6 +3174,16 @@ mod tests {
         assert_eq!(first_positional(&a(&["--json", "--full", "deadbeef"])), Some("deadbeef"));
         assert_eq!(first_positional(&a(&["--store", "/s", "--json"])), None);
         assert_eq!(first_positional(&a(&[])), None);
+    }
+
+    #[test]
+    fn positionals_skips_value_flag_args_and_keeps_order() {
+        let a = |xs: &[&str]| xs.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        // `keel vfs --root DIR <change> ls <path>` must yield [<change>, ls, <path>], not DIR first —
+        // the bug the walkthrough review caught, here for a three-positional command.
+        assert_eq!(positionals(&a(&["--root", "/repo", "abc", "ls", "src/x"])), ["abc", "ls", "src/x"]);
+        assert_eq!(positionals(&a(&["abc", "cat", "f", "--json"])), ["abc", "cat", "f"]);
+        assert_eq!(positionals(&a(&["--json"])), Vec::<&str>::new());
     }
 
     #[test]
