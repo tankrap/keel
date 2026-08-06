@@ -276,8 +276,13 @@ fn cmd_commit(args: &[String]) -> io::Result<()> {
     };
     let auto_ctx = last_brief_blob(&repo, &root);
     let session_id = if let Some(path) = flag(args, "--session") {
-        let mut s = session_from_file(&repo, path, msg, flag(args, "--lesson"), scrub, erase_key_of(args, author))?;
-        if s.context_served.is_none() {
+        let ek = erase_key_of(args, author);
+        let mut s = session_from_file(&repo, path, msg, flag(args, "--lesson"), scrub, ek)?;
+        // Only auto-attach the served brief to a NON-erasable session: `last_brief_blob` is a plaintext
+        // blob, so attaching it to an erasable commit would bolt on a non-erasable payload that `keel
+        // erase` can't remove (the session file may still set its own context_served, which IS
+        // encrypted). Skip it for erasable commits to keep the erasure guarantee honest.
+        if ek.is_none() && s.context_served.is_none() {
             s.context_served = auto_ctx;
         }
         Some(repo.store().put(&Object::Session(s)).map_err(to_io)?)
@@ -315,9 +320,11 @@ fn session_from_file(repo: &Repo, path: &str, msg: &str, lesson_override: Option
     session_from_value(repo, &v, msg, lesson_override, scrub, erase_key)
 }
 
-/// Resolve the crypto-shred key_id for an erasable capture/commit: `--erase-key <id>` wins; otherwise
-/// `--erasable` uses the author as the key (per-subject erasure — one subject's data erases together).
-/// `None` means store payloads as plaintext blobs (the default; still secret-scrubbed).
+/// Resolve the crypto-shred key_id for an erasable capture/commit. Erasable storage is enabled by
+/// EITHER `--erasable` (keyed by the author — per-subject erasure, one subject's data erases together)
+/// OR an explicit `--erase-key <id>` (which also implies erasable; a constant id = per-repo scope, a
+/// unique id = per-session). `None` means store payloads as plaintext blobs (the default; still
+/// secret-scrubbed).
 fn erase_key_of<'a>(args: &'a [String], author: &'a str) -> Option<&'a str> {
     if let Some(k) = flag(args, "--erase-key") {
         Some(k)
@@ -337,7 +344,14 @@ fn cmd_erase(args: &[String]) -> io::Result<()> {
     let key_id = args
         .iter()
         .find(|a| !a.starts_with('-'))
-        .ok_or_else(|| io::Error::other("usage: keel erase <key-id> (the --erase-key/author an erasable capture used; IRREVERSIBLE)"))?;
+        .ok_or_else(|| io::Error::other("usage: keel erase <key-id> --force (the --erase-key/author an erasable capture used; IRREVERSIBLE)"))?;
+    // Irreversible: a mistyped key_id destroys the wrong subject's data with no undo. Require --force.
+    if !has(args, "--force") {
+        return Err(fail_fix(
+            format!("`keel erase {key_id}` is IRREVERSIBLE — it permanently destroys every payload under this key"),
+            "re-run with --force to confirm",
+        ));
+    }
     let (_, store) = root_store(args)?;
     let repo = Repo::open(&store).map_err(to_io)?;
     let existed = repo.store().has_key(key_id).map_err(to_io)?;
@@ -2176,9 +2190,23 @@ fn cmd_session(args: &[String]) -> io::Result<()> {
     }
     println!("  tokens:    in {} / out {}", s.tokens_in, s.tokens_out);
     println!("  verified:  {:?}", s.verification);
+    // erasure-aware count for the payload vecs: N, or "N (erased)" once every entry's key is shredded.
+    let vec_status = |v: &[keel_store::ObjectId]| -> String {
+        if v.is_empty() {
+            return "0".to_string();
+        }
+        let all_erased = v
+            .iter()
+            .all(|pid| matches!(repo.store().read_secret(pid), Ok(keel_store::SecretState::Shredded)));
+        if all_erased {
+            format!("{} (erased)", v.len())
+        } else {
+            v.len().to_string()
+        }
+    };
     println!("  prompts:   {}", status(&s.prompts));
     println!("  context:   {}", status(&s.context_served));
-    println!("  tool_calls: {}   tool_results: {}", s.tool_calls.len(), s.tool_results.len());
+    println!("  tool_calls: {}   tool_results: {}", vec_status(&s.tool_calls), vec_status(&s.tool_results));
     Ok(())
 }
 
