@@ -168,7 +168,8 @@
       <span class="chip">measured on <b>Apple&nbsp;Silicon</b>, release build</span>
       <span class="chip">repos: <b>linux&nbsp;kernel</b> (94,523 files · 1.6&nbsp;GB · C)</span>
       <span class="chip"><b>VS&nbsp;Code&nbsp;/src</b> (9,358 files · 0.12&nbsp;GB · TS)</span>
-      <span class="chip">2026-07-29</span>
+      <span class="chip">flywheel suite: <b>versioned + manifest-pinned</b></span>
+      <span class="chip">2026-08-06</span>
     </div>
   </div>
 </header>
@@ -477,20 +478,26 @@
       predicts: non-obvious, project-local knowledge a fused brief carries from prior work.
     </div>
     <div class="note-box" style="margin-top:14px; border-left-color: var(--accent)">
-      <b>Real corpora — three languages, no invented rules.</b> To answer <em>"you made those
-      conventions up,"</em> the same test ran on <b>real, documented conventions</b> mined from three
+      <b>Real corpora — four languages, no invented rules.</b> To answer <em>"you made those
+      conventions up,"</em> the same test ran on <b>real, documented conventions</b> mined from four
       codebases, each grounded by its frequency in the actual source — nothing invented.
       <b>VS Code</b> (TypeScript): 16×4 → <b>73% → 94%</b> (+20). <b>Django</b> (Python;
       <code>@cached_property</code> 278, <code>ImproperlyConfigured</code> 230): 12×4 →
       <b>62% → 92%</b> (+29). <b>Prometheus</b> (Go; <code>fmt.Errorf %w</code> 849,
       <code>errors.Is/As</code> 226, <code>ctx context.Context</code> 519): 12×4 →
-      <b>58% → 90%</b> (+31). <b>Pooled across all three (160/condition): 66% → 92%, +26 points</b>;
-      all 60/60 conventions retrieved. A telling pattern: as prior familiarity falls the baseline
-      falls (TS&nbsp;73 &gt; PY&nbsp;62 &gt; Go&nbsp;58) and the <b>lift rises</b>
-      (+20 → +29 → +31) — the entire lift lands on the conventions the model had <b>not</b> memorised
-      (Django <code>gettext_lazy</code> 0→4/4; Go <code>fmt.Errorf %w</code> 0→4/4, <code>ctx</code>
-      first 0→4; VS Code <code>URI.joinPath</code>). Retrieval pays against a model that memorised the
-      target codebases, in <b>three</b> ecosystems — on exactly the knowledge that isn't in the weights.
+      <b>58% → 90%</b> (+31). <b>Tokio</b> (Rust; <code>loom::model</code>, <code>#[track_caller]</code>,
+      in-tree <code>assert_ok!</code>, <code>// SAFETY:</code>): 12×4 → <b>60% → 98%</b> (+38).
+      <b>Pooled across all four (208/condition): 64% → 93%, +29 points</b>; all <b>72/72</b>
+      conventions retrieved. As prior familiarity falls the baseline falls (TS&nbsp;73 &gt; PY&nbsp;62
+      &gt; Go&nbsp;58) and the lift rises (+20 → +29 → +31); <b>Tokio's +38 is the largest</b> not
+      because its baseline is lowest (60%) but because a runtime leans hard on repo-local idioms a
+      general model rarely internalises — its <code>loom</code> concurrency harness, its in-tree
+      assertion macros, its <code>// SAFETY:</code> discipline — exactly the subset retrieval helps,
+      and Rust is the language <b>keel itself is written in</b>. The entire lift lands on conventions
+      the model had <b>not</b> memorised (Django <code>gettext_lazy</code> 0→4/4; Go
+      <code>fmt.Errorf %w</code> 0→4/4; Rust <code>#[track_caller]</code> 0→4, <code>loom::model</code>
+      0→4; VS Code <code>URI.joinPath</code>) — retrieval pays against a model that memorised the target
+      codebases, in <b>four</b> ecosystems, on exactly the knowledge that isn't in the weights.
     </div>
     <div class="note-box" style="margin-top:14px; border-left-color: var(--warn)">
       <b>Adversarial control — is it the rule, or just "more context"?</b> A skeptic could argue the
@@ -501,6 +508,64 @@
       <b>95%</b> · with a <b>wrong</b> rule <b>0%</b>. A wrong retrieved rule gives <b>zero lift —
       identical to no lesson</b>. The gain is entirely the <em>specific</em> retrieved content; the
       prompting-artifact hypothesis is rejected.
+    </div>
+  </div>
+</section>
+
+<section id="repro">
+  <div class="wrap">
+    <div class="eyebrow">Reproducibility · the numbers are pinned, not asserted</div>
+    <h2>Every flywheel result carries a manifest — and you can recompute it</h2>
+    <p class="sub">
+      A benchmark is only a proof if you can reproduce it. The suite is versioned and its inputs are
+      hashed: a run's report carries a <b>manifest SHA-256</b> over every input that determines a
+      result, so a later run can be confirmed to have used byte-identical inputs. The verification
+      below is <b>free</b> — no API key, no credits — because it only reads the pinned inputs, not the
+      model.
+    </p>
+    <div class="cards">
+      <div class="card">
+        <div class="big" style="font-size:20px">c2c5fa84…</div>
+        <div class="lab">Manifest SHA</div>
+        <div class="note">Stable hash over scenario tables, the solver &amp; judge prompts, the model IDs, config, and the corpus revisions.</div>
+      </div>
+      <div class="card">
+        <div class="big">4<small>/4</small></div>
+        <div class="lab">Corpora pinned to a commit</div>
+        <div class="note">Each real checkout is pinned to a git commit and verified on disk (right commit, clean tree).</div>
+      </div>
+      <div class="card">
+        <div class="big">✓</div>
+        <div class="lab">keel build stamped</div>
+        <div class="note">The report records the exact keel commit (and whether the tree was dirty) that produced it.</div>
+      </div>
+      <div class="card">
+        <div class="big">±<small>noise</small></div>
+        <div class="lab">Stochastic parts, honestly</div>
+        <div class="note">LLM runs can't match byte-for-byte; an equivalence test certifies two runs agree within a stated margin.</div>
+      </div>
+    </div>
+    <div class="scroll" style="margin-top:22px">
+      <table>
+        <thead><tr><th>Verify a run (free · no API key)</th><th>What it proves</th></tr></thead>
+        <tbody>
+          <tr><td class="metric"><code>run_suite.py --manifest</code></td><td>Prints the SHA over every pinned input; recompute it to confirm two runs shared inputs.</td></tr>
+          <tr><td class="metric"><code>run_suite.py --verify-corpus</code></td><td>Each real corpus checkout is at its pinned commit <b>with a clean tree</b> (a stray edit fails).</td></tr>
+          <tr><td class="metric"><code>run_suite.py --verify-keel</code></td><td>The keel binary reports a clean, identified build commit — the tool is pinned too.</td></tr>
+          <tr><td class="metric"><code>run_suite.py --compare a.json b.json</code></td><td>Manifest-gated equivalence test: two runs reproduce within ±δ, or a real regression is flagged.</td></tr>
+          <tr><td class="metric"><code>run_suite.py --dry-run</code></td><td>Every harness imports and the manifest is deterministic — the whole gate, offline.</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <div class="note-box" style="border-left-color: var(--accent)">
+      <b>The contract, in two halves.</b> The <em>deterministic</em> inputs are byte-identical across
+      runs — same manifest SHA or the inputs differed. The <em>stochastic</em> outputs (the LLM's
+      answers) reproduce <em>within noise</em>: because the samples are finite, "reproduced" is
+      certified by a two-one-sided equivalence test (the 95% CI for the difference sits inside a
+      margin), which is <b>conservative by design</b> — too few trials yields <em>inconclusive</em>,
+      never a false "reproduced." Every input that steers a result is either hashed (scenarios, the
+      solver/judge prompts, model IDs, config, corpus commits) or recorded and checkable (the keel
+      build). The pitch is the numbers; the numbers are pinned.
     </div>
   </div>
 </section>
@@ -518,7 +583,8 @@
       <ul class="tight">
         <li><b>Entire</b> was installed and run (<code>go install …/entire</code>): it hooks git and captures agent sessions to a <code>entire/checkpoints/v1</code> shadow branch. It is session capture/observability — no relevance graph or brief to benchmark against keel's.</li>
         <li><b>Sourcegraph</b> is a hosted static index; its rows reflect its committed-index design (0% on uncommitted state).</li>
-        <li><b>Flywheel &amp; coordination</b> are eval-harness numbers, labelled separately from the live system measurements.</li>
+        <li><b>Flywheel retrieval (72%) &amp; coordination (1.5–9.7×)</b> are eval-harness numbers, labelled separately from the live system measurements. The <b>correctness lift</b> (0→95 synthetic, +20 to +38 across four real corpora) is the <b>live</b> Rust&nbsp;keel + real&nbsp;LLM suite.</li>
+        <li><b>The flywheel suite is versioned and pinned</b> — its inputs (scenarios, solver/judge prompts, model IDs, config, corpus commits) hash into a manifest SHA, the keel build is stamped, and re-runs are certified to reproduce within noise. See <b>Reproducibility</b> above.</li>
         <li><b>Not yet at scale:</b> C relevance-slicing over the whole kernel (the definition index is bounded); tuning, not a wall.</li>
       </ul>
     </div>
@@ -527,8 +593,8 @@
 
 <footer>
   <div class="wrap">
-    <div><b style="color:var(--muted)">Reproducibility.</b> Storage/scale: <code>cargo run --release -p keel-store --example scale_bench -- &lt;dir&gt;</code>. Relevance + graph: <code>… --example system_bench</code>, <code>-p keel-graph --example c_scale</code>. git head-to-head: fresh <code>GIT_DIR</code>, one commit, <code>gc</code>. </div>
-    <div>keel is a research build — local, not yet pushed. Numbers are from a single machine; treat as directional, reproducible via the commands above.</div>
-    <div style="margin-top:14px; color:var(--faint)">keel · the fused code + session graph · benchmark report 2026-07-29</div>
+    <div><b style="color:var(--muted)">Reproducibility.</b> Storage/scale: <code>cargo run --release -p keel-store --example scale_bench -- &lt;dir&gt;</code>. Relevance + graph: <code>… --example system_bench</code>, <code>-p keel-graph --example c_scale</code>. git head-to-head: fresh <code>GIT_DIR</code>, one commit, <code>gc</code>. Flywheel suite: <code>src/keel-bench/</code> — <code>python3 run_suite.py --dry-run</code> / <code>--manifest</code> / <code>--verify-corpus</code> / <code>--verify-keel</code> validate the pinned inputs offline; a live run writes a report carrying its manifest SHA, and <code>--compare</code> certifies a re-run reproduces.</div>
+    <div><b style="color:var(--muted)">Two tiers of confidence.</b> Storage/scale/relevance are single-machine measurements — directional, reproducible via the commands above. The <b>flywheel suite is stronger</b>: versioned, its inputs hashed into a manifest SHA, its corpora and the keel build pinned to commits, and its stochastic results certified to reproduce within noise. The eval protocol itself — record a project convention with <code>keel learn</code>, retrieve it with <code>keel brief</code>, solve a task WITHOUT vs WITH it, score with a strict dual judge — is a spec any context-retrieval tool can be run against. keel is a research build, local, not yet pushed.</div>
+    <div style="margin-top:14px; color:var(--faint)">keel · the fused code + session graph · benchmark report 2026-08-06</div>
   </div>
 </footer>
