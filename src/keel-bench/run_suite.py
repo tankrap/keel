@@ -33,9 +33,15 @@ def load_config():
 
 
 def pin_env(cfg):
-    """Export the pinned run config so harness modules pick it up at import time. Env wins."""
+    """Export the pinned run config so harness modules pick it up at import time, then reconcile the
+    *effective* values back into cfg so the manifest certifies what actually ran, not what the file
+    said. A pre-set env var still wins (the `TRIALS=1 python3 run_suite.py` smoke-run affordance) —
+    but because the effective trials flow into the manifest, a smoke run gets a *different* SHA that
+    correctly won't match the pinned one, instead of silently certifying the pinned trial count."""
     os.environ.setdefault("TRIALS", str(cfg["run"]["trials"]))
     os.environ.setdefault("WORKERS", str(cfg["run"]["workers"]))
+    cfg["run"]["trials"] = int(os.environ["TRIALS"])
+    cfg["run"]["workers"] = int(os.environ["WORKERS"])
 
 
 def validate_benchmark(bench):

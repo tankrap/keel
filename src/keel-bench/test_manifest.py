@@ -39,6 +39,26 @@ def main():
     )
     check(len(m.get("common_source_sha256", "")) == 64, "shared bench_common source is bound (judge prompt, model constants)")
 
+    # source is actually WIRED INTO the manifest SHA (not just recorded): collapse every source hash
+    # to a constant and the manifest SHA must move — i.e. an edit to harness/bench_common source flows
+    # through to manifest_sha256. Exercises the real build path, not just field shape.
+    orig_ssha = bench_manifest._source_sha
+    try:
+        bench_manifest._source_sha = lambda name: "0" * 64
+        check(
+            bench_manifest.build_manifest(CFG)["manifest_sha256"] != m["manifest_sha256"],
+            "harness/bench_common source flows into the manifest SHA (editing source moves it)",
+        )
+    finally:
+        bench_manifest._source_sha = orig_ssha
+
+    # the REAL harness SCEN table is what's hashed (not some placeholder): the per-benchmark
+    # scenario_sha256 equals a fresh hash of that module's live SCEN.
+    real_mod = CFG["benchmarks"][0]["module"]
+    real_sha, _ = bench_manifest.scenario_sha(real_mod)
+    entry = next(b for b in m["benchmarks"] if b["module"] == real_mod)
+    check(entry["scenario_sha256"] == real_sha, "the real harness SCEN table is what the manifest hashes")
+
     # a config change (one more trial) must change the manifest SHA — inputs are truly bound in
     cfg_trials = copy.deepcopy(CFG)
     cfg_trials["run"]["trials"] += 1

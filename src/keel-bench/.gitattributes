@@ -1,0 +1,5 @@
+# The reproducibility manifest (bench_manifest.py) hashes these files' source BYTES, so their line
+# endings must be identical on every checkout. Force LF regardless of a contributor's core.autocrlf,
+# so a Windows checkout can't silently change every source SHA.
+*.py text eol=lf
+*.sh text eol=lf
