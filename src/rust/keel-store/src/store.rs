@@ -839,6 +839,25 @@ impl Store {
         })
     }
 
+    /// Atomic get-or-insert in namespace `ns`. Within a single write txn — and because LMDB permits
+    /// one writer at a time — the read and the conditional put don't interleave with another writer,
+    /// so this is a true put-if-absent: two un-coordinated callers can't each insert a *different*
+    /// value (which a separate `aux_get` + `aux_put` would allow, silently clobbering the first). This
+    /// is what keeps a freshly generated crypto-shred key from being overwritten on concurrent first
+    /// use of a `key_id`. Returns the resident value and whether this call inserted it. `make` may run
+    /// more than once (a `MapFull` retry re-runs the body), so it must be pure/idempotent-safe.
+    pub fn aux_get_or_insert(&self, ns: &str, key: &[u8], make: &dyn Fn() -> Result<Vec<u8>>) -> Result<(Vec<u8>, bool)> {
+        self.write_with_retry(|w| {
+            let k = Self::aux_key(ns, key);
+            if let Some(v) = self.aux.get(&*w, &k)? {
+                return Ok((v.to_vec(), false));
+            }
+            let v = make()?;
+            self.aux.put(w, &k, &v)?;
+            Ok((v, true))
+        })
+    }
+
     /// Get `key` from namespace `ns`.
     pub fn aux_get(&self, ns: &str, key: &[u8]) -> Result<Option<Vec<u8>>> {
         let (_rg, r) = self.ro_txn()?;

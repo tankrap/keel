@@ -14,6 +14,9 @@ miniz_oxide = "0.8"
 ignore = "0.4"
 # advisory file locking (flock) so GC and commit are mutually exclusive across processes.
 libc = "0.2"
+# vetted AEAD (ChaCha20-Poly1305) + CSPRNG for crypto-shredding (NEW-1088). Already in the tree via
+# keel-net's rustls, so this adds no new crypto vendor — we never hand-roll cryptography.
+ring = "0.17"
 
 [dev-dependencies]
 keel-resolve = { path = "../keel-resolve" }
