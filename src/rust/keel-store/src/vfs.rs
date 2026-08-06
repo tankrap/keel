@@ -116,11 +116,16 @@ impl<'a> Vfs<'a> {
     }
 
     /// Resolve a repo-relative path to `(id, mode)`, or `None` if absent. `""` / `"/"` is the root
-    /// directory. Only the trees along the path are read, and the walk is bounded by
-    /// [`MAX_TREE_DEPTH`] so a crafted deep path can't run away.
+    /// directory. Only the trees along the path are read. Resolution is iterative — one tree read per
+    /// path component — so store contents can never drive unbounded recursion; the [`MAX_TREE_DEPTH`]
+    /// cap simply rejects an absurdly long *input path* rather than walking it.
     fn resolve(&self, path: &str) -> Result<Option<(ObjectId, u32)>> {
         let parts: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
         if parts.is_empty() {
+            // The root, trusted as a directory from the change's tree id without a fetch — exactly as
+            // a non-root path trusts its parent entry's mode bit rather than reading the target. This
+            // keeps `getattr`/stat cheap; `readdir`/`read` do fetch, so on a corrupt store a missing
+            // dir object surfaces there (an intentional stat-trusts-structure / open-verifies split).
             return Ok(Some((self.root, MODE_DIR)));
         }
         if parts.len() as u32 > MAX_TREE_DEPTH {
@@ -184,7 +189,10 @@ impl<'a> Vfs<'a> {
     /// follow-up that pairs with the size index).
     pub fn read_at(&self, path: &str, offset: u64, len: usize) -> Result<Option<Vec<u8>>> {
         let Some(bytes) = self.read(path)? else { return Ok(None) };
-        let start = (offset as usize).min(bytes.len());
+        // Clamp via a saturating u64→usize conversion: a plain `offset as usize` would TRUNCATE on a
+        // 32-bit target (an offset ≥ 4 GiB wrapping to a small in-bounds index → wrong bytes), so map
+        // any out-of-range offset to usize::MAX, which then clamps to EOF (an empty slice).
+        let start = usize::try_from(offset).unwrap_or(usize::MAX).min(bytes.len());
         let end = start.saturating_add(len).min(bytes.len());
         Ok(Some(bytes[start..end].to_vec()))
     }
@@ -291,6 +299,8 @@ mod tests {
         assert_eq!(vfs.read_at("README", 0, 3).unwrap().unwrap(), b"hel");
         assert_eq!(vfs.read_at("README", 3, 100).unwrap().unwrap(), b"lo\n"); // len clamps to EOF
         assert_eq!(vfs.read_at("README", 999, 4).unwrap().unwrap(), b""); // offset past EOF → empty
+        // a huge offset must clamp to EOF (empty), never wrap to an in-bounds index (32-bit guard)
+        assert_eq!(vfs.read_at("README", u64::MAX, 4).unwrap().unwrap(), b"");
         // a directory has no bytes
         assert!(vfs.read_at("src", 0, 10).unwrap().is_none());
     }
