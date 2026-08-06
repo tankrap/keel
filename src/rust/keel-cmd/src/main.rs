@@ -46,6 +46,7 @@ fn main() {
         Some("learn") => run(cmd_learn(&args[1..])),
         Some("review") => run(cmd_review(&args[1..])),
         Some("reviews") => run(cmd_reviews(&args[1..])),
+        Some("walkthrough") => run(cmd_walkthrough(&args[1..])),
         Some("why") => run(cmd_why(&args[1..])),
         Some("capture") => run(cmd_capture(&args[1..])),
         Some("erase") => run(cmd_erase(&args[1..])),
@@ -140,6 +141,7 @@ fn print_usage() {
          \x20 keel sessions [--file <path>]       ·   keel session <change>\n\
          \x20 keel review --target <id> --verdict <approve|request-changes|reject|comment> [--label <l>]\n\
          \x20 keel reviews [--target <id>] [--label <l>] [--mentions <t>] [--no-human] [--disagreements] [--json]\n\
+         \x20 keel walkthrough <change> [--full] [--json]   block-by-block review, each block cites its proof\n\
          \x20 keel repack [--json]                delta-compress history + GC (like `git gc`)\n\
          \x20 keel size   [--json]                logical bytes / object counts\n\
          \x20 keel mirror-in <git-repo>  ·  keel mirror-out <dir>  ·  keel import/export\n\
@@ -1801,6 +1803,323 @@ fn cmd_reviews(args: &[String]) -> io::Result<()> {
     Ok(())
 }
 
+/// `keel walkthrough <change> [--json] [--full]`
+///
+/// The reviewer walkthrough: instead of handing a reviewer a raw diff to read line by line, keel
+/// narrates the change block by block from what it already recorded — the session's task and model,
+/// the change's verification verdict, and, for each file, the proof that backs it. "Proof" is
+/// concrete, not prose: a test file is its own evidence; a source file is linked to the test files
+/// that changed alongside it; anything else leans on the recorded green/red verdict, and an untested
+/// block that never went green is flagged for a closer look.
+///
+/// git has no session or verdict to narrate from, so its review is always "read every line and hope
+/// you catch the one that matters." keel derives the walkthrough from the recorded work, which is why
+/// it's a lookup here and a re-generation nowhere.
+fn cmd_walkthrough(args: &[String]) -> io::Result<()> {
+    let change = args
+        .iter()
+        .find(|a| !a.starts_with('-'))
+        .ok_or_else(|| io::Error::other("usage: keel walkthrough <change> [--json] [--full]"))?;
+    let full = has(args, "--full");
+    let (_, store) = root_store(args)?;
+    let repo = Repo::open(&store).map_err(to_io)?;
+    let id = resolve_change(&repo, change)?;
+    let c = repo.change(id).map_err(to_io)?.ok_or_else(|| io::Error::other("no such change"))?;
+
+    // Authoritative verdict comes from the side-table (`keel verify`), not the change's commit-time
+    // field, which stays Unverified after the fact.
+    let verif = match repo.store().verification(&id).map_err(to_io)? {
+        Verification::Green => "green",
+        Verification::Red => "red",
+        Verification::Unverified => "unverified",
+    };
+
+    // Session narrative (optional): the task the agent was given, the model, the lesson it learned.
+    let (mut task, mut model, mut lesson) = (None, None, None);
+    if let Some(sid) = c.session {
+        if let Some(Object::Session(s)) = repo.store().get(&sid).map_err(to_io)? {
+            if !s.task.is_empty() {
+                task = Some(s.task);
+            }
+            if !s.model.is_empty() {
+                model = Some(s.model);
+            }
+            if !s.lesson.is_empty() {
+                lesson = Some(s.lesson);
+            }
+        }
+    }
+
+    let files = repo.change_files(id).map_err(to_io)?;
+    let parent = c.parents.first().copied();
+    // The test files this change touched — the pool each source block draws its proof link from.
+    let test_paths: Vec<String> =
+        files.iter().filter(|f| is_test_path(&f.path)).map(|f| f.path.clone()).collect();
+
+    let mut blocks = Vec::new();
+    let (mut tot_add, mut tot_del) = (0usize, 0usize);
+    for f in &files {
+        let old = match (parent, f.kind) {
+            (_, ChangeKind::Added) => Vec::new(),
+            (Some(p), _) => repo.file_bytes_at(p, &f.path).map_err(to_io)?.unwrap_or_default(),
+            (None, _) => Vec::new(),
+        };
+        let new = match f.kind {
+            ChangeKind::Deleted => Vec::new(),
+            _ => repo.file_bytes_at(id, &f.path).map_err(to_io)?.unwrap_or_default(),
+        };
+        let block = walkthrough_block(&f.path, f.kind, &old, &new, &test_paths, verif, full);
+        tot_add += block["added_lines"].as_u64().unwrap_or(0) as usize;
+        tot_del += block["deleted_lines"].as_u64().unwrap_or(0) as usize;
+        blocks.push(block);
+    }
+    let covered = blocks.iter().filter(|b| b["proof"]["status"] == "covered").count();
+    let untested = blocks.iter().filter(|b| b["proof"]["status"] == "untested").count();
+
+    let mut out = json!({
+        "ok": true,
+        "change": id.to_hex(),
+        "intent": c.intent,
+        "author": c.author,
+        "timestamp": c.timestamp,
+        "verification": verif,
+        "files": files.len(),
+        "added_lines": tot_add,
+        "deleted_lines": tot_del,
+        "blocks": blocks,
+        "proof_summary": {
+            "verified": verif == "green",
+            "covered": covered,
+            "untested": untested,
+            "tests_changed": test_paths.len(),
+        },
+    });
+    if let Some(t) = task {
+        out["task"] = json!(t);
+    }
+    if let Some(m) = model {
+        out["model"] = json!(m);
+    }
+    if let Some(l) = lesson {
+        out["lesson"] = json!(l);
+    }
+
+    if has(args, "--json") {
+        println!("{}", render_json(&out));
+    } else {
+        print!("{}", render_walkthrough_human(&out));
+    }
+    Ok(())
+}
+
+/// Does this path look like a test/spec file? Covers the conventions in play across the benchmark
+/// corpora: a `test`/`tests`/`spec`/`__tests__` path segment (django, tokio), a `_test`/`_spec`
+/// basename suffix (prometheus/go), a `test_` prefix (django/py), or a `.test.`/`.spec.` infix
+/// (vs code/ts). Deliberately a heuristic — its only job is to pick which proof link to surface.
+fn is_test_path(path: &str) -> bool {
+    let lower = path.to_lowercase();
+    if lower.split('/').any(|p| matches!(p, "test" | "tests" | "spec" | "__tests__")) {
+        return true;
+    }
+    let base = lower.rsplit('/').next().unwrap_or(&lower);
+    if base.contains(".test.") || base.contains(".spec.") {
+        return true;
+    }
+    let stem = base.split('.').next().unwrap_or(base);
+    stem.starts_with("test_")
+        || stem.starts_with("spec_")
+        || stem.ends_with("_test")
+        || stem.ends_with("_spec")
+}
+
+/// Does `test_path` plausibly exercise `src_path`? True when, after stripping the usual test affixes,
+/// the test's basename stem equals the source's basename stem (`core.rs` ↔ `core_test.rs`,
+/// `parser.ts` ↔ `parser.test.ts`, `views.py` ↔ `test_views.py`). Same stem in a different directory
+/// still counts — the link is a reviewer hint, so a generous match is the right bias.
+fn test_covers(src_path: &str, test_path: &str) -> bool {
+    fn stem(p: &str) -> String {
+        let base = p.rsplit('/').next().unwrap_or(p).to_lowercase();
+        base.split('.').next().unwrap_or(&base).to_string()
+    }
+    let src = stem(src_path);
+    if src.is_empty() {
+        return false;
+    }
+    let mut t = stem(test_path);
+    for p in ["test_", "spec_"] {
+        if let Some(r) = t.strip_prefix(p) {
+            t = r.to_string();
+        }
+    }
+    for p in ["_test", "_spec", "test", "spec"] {
+        if let Some(r) = t.strip_suffix(p) {
+            t = r.to_string();
+        }
+    }
+    let t = t.trim_matches('_');
+    !t.is_empty() && t == src
+}
+
+/// One file's block in the walkthrough: its diff shape (added/deleted line counts, hunk headers, and
+/// — with `--full` — hunk bodies) plus its proof link. A binary file is reported, not dumped.
+fn walkthrough_block(
+    path: &str,
+    kind: ChangeKind,
+    old: &[u8],
+    new: &[u8],
+    test_paths: &[String],
+    verif: &str,
+    full: bool,
+) -> Value {
+    let kind_s = match kind {
+        ChangeKind::Added => "added",
+        ChangeKind::Modified => "modified",
+        ChangeKind::Deleted => "deleted",
+    };
+    let binary = old.contains(&0) || new.contains(&0);
+    let (mut add, mut del) = (0usize, 0usize);
+    let mut hunk_heads = Vec::new();
+    let mut hunk_bodies = Vec::new();
+    if !binary {
+        let (o, n) = (String::from_utf8_lossy(old), String::from_utf8_lossy(new));
+        for h in diff_lines(&o, &n) {
+            hunk_heads.push(format!("@@ -{},{} +{},{} @@", h.old_start, h.old_len, h.new_start, h.new_len));
+            let mut body = Vec::new();
+            for line in &h.lines {
+                match line.tag {
+                    Tag::Add => add += 1,
+                    Tag::Del => del += 1,
+                    Tag::Context => {}
+                }
+                if full {
+                    let m = match line.tag {
+                        Tag::Context => ' ',
+                        Tag::Del => '-',
+                        Tag::Add => '+',
+                    };
+                    body.push(format!("{m}{}", line.text));
+                }
+            }
+            if full {
+                hunk_bodies.push(body);
+            }
+        }
+    }
+    // Proof link: a test file is its own evidence; a source file points at the tests that changed
+    // with it; otherwise the block leans on the recorded verdict, and an untested non-green block
+    // is the one a reviewer should actually open.
+    let is_test = is_test_path(path);
+    let covering: Vec<String> = if is_test {
+        Vec::new()
+    } else {
+        test_paths.iter().filter(|t| test_covers(path, t)).cloned().collect()
+    };
+    let status = if is_test {
+        "is-test"
+    } else if !covering.is_empty() {
+        "covered"
+    } else if verif == "green" {
+        "verified"
+    } else {
+        "untested"
+    };
+    let mut b = json!({
+        "path": path,
+        "kind": kind_s,
+        "binary": binary,
+        "added_lines": add,
+        "deleted_lines": del,
+        "hunks": hunk_heads,
+        "proof": { "status": status, "tests": covering, "verification": verif },
+    });
+    if full && !hunk_bodies.is_empty() {
+        b["hunk_bodies"] = json!(hunk_bodies);
+    }
+    b
+}
+
+/// Render the walkthrough for a human reviewer: a header (verdict, author, task, scope, proof tally),
+/// then one narrated block per file — each opening with its proof link so the reviewer reads the
+/// evidence before the diff — and a closing nudge to record a verdict as a first-class review object.
+fn render_walkthrough_human(v: &Value) -> String {
+    use std::fmt::Write;
+    let mut s = String::new();
+    let verif = v["verification"].as_str().unwrap_or("");
+    let mark = match verif {
+        "green" => "✓",
+        "red" => "✗",
+        _ => "·",
+    };
+    let change = v["change"].as_str().unwrap_or("");
+    let _ = writeln!(s, "walkthrough · {} {}  {}", mark, short(change), v["intent"].as_str().unwrap_or(""));
+    let _ = writeln!(
+        s,
+        "  by {} · {} · verified {verif}",
+        v["author"].as_str().unwrap_or(""),
+        rel_time(v["timestamp"].as_u64().unwrap_or(0))
+    );
+    if let Some(t) = v.get("task").and_then(Value::as_str) {
+        let _ = writeln!(s, "  task:  {t}");
+    }
+    if let Some(m) = v.get("model").and_then(Value::as_str) {
+        let _ = writeln!(s, "  model: {m}");
+    }
+    let _ = writeln!(s, "  scope: {} file(s), +{} −{}", v["files"], v["added_lines"], v["deleted_lines"]);
+    let ps = &v["proof_summary"];
+    let _ = writeln!(
+        s,
+        "  proof: {} covered · {} untested · {} test file(s) changed",
+        ps["covered"], ps["untested"], ps["tests_changed"]
+    );
+    let _ = writeln!(s);
+    if let Some(blocks) = v["blocks"].as_array() {
+        for (i, b) in blocks.iter().enumerate() {
+            let _ = writeln!(
+                s,
+                "  {}. {} ({}) +{} −{}",
+                i + 1,
+                b["path"].as_str().unwrap_or(""),
+                b["kind"].as_str().unwrap_or(""),
+                b["added_lines"],
+                b["deleted_lines"]
+            );
+            let proof_txt = match b["proof"]["status"].as_str().unwrap_or("") {
+                "is-test" => "proof: this file IS the test evidence for the change".to_string(),
+                "covered" => {
+                    let tests: Vec<&str> = b["proof"]["tests"]
+                        .as_array()
+                        .map(|a| a.iter().filter_map(Value::as_str).collect())
+                        .unwrap_or_default();
+                    format!("proof: exercised by {}", tests.join(", "))
+                }
+                "verified" => "proof: change verified green (no test changed alongside)".to_string(),
+                _ => "proof: UNTESTED — no colocated test and change not green; review closely".to_string(),
+            };
+            let _ = writeln!(s, "       {proof_txt}");
+            if b["binary"].as_bool().unwrap_or(false) {
+                let _ = writeln!(s, "       (binary file)");
+            } else if let Some(hunks) = b["hunks"].as_array() {
+                for h in hunks {
+                    let _ = writeln!(s, "       {}", h.as_str().unwrap_or(""));
+                }
+            }
+            if let Some(bodies) = b.get("hunk_bodies").and_then(Value::as_array) {
+                for body in bodies.iter().filter_map(Value::as_array) {
+                    for l in body.iter().filter_map(Value::as_str) {
+                        let _ = writeln!(s, "         {l}");
+                    }
+                }
+            }
+            let _ = writeln!(s);
+        }
+    }
+    let _ = writeln!(
+        s,
+        "  → record a verdict: keel review --target {change} --verdict <approve|request-changes|reject> [--human]"
+    );
+    s
+}
+
 fn cmd_learn(args: &[String]) -> io::Result<()> {
     let lesson = flag(args, "--lesson").ok_or_else(|| io::Error::other("usage: keel learn --lesson <text> [--task <text>]"))?;
     let task = flag(args, "--task").unwrap_or("");
@@ -2643,6 +2962,85 @@ mod tests {
         assert!(h.contains("prior sessions"));
         assert!(h.contains("settle before charge"));
         assert!(h.contains("invariants"), "pinned invariants rendered");
+    }
+
+    #[test]
+    fn is_test_path_spans_language_conventions() {
+        for p in [
+            "src/foo/tests/bar.rs",           // path segment (rust/tokio)
+            "django/db/models/test_query.py", // test_ prefix (python/django)
+            "prometheus/tsdb/head_test.go",   // _test suffix (go/prometheus)
+            "src/vs/editor/parser.test.ts",   // .test. infix (ts/vscode)
+            "app/__tests__/view.js",          // jest __tests__ dir
+            "lib/thing_spec.rb",              // _spec suffix (ruby)
+        ] {
+            assert!(is_test_path(p), "should read as a test file: {p}");
+        }
+        for p in ["src/parser.rs", "kernel/sched/core.c", "latest.go", "src/contest.py"] {
+            assert!(!is_test_path(p), "should NOT read as a test file: {p}");
+        }
+    }
+
+    #[test]
+    fn test_covers_matches_source_across_affixes() {
+        assert!(test_covers("src/core.rs", "src/core_test.rs"));
+        assert!(test_covers("a/parser.ts", "a/parser.test.ts"));
+        assert!(test_covers("db/views.py", "db/tests/test_views.py")); // different dir still counts
+        assert!(test_covers("tsdb/head.go", "tsdb/head_test.go"));
+        // non-matches: different stem must not link
+        assert!(!test_covers("src/core.rs", "src/parser_test.rs"));
+        assert!(!test_covers("src/core.rs", "src/other.rs"));
+    }
+
+    #[test]
+    fn walkthrough_block_links_proof_and_flags_untested() {
+        let tests = vec!["src/core_test.rs".to_string()];
+        // a source file with a colocated test → covered, and the test is named
+        let covered = walkthrough_block(
+            "src/core.rs", ChangeKind::Modified, b"a\n", b"a\nb\n", &tests, "unverified", false,
+        );
+        assert_eq!(covered["proof"]["status"], "covered");
+        assert_eq!(covered["proof"]["tests"][0], "src/core_test.rs");
+        assert_eq!(covered["added_lines"], 1);
+
+        // the test file itself is its own evidence
+        let is_test = walkthrough_block(
+            "src/core_test.rs", ChangeKind::Modified, b"", b"x\n", &tests, "unverified", false,
+        );
+        assert_eq!(is_test["proof"]["status"], "is-test");
+
+        // a lone source file, change not green → untested (the block a reviewer must open)
+        let untested = walkthrough_block(
+            "src/alone.rs", ChangeKind::Added, b"", b"x\n", &[], "unverified", false,
+        );
+        assert_eq!(untested["proof"]["status"], "untested");
+
+        // same file, but the change verified green → leans on the recorded verdict
+        let verified = walkthrough_block(
+            "src/alone.rs", ChangeKind::Added, b"", b"x\n", &[], "green", false,
+        );
+        assert_eq!(verified["proof"]["status"], "verified");
+    }
+
+    #[test]
+    fn walkthrough_human_render_leads_with_proof_and_verdict_nudge() {
+        let v = json!({
+            "change": "abc123def456abc123def456abc123def456abc123def456abc123def456abcd",
+            "intent": "add retry", "author": "acct:x", "timestamp": 0u64,
+            "verification": "green", "files": 1, "added_lines": 2, "deleted_lines": 0,
+            "task": "make the client retry",
+            "proof_summary": {"verified": true, "covered": 1, "untested": 0, "tests_changed": 1},
+            "blocks": [{
+                "path": "src/client.rs", "kind": "modified", "binary": false,
+                "added_lines": 2, "deleted_lines": 0, "hunks": ["@@ -1,1 +1,3 @@"],
+                "proof": {"status": "covered", "tests": ["src/client_test.rs"], "verification": "green"},
+            }],
+        });
+        let h = render_walkthrough_human(&v);
+        assert!(h.contains("walkthrough · ✓"), "verdict mark in header: {h}");
+        assert!(h.contains("task:  make the client retry"));
+        assert!(h.contains("proof: exercised by src/client_test.rs"), "proof link before diff: {h}");
+        assert!(h.contains("keel review --target abc123def456"), "closes with a verdict nudge: {h}");
     }
 
     #[test]
