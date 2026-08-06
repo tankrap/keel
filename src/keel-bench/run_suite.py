@@ -229,6 +229,10 @@ def full_run(cfg, only=None):
     # Build (and validate) the manifest BEFORE spending any credits, so a config/harness drift or a
     # config-vs-code model mismatch fails loudly here rather than after a full paid run.
     manifest = bench_manifest.build_manifest(cfg)
+    # Importing any harness pulls in bench_common, which resolved BENCH_PROVIDER at import — surface
+    # the effective transport so a run's output says how it was routed.
+    import bench_common
+    print(f"transport: {bench_common.PROVIDER}")
     summaries = []
     for b in cfg["benchmarks"]:
         if only and b["id"] != only:
@@ -248,6 +252,9 @@ def full_run(cfg, only=None):
         "generated_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
         "models": cfg["models"],
         "run": cfg["run"],
+        # Transport used (recorded, not hashed into the manifest — the models are identical across
+        # providers, so a run over either routes stays comparable to the pinned reference).
+        "provider": bench_common.PROVIDER,
         # Pin the exact inputs this result was produced from: anyone can recompute the manifest and
         # confirm a later run used byte-identical inputs (reproducibility).
         "manifest": manifest,
@@ -280,7 +287,15 @@ def main():
     ap.add_argument("--margin", type=float, metavar="PP", default=None,
                     help="equivalence margin in percentage points for --compare (default 20)")
     ap.add_argument("--only", metavar="ID", help="run a single benchmark by its config id")
+    ap.add_argument("--provider", choices=("anthropic", "openrouter"), default=None,
+                    help="LLM transport: anthropic (default, ~/.claude-token) or openrouter "
+                         "(~/.openrouter). Same pinned models either way; only the transport differs.")
     args = ap.parse_args()
+
+    # Resolve the transport BEFORE any harness (and thus bench_common) is imported, since bench_common
+    # reads BENCH_PROVIDER at import. Precedence: --provider > BENCH_PROVIDER env > anthropic.
+    provider = args.provider or os.environ.get("BENCH_PROVIDER") or "anthropic"
+    os.environ["BENCH_PROVIDER"] = provider
 
     if args.compare:
         return run_compare(*args.compare, margin_pp=args.margin)
