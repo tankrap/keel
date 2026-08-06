@@ -1,13 +1,13 @@
 {
   "schema": "keel-bench/1",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "issue": "NEW-1094",
   "description": "Pinned configuration for keel's live-LLM flywheel benchmark suite. Runs are reproducible and comparable over time because models, trial counts, worker parallelism, scenario counts and the Wilson z are all fixed here. The adversarial control (flywheel_adversarial.py) runs standalone: it has three conditions rather than the without/with pair this suite aggregates.",
   "models": {
     "solver": "claude-opus-4-8",
     "judge": "claude-sonnet-5",
     "api_version": "2023-06-01",
-    "temperature": "none — opus-4-8 adaptive thinking forces temp=1; sending a temperature returns HTTP 400, so no temperature field is ever sent"
+    "temperature": "none \u2014 opus-4-8 adaptive thinking forces temp=1; sending a temperature returns HTTP 400, so no temperature field is ever sent"
   },
   "run": {
     "trials": 4,
@@ -28,9 +28,15 @@
       "requires": "keel binary (KEEL_BIN)",
       "reference": {
         "without": "0/80 (0%)",
-        "without_ci95_pct": [0, 5],
+        "without_ci95_pct": [
+          0,
+          5
+        ],
         "with": "76/80 (95%)",
-        "with_ci95_pct": [88, 98],
+        "with_ci95_pct": [
+          88,
+          98
+        ],
         "lift_points": 95,
         "retrieved": "20/20"
       }
@@ -42,11 +48,23 @@
       "scenario_arity": 5,
       "measures": "Real-corpus flywheel retrieval-lift: 16 real, documented VS Code conventions attached to their real files (real path + real content) and retrieved via `keel brief`. Answers the 'you invented those conventions' objection to the synthetic run.",
       "requires": "keel binary (KEEL_BIN) + a microsoft/vscode checkout (CORPUS_SRC, default ~/keel-vscode-demo)",
+      "corpus": {
+        "repo": "github.com/microsoft/vscode",
+        "commit": "b9b1422f1276a1d6cd6309edc866f8086103ac2d",
+        "src_env": "CORPUS_SRC",
+        "src_default": "~/keel-vscode-demo"
+      },
       "reference": {
         "without": "47/64 (73%)",
-        "without_ci95_pct": [62, 83],
+        "without_ci95_pct": [
+          62,
+          83
+        ],
         "with": "60/64 (94%)",
-        "with_ci95_pct": [85, 98],
+        "with_ci95_pct": [
+          85,
+          98
+        ],
         "lift_points": 20,
         "retrieved": "16/16"
       }
@@ -58,11 +76,23 @@
       "scenario_arity": 5,
       "measures": "Real-corpus flywheel retrieval-lift on Django (Python): 12 real, documented django/django conventions attached to their real files and retrieved via `keel brief`. Generalizes the effect beyond TypeScript.",
       "requires": "keel binary (KEEL_BIN) + a django/django checkout (CORPUS_SRC, default ~/keel-django-demo)",
+      "corpus": {
+        "repo": "github.com/django/django",
+        "commit": "2b0e08a149b2036352684b8247f35c031cf61504",
+        "src_env": "CORPUS_SRC",
+        "src_default": "~/keel-django-demo"
+      },
       "reference": {
         "without": "30/48 (62%)",
-        "without_ci95_pct": [48, 75],
+        "without_ci95_pct": [
+          48,
+          75
+        ],
         "with": "44/48 (92%)",
-        "with_ci95_pct": [80, 97],
+        "with_ci95_pct": [
+          80,
+          97
+        ],
         "lift_points": 29,
         "retrieved": "12/12"
       }
@@ -74,11 +104,23 @@
       "scenario_arity": 5,
       "measures": "Real-corpus flywheel retrieval-lift on Prometheus (Go): 12 real, documented prometheus/prometheus conventions attached to their real files and retrieved via `keel brief`. Lowest model prior of the three, so the highest lift.",
       "requires": "keel binary (KEEL_BIN) + a prometheus/prometheus checkout (CORPUS_SRC, default ~/keel-go-demo)",
+      "corpus": {
+        "repo": "github.com/prometheus/prometheus",
+        "commit": "bf5a9810e60d5f4cdbb4035119fd61668790b1b7",
+        "src_env": "CORPUS_SRC",
+        "src_default": "~/keel-go-demo"
+      },
       "reference": {
         "without": "28/48 (58%)",
-        "without_ci95_pct": [44, 71],
+        "without_ci95_pct": [
+          44,
+          71
+        ],
         "with": "43/48 (90%)",
-        "with_ci95_pct": [78, 96],
+        "with_ci95_pct": [
+          78,
+          96
+        ],
         "lift_points": 31,
         "retrieved": "12/12"
       }
@@ -90,11 +132,23 @@
       "scenario_arity": 5,
       "measures": "Real-corpus flywheel retrieval-lift on Tokio (Rust): 12 real, idiomatic tokio-rs/tokio conventions attached to their real files and retrieved via `keel brief`. Rust is the language keel itself is written in.",
       "requires": "keel binary (KEEL_BIN) + a tokio-rs/tokio checkout (CORPUS_SRC, default ~/keel-rust-demo)",
+      "corpus": {
+        "repo": "github.com/tokio-rs/tokio",
+        "commit": "adc2ae7af2caaea83985fbdfbc7884c159c486f2",
+        "src_env": "CORPUS_SRC",
+        "src_default": "~/keel-rust-demo"
+      },
       "reference": {
         "without": "29/48 (60%)",
-        "without_ci95_pct": [46, 73],
+        "without_ci95_pct": [
+          46,
+          73
+        ],
         "with": "47/48 (98%)",
-        "with_ci95_pct": [89, 100],
+        "with_ci95_pct": [
+          89,
+          100
+        ],
         "lift_points": 38,
         "retrieved": "12/12"
       }

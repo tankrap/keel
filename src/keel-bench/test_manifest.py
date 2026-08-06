@@ -74,6 +74,24 @@ def main():
         "scenario content is bound (different SCEN rows → different SHA)",
     )
 
+    # a real-corpus benchmark binds WHICH revision it ran against: changing a pinned commit moves the
+    # SHA; a synthetic (no-corpus) benchmark carries no corpus field.
+    corpus_idx = next((i for i, b in enumerate(CFG["benchmarks"]) if b.get("corpus")), None)
+    if corpus_idx is not None:
+        cfg_commit = copy.deepcopy(CFG)
+        cfg_commit["benchmarks"][corpus_idx]["corpus"]["commit"] = "0" * 40
+        check(
+            bench_manifest.build_manifest(cfg_commit)["manifest_sha256"] != m["manifest_sha256"],
+            "a pinned corpus-commit change yields a different manifest SHA",
+        )
+        cid = CFG["benchmarks"][corpus_idx]["id"]
+        entry = next(b for b in m["benchmarks"] if b["id"] == cid)
+        check("commit" in entry.get("corpus", {}), "a corpus benchmark records its pinned commit in the manifest")
+    check(
+        all("corpus" not in b for b in m["benchmarks"] if b["module"] == "flywheel_bench"),
+        "a synthetic (no-corpus) benchmark carries no corpus pin",
+    )
+
     # workers is pure parallelism — it must NOT change the SHA (else identical runs look different)
     cfg_workers = copy.deepcopy(CFG)
     cfg_workers["run"]["workers"] += 3

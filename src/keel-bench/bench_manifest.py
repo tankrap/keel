@@ -91,19 +91,24 @@ def config_sha(cfg: dict) -> str:
     notes, and the key source are excluded: they don't change an outcome. Benchmarks are sorted so
     reordering the config array can't change the SHA."""
     _verify_models(cfg)
+
+    def _bench_core(b):
+        c = {"id": b["id"], "module": b["module"], "scenarios": b["scenarios"],
+             "scenario_arity": b["scenario_arity"]}
+        # a real-corpus benchmark's inputs include WHICH revision of the real files it ran against;
+        # pin the repo + commit so a different checkout yields a different SHA (the src path/env don't
+        # affect a result — only the repo identity and commit do).
+        corpus = b.get("corpus")
+        if corpus:
+            c["corpus"] = {"repo": corpus["repo"], "commit": corpus["commit"]}
+        return c
+
     core = {
         "schema": cfg["schema"],
         "version": cfg["version"],
         "models": {k: cfg["models"][k] for k in ("solver", "judge", "api_version")},
         "run": {k: cfg["run"][k] for k in ("trials", "wilson_z")},  # workers excluded on purpose
-        "benchmarks": sorted(
-            (
-                {"id": b["id"], "module": b["module"], "scenarios": b["scenarios"],
-                 "scenario_arity": b["scenario_arity"]}
-                for b in cfg["benchmarks"]
-            ),
-            key=lambda x: x["id"],
-        ),
+        "benchmarks": sorted((_bench_core(b) for b in cfg["benchmarks"]), key=lambda x: x["id"]),
     }
     return _sha(_canon(core))
 
@@ -120,13 +125,16 @@ def build_manifest(cfg: dict) -> dict:
         pinned = b.get("scenarios")
         if pinned is not None and pinned != n:
             raise ValueError(f"{b['id']}: config pins {pinned} scenarios but {b['module']}.SCEN has {n}")
-        benches.append({
+        entry = {
             "id": b["id"],
             "module": b["module"],
             "scenarios": n,
             "scenario_sha256": sha,
             "source_sha256": _source_sha(b["module"]),  # binds this harness's prompts + max_tokens
-        })
+        }
+        if b.get("corpus"):  # record the pinned real-files revision this benchmark ran against
+            entry["corpus"] = {"repo": b["corpus"]["repo"], "commit": b["corpus"]["commit"]}
+        benches.append(entry)
     benches.sort(key=lambda x: x["id"])  # order-independent
     common = _source_sha(COMMON_MODULE)  # binds the shared judge prompt, api() defaults, model constants
     core = {"config_sha256": csha, "common_source_sha256": common, "benchmarks": benches}
@@ -138,6 +146,40 @@ def build_manifest(cfg: dict) -> dict:
         "benchmarks": benches,
         "manifest_sha256": _sha(_canon(core)),
     }
+
+
+def verify_corpus(cfg: dict):
+    """Check that each real-corpus checkout on disk is at the commit the manifest pins. Separate from
+    `build_manifest` on purpose: it shells out to git and needs the checkout present, so it is opt-in
+    (CI and `--manifest` stay checkout-free). Returns one row per corpus benchmark with a `status`:
+    `match` | `MISMATCH` | `absent` (no dir) | `not-a-git-checkout`. Never raises for a missing corpus
+    — the caller decides whether an absent/mismatched corpus is fatal."""
+    import os
+    import subprocess
+
+    rows = []
+    for b in cfg["benchmarks"]:
+        c = b.get("corpus")
+        if not c:
+            continue
+        src = os.environ.get(c.get("src_env", ""), "") or os.path.expanduser(c["src_default"])
+        row = {"id": b["id"], "repo": c["repo"], "expected": c["commit"], "path": src}
+        git_dir = pathlib.Path(src, ".git")
+        if not pathlib.Path(src).is_dir() or not git_dir.exists():
+            row["status"] = "absent" if not pathlib.Path(src).is_dir() else "not-a-git-checkout"
+            row["actual"] = None
+        else:
+            try:
+                actual = subprocess.run(
+                    ["git", "-C", src, "rev-parse", "HEAD"],
+                    capture_output=True, text=True, timeout=30,
+                ).stdout.strip()
+            except Exception as e:  # git missing / not a repo — report, don't crash
+                actual = f"<error: {e!r}>"
+            row["actual"] = actual
+            row["status"] = "match" if actual == c["commit"] else "MISMATCH"
+        rows.append(row)
+    return rows
 
 
 if __name__ == "__main__":

@@ -177,12 +177,33 @@ def main():
                     help="import harnesses + validate scenario tables; make NO API calls")
     ap.add_argument("--manifest", action="store_true",
                     help="print the reproducibility manifest (SHA over pinned inputs); make NO API calls")
+    ap.add_argument("--verify-corpus", action="store_true",
+                    help="check each real-corpus checkout on disk is at the pinned commit; NO API calls")
     ap.add_argument("--only", metavar="ID", help="run a single benchmark by its config id")
     args = ap.parse_args()
 
     cfg = load_config()
     if args.manifest:
         print(json.dumps(bench_manifest.build_manifest(cfg), indent=2))
+        return 0
+    if args.verify_corpus:
+        rows = bench_manifest.verify_corpus(cfg)
+        if not rows:
+            print("no corpus-pinned benchmarks in the config.")
+            return 0
+        bad = 0
+        for r in rows:
+            ok = r["status"] == "match"
+            bad += 0 if ok else 1
+            mark = "✓" if ok else "✗"
+            print(f"  {mark} {r['id']:<14} {r['repo']}")
+            print(f"      expected {r['expected']}")
+            print(f"      on disk  {r['actual'] or '(none)'}  [{r['status']}]  {r['path']}")
+        print()
+        if bad:
+            print(f"corpus verify FAIL — {bad} checkout(s) not at the pinned commit.")
+            return 1
+        print(f"corpus verify PASS — {len(rows)} checkout(s) at the pinned commit.")
         return 0
     if args.dry_run:
         return dry_run(cfg)

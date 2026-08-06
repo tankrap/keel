@@ -45,6 +45,9 @@ python3 run_suite.py --dry-run
 # Free: print the reproducibility manifest (a stable SHA over every pinned input). No API, no key.
 python3 run_suite.py --manifest
 
+# Free: check each real-corpus checkout on disk is at the manifest's pinned commit. No API, no key.
+python3 run_suite.py --verify-corpus
+
 # Live (costs credits): run the packaged benchmarks and write an aggregated report.
 python3 run_suite.py
 
@@ -83,9 +86,13 @@ What it binds, and why each matters:
 - **`bench_common.py`'s source** — the shared dual-judge prompt, the `api()` defaults, and the `SOLVER`/`JUDGE`/`API_VERSION` constants the harnesses *actually call* (the run reads these, not the config's `models` block);
 - **the result-affecting config** — schema/version, the pinned model IDs (verified to equal the constants the code uses, so the config can't silently drift from the run), `trials`, the Wilson `z`, and each benchmark's shape.
 
-`workers` is deliberately **excluded** (pure parallelism — it changes wall-clock, never an outcome). Hashing source is conservative on purpose: a comment edit bumps the SHA (a harmless false "not reproducible"), the safe direction. **Not yet bound:** the *content* of the real corpus checkouts — pinning each corpus's git commit is the tracked follow-up; the gap is small because the solver prompt is built from `SCEN` (path/hint/task/lesson), not the file bytes, so a different checkout moves essentially only the retrieval-hit count, not the headline lift.
+- **each real corpus's `repo` + git `commit`** — the exact revision of the real files a corpus benchmark ran against, so a different checkout yields a different SHA. (The `src` path/env are *not* hashed — only the repo identity and commit affect a result.)
 
-It's deterministic by construction (canonical JSON → identical bytes → identical hash), needs no API or token, and `--dry-run` asserts that determinism. `test_manifest.py` locks the guarantees (deterministic, scenario/source/config change → SHA-change, `workers` change → SHA-*un*changed, config-vs-code model drift refused, count-drift caught), and the CI gate runs both so a scenario-table drift or a broken harness fails the build. Bump `version` in `bench-config.json` whenever the pinned inputs change.
+`workers` is deliberately **excluded** (pure parallelism — it changes wall-clock, never an outcome). Hashing source is conservative on purpose: a comment edit bumps the SHA (a harmless false "not reproducible"), the safe direction.
+
+`python3 run_suite.py --verify-corpus` checks that each corpus checkout **on disk** is at the pinned commit (`git rev-parse HEAD` vs the manifest) and fails on any drift — the on-ramp for confirming your machine reproduces a published SHA. It's kept out of `build_manifest` and the CI gate because it needs the (large) checkouts present; the manifest itself stays checkout-free.
+
+It's deterministic by construction (canonical JSON → identical bytes → identical hash), needs no API or token, and `--dry-run` asserts that determinism. `test_manifest.py` locks the guarantees (deterministic, scenario/source/config/corpus-commit change → SHA-change, `workers` change → SHA-*un*changed, config-vs-code model drift refused, count-drift caught), and the CI gate runs the self-test + dry-run so a scenario-table drift or a broken harness fails the build. Bump `version` in `bench-config.json` whenever the pinned inputs change.
 
 ### Reading the Wilson intervals
 
@@ -99,8 +106,8 @@ Each condition reports a Wilson score interval, the range the true success rate 
 
 | file | role |
 |---|---|
-| `run_suite.py` | single entry point; `--dry-run` / `--manifest`, aggregates a JSON and markdown report |
-| `bench-config.json` | pinned config: models, trials, workers, scenario counts, Wilson z |
+| `run_suite.py` | single entry point; `--dry-run` / `--manifest` / `--verify-corpus`, aggregates a JSON and markdown report |
+| `bench-config.json` | pinned config: models, trials, workers, scenario counts, Wilson z, per-corpus repo+commit |
 | `bench_manifest.py` | reproducibility manifest: a stable SHA over every pinned input (no API) |
 | `test_manifest.py` | self-test locking the manifest's guarantees (run in the CI gate) |
 | `bench_common.py` | shared plumbing: the API client, `wilson()`, dual `judge()`, `sh()`, parallel `run_trials()` |
