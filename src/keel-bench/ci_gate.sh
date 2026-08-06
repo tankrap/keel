@@ -112,6 +112,14 @@ else
   fail "erasure flow (pre-yes=$EPRE plaintext-leaks=$ELEAK post-erased=$EPOST task-survived=$ETASK)"
 fi
 
+# guard the commit --session --erasable fix directly: it must NOT auto-attach a plaintext served-brief
+printf '{"task":"ci-cs","prompts":"erasable session body"}\n' > "$TMP/ecs.json"
+"$KEEL" brief --root "$TMP/repo" --file a.ts --symbol doA >/dev/null 2>&1  # populate last_brief (the plaintext ctx)
+"$KEEL" native commit --session "$TMP/ecs.json" --erasable --author acct:cs --root "$TMP/repo" -m "erasable cs" >/dev/null 2>&1
+ECS=$("$KEEL" native log --root "$TMP/repo" 2>/dev/null | head -1 | awk '{print $1}')
+CTX=$("$KEEL" session "$ECS" --root "$TMP/repo" 2>/dev/null | grep -c "context:.*—")
+if [ "${CTX:-0}" = "1" ]; then pass "erasable commit --session skips the plaintext auto-context"; else fail "erasable commit leaked a plaintext context_served"; fi
+
 section "benchmark suite — reproducibility manifest + compare + dry-run (no API)"
 BENCH=~/keel/src/keel-bench
 if python3 "$BENCH/test_manifest.py" >/dev/null 2>&1 && python3 "$BENCH/test_compare.py" >/dev/null 2>&1 \
