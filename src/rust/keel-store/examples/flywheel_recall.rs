@@ -197,7 +197,9 @@ fn main() {
     // Commit each session's code as its own change (a distinct file per item, so each change's diff
     // is exactly that session's code), and extract its sym set from the real production extractor.
     let mut tagged: Vec<Tagged> = Vec::new();
-    let mut queries: Vec<(String, BTreeSet<String>, BTreeSet<String>, BTreeSet<String>)> = Vec::new(); // (id, qsym, qpat_hand, qpat_real)
+    // (id, qsym, qpat_hand, qpat_real)
+    type Query = (String, BTreeSet<String>, BTreeSet<String>, BTreeSet<String>);
+    let mut queries: Vec<Query> = Vec::new();
     for (i, it) in items.iter().enumerate() {
         std::fs::write(work.join(format!("{}.js", it.id)), it.code).unwrap();
         let c = repo.commit_dir(&work, it.id, "bench", (i + 1) as u64, None).unwrap();
@@ -231,7 +233,8 @@ fn main() {
         let (mut r1, mut r2, mut r3) = (0, 0, 0);
         println!("    ── {mode} ──");
         for (tid, qsym, qpat_hand, qpat_real) in &queries {
-            let (qpat, spat): (&BTreeSet<String>, fn(&Tagged) -> &BTreeSet<String>) = match mode {
+            type PatOf = fn(&Tagged) -> &BTreeSet<String>;
+            let (qpat, spat): (&BTreeSet<String>, PatOf) = match mode {
                 "sym-only" => (&empty, |t| &t.pat),
                 "sym+pat(hand-modeled)" => (qpat_hand, |t| &t.pat),
                 _ => (qpat_real, |t| &t.real_pat),

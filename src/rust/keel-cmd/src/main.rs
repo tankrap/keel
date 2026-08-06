@@ -847,8 +847,31 @@ fn cmd_native(args: &[String]) -> io::Result<()> {
         Some("status") => cmd_status(&args[1..]),
         Some("log") => cmd_log(&args[1..]),
         Some("diff") => cmd_diff(&args[1..]),
-        _ => Err(io::Error::other("keel native: expected commit | status | log | diff")),
+        Some("version") => cmd_version(),
+        _ => Err(io::Error::other("keel native: expected commit | status | log | diff | version")),
     }
+}
+
+/// `keel native version` — the keel binary's OWN build identity (crate version + the git commit it
+/// was built from, and whether that tree was dirty), as byte-stable JSON. Distinct from `keel
+/// --version`, which proxies to the git binary keel wraps. Consumers pin/record this to tie a result
+/// to the exact keel build that produced it. The git fields are embedded at build time by build.rs;
+/// an empty commit means keel was built outside a checkout (or without git available).
+fn cmd_version() -> io::Result<()> {
+    println!("{}", render_json(&version_value()));
+    Ok(())
+}
+
+/// The keel build identity as JSON. Pure (reads only compile-time env) so it's unit-testable.
+fn version_value() -> Value {
+    let commit = option_env!("KEEL_GIT_COMMIT").unwrap_or("");
+    let dirty = option_env!("KEEL_GIT_DIRTY") == Some("1");
+    json!({
+        "version": env!("CARGO_PKG_VERSION"),
+        "git_commit": commit,
+        "git_commit_short": commit.get(..12).unwrap_or(commit),
+        "dirty": dirty,
+    })
 }
 
 /// `keel serve [--port N]` — serve this repo over git's smart-HTTP protocol, so a plain
@@ -2144,5 +2167,20 @@ mod tests {
         assert_eq!(decode_chunked(raw), None);
         // usize::MAX itself, and a value one below, both exercise the checked_add / end+2 guards.
         assert_eq!(decode_chunked(b"ffffffffffffffff\r\nx"), None);
+    }
+
+    #[test]
+    fn version_value_reports_crate_version_and_stable_shape() {
+        let v = version_value();
+        // the crate version is always known at compile time; the build identity always carries it
+        assert_eq!(v["version"], json!(env!("CARGO_PKG_VERSION")));
+        // shape is stable for consumers that pin/record it: these keys always exist and are typed
+        assert!(v["git_commit"].is_string(), "git_commit must be a string (empty if built outside a checkout)");
+        assert!(v["git_commit_short"].is_string(), "git_commit_short must be a string");
+        assert!(v["dirty"].is_boolean(), "dirty must be a bool");
+        // the short form never exceeds 12 chars and is a prefix of the full commit
+        let full = v["git_commit"].as_str().unwrap();
+        let short = v["git_commit_short"].as_str().unwrap();
+        assert!(short.len() <= 12 && full.starts_with(short));
     }
 }

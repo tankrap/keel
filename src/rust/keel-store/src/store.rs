@@ -279,11 +279,11 @@ impl Store {
                 Ok(v)
             })();
             match attempt {
-                Err(e) if matches!(e, StoreError::MapFull) => {
+                Err(StoreError::MapFull) => {
                     drop(guard); // release our shared guard so the resize can take the exclusive one
                     self.grow_map()?; // waits for all other txns to drain, then resizes
                 }
-                Err(e) if matches!(e, StoreError::MapResized) => {
+                Err(StoreError::MapResized) => {
                     drop(guard);
                     self.adopt_map_size()?; // a peer grew the file; match its size, then retry
                 }
