@@ -169,7 +169,8 @@
       <span class="chip">repos: <b>linux&nbsp;kernel</b> (94,523 files · 1.6&nbsp;GB · C)</span>
       <span class="chip"><b>VS&nbsp;Code&nbsp;/src</b> (9,358 files · 0.12&nbsp;GB · TS)</span>
       <span class="chip">flywheel suite: <b>versioned + manifest-pinned</b></span>
-      <span class="chip">2026-08-06</span>
+      <span class="chip">storage/scale measured <b>2026-07-29</b></span>
+      <span class="chip">report 2026-08-06</span>
     </div>
   </div>
 </header>
@@ -594,7 +595,7 @@
 <footer>
   <div class="wrap">
     <div><b style="color:var(--muted)">Reproducibility.</b> Storage/scale: <code>cargo run --release -p keel-store --example scale_bench -- &lt;dir&gt;</code>. Relevance + graph: <code>… --example system_bench</code>, <code>-p keel-graph --example c_scale</code>. git head-to-head: fresh <code>GIT_DIR</code>, one commit, <code>gc</code>. Flywheel suite: <code>src/keel-bench/</code> — <code>python3 run_suite.py --dry-run</code> / <code>--manifest</code> / <code>--verify-corpus</code> / <code>--verify-keel</code> validate the pinned inputs offline; a live run writes a report carrying its manifest SHA, and <code>--compare</code> certifies a re-run reproduces.</div>
-    <div><b style="color:var(--muted)">Two tiers of confidence.</b> Storage/scale/relevance are single-machine measurements — directional, reproducible via the commands above. The <b>flywheel suite is stronger</b>: versioned, its inputs hashed into a manifest SHA, its corpora and the keel build pinned to commits, and its stochastic results certified to reproduce within noise. The eval protocol itself — record a project convention with <code>keel learn</code>, retrieve it with <code>keel brief</code>, solve a task WITHOUT vs WITH it, score with a strict dual judge — is a spec any context-retrieval tool can be run against. keel is a research build, local, not yet pushed.</div>
+    <div><b style="color:var(--muted)">Two tiers of confidence.</b> Storage/scale/relevance are single-machine measurements — directional, reproducible via the commands above. The <b>flywheel suite is stronger</b>: versioned, its inputs hashed into a manifest SHA, its corpora and the keel build pinned to commits, and its stochastic results certified to reproduce within noise. The eval protocol itself — record a project convention with <code>keel learn</code>, retrieve it with <code>keel brief</code>, solve a task WITHOUT vs WITH it, score with a strict dual judge — is a methodology another context-retrieval tool could be evaluated under (the harness currently drives keel directly; no drop-in adapter yet). keel is a research build, local, not yet pushed.</div>
     <div style="margin-top:14px; color:var(--faint)">keel · the fused code + session graph · benchmark report 2026-08-06</div>
   </div>
 </footer>
