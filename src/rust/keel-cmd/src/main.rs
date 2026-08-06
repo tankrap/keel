@@ -48,6 +48,7 @@ fn main() {
         Some("reviews") => run(cmd_reviews(&args[1..])),
         Some("why") => run(cmd_why(&args[1..])),
         Some("capture") => run(cmd_capture(&args[1..])),
+        Some("erase") => run(cmd_erase(&args[1..])),
         Some("native") => run(cmd_native(&args[1..])),
         // ── git-compatible surface ──
         Some("init") => run(cmd_init(&args[1..])),   // git init + keel store
@@ -275,8 +276,13 @@ fn cmd_commit(args: &[String]) -> io::Result<()> {
     };
     let auto_ctx = last_brief_blob(&repo, &root);
     let session_id = if let Some(path) = flag(args, "--session") {
-        let mut s = session_from_file(&repo, path, msg, flag(args, "--lesson"), scrub)?;
-        if s.context_served.is_none() {
+        let ek = erase_key_of(args, author);
+        let mut s = session_from_file(&repo, path, msg, flag(args, "--lesson"), scrub, ek)?;
+        // Only auto-attach the served brief to a NON-erasable session: `last_brief_blob` is a plaintext
+        // blob, so attaching it to an erasable commit would bolt on a non-erasable payload that `keel
+        // erase` can't remove (the session file may still set its own context_served, which IS
+        // encrypted). Skip it for erasable commits to keep the erasure guarantee honest.
+        if ek.is_none() && s.context_served.is_none() {
             s.context_served = auto_ctx;
         }
         Some(repo.store().put(&Object::Session(s)).map_err(to_io)?)
@@ -308,22 +314,76 @@ fn cmd_commit(args: &[String]) -> io::Result<()> {
 /// Session holds their ids. Shape:
 /// `{ task?, model?, lesson?, prompts?, context_served?, tool_calls?[], tool_results?[],
 ///    tokens_in?, tokens_out?, verification?: "green"|"red"|"unverified" }`
-fn session_from_file(repo: &Repo, path: &str, msg: &str, lesson_override: Option<&str>, scrub: bool) -> io::Result<Session> {
+fn session_from_file(repo: &Repo, path: &str, msg: &str, lesson_override: Option<&str>, scrub: bool, erase_key: Option<&str>) -> io::Result<Session> {
     let raw = std::fs::read_to_string(path)?;
     let v: Value = serde_json::from_str(&raw).map_err(|e| io::Error::other(format!("session json: {e}")))?;
-    session_from_value(repo, &v, msg, lesson_override, scrub)
+    session_from_value(repo, &v, msg, lesson_override, scrub, erase_key)
+}
+
+/// Resolve the crypto-shred key_id for an erasable capture/commit. Erasable storage is enabled by
+/// EITHER `--erasable` (keyed by the author — per-subject erasure, one subject's data erases together)
+/// OR an explicit `--erase-key <id>` (which also implies erasable; a constant id = per-repo scope, a
+/// unique id = per-session). `None` means store payloads as plaintext blobs (the default; still
+/// secret-scrubbed).
+fn erase_key_of<'a>(args: &'a [String], author: &'a str) -> Option<&'a str> {
+    if let Some(k) = flag(args, "--erase-key") {
+        Some(k)
+    } else if has(args, "--erasable") {
+        Some(author)
+    } else {
+        None
+    }
+}
+
+/// `keel erase <key-id> [--json]` — the right-to-erasure operation (NEW-1088). Crypto-shreds the data
+/// key: every session payload captured under it (`keel capture --erasable`, default key = the author)
+/// becomes permanently unrecoverable, while the immutable change graph — commits, trees, and the
+/// task/lesson metadata — stays intact and verifiable. IRREVERSIBLE. Note it erases only THIS store;
+/// backups/replicas retain the data until they are erased too.
+fn cmd_erase(args: &[String]) -> io::Result<()> {
+    let key_id = args
+        .iter()
+        .find(|a| !a.starts_with('-'))
+        .ok_or_else(|| io::Error::other("usage: keel erase <key-id> --force (the --erase-key/author an erasable capture used; IRREVERSIBLE)"))?;
+    // Irreversible: a mistyped key_id destroys the wrong subject's data with no undo. Require --force.
+    if !has(args, "--force") {
+        return Err(fail_fix(
+            format!("`keel erase {key_id}` is IRREVERSIBLE — it permanently destroys every payload under this key"),
+            "re-run with --force to confirm",
+        ));
+    }
+    let (_, store) = root_store(args)?;
+    let repo = Repo::open(&store).map_err(to_io)?;
+    let existed = repo.store().has_key(key_id).map_err(to_io)?;
+    let n = repo.store().shred_key(key_id).map_err(to_io)?;
+    if has(args, "--json") {
+        println!("{}", render_json(&json!({ "ok": true, "key_id": key_id, "erased": n, "key_existed": existed })));
+    } else if existed {
+        println!("erased '{key_id}' — {n} payload(s) now permanently unrecoverable (the change graph is untouched)");
+    } else {
+        println!("no key '{key_id}' — nothing to erase (already shredded, or no erasable capture used it)");
+    }
+    Ok(())
 }
 
 /// Build a [`Session`] from an already-parsed universal capture object (see [`session_from_file`]
 /// for the shape). Shared by `commit --session` and the `capture` adapters.
-fn session_from_value(repo: &Repo, v: &Value, msg: &str, lesson_override: Option<&str>, scrub: bool) -> io::Result<Session> {
+fn session_from_value(repo: &Repo, v: &Value, msg: &str, lesson_override: Option<&str>, scrub: bool, erase_key: Option<&str>) -> io::Result<Session> {
     let s = |k: &str| v.get(k).and_then(Value::as_str);
     // The single choke point before any session text is content-addressed: scrub secrets here too
     // (unless the caller already scrubbed, or --no-scrub), so `keel commit --session <file>` — a
     // hand-supplied session file — gets the same protection as `keel capture` (NEW-1088).
     let scrub_txt = |t: &str| -> String { if scrub { scrub_secrets(t).0 } else { t.to_string() } };
+    // When `erase_key` is set, the bulk payloads (prompts / context / tool calls & results) are
+    // stored crypto-shreddable under that key_id instead of as plaintext blobs — so `keel erase
+    // <key_id>` can later make them unrecoverable (right-to-erasure, NEW-1088). `task`/`lesson` stay
+    // plaintext: they're the flywheel's retrieval metadata, not the sensitive transcript bulk.
     let blob = |text: &str| -> io::Result<ObjectId> {
-        repo.store().put(&Object::Blob(scrub_txt(text).into_bytes())).map_err(to_io)
+        let t = scrub_txt(text);
+        match erase_key {
+            Some(kid) => repo.store().put_secret(t.as_bytes(), kid).map_err(to_io),
+            None => repo.store().put(&Object::Blob(t.into_bytes())).map_err(to_io),
+        }
     };
     let opt_blob = |k: &str| -> io::Result<Option<ObjectId>> {
         match s(k) {
@@ -365,7 +425,7 @@ fn cmd_capture(args: &[String]) -> io::Result<()> {
         .iter()
         .find(|a| !a.starts_with('-'))
         .cloned()
-        .ok_or_else(|| io::Error::other("usage: keel capture <session-log> [--tool claude|aider] [--commit] [--no-scrub] (a Claude Code .jsonl or Aider chat history; secrets are scrubbed before storage unless --no-scrub)"))?;
+        .ok_or_else(|| io::Error::other("usage: keel capture <session-log> [--tool claude|aider] [--commit] [--no-scrub] [--erasable [--erase-key <id>]] (Claude Code .jsonl / Aider history; secrets scrubbed unless --no-scrub; --erasable stores payloads crypto-shreddable so `keel erase` can remove them)"))?;
     let text = std::fs::read_to_string(&log)?;
     let tool = match flag(args, "--tool").unwrap_or("auto") {
         "auto" => detect_tool(&log, &text),
@@ -407,9 +467,10 @@ fn cmd_capture(args: &[String]) -> io::Result<()> {
         let repo = Repo::open(&store).map_err(to_io)?;
         // scrub=false: cmd_capture already scrubbed `universal` (and the lesson) above, respecting
         // --no-scrub — don't double-work.
-        let session = session_from_value(&repo, &universal, &task, lesson.as_deref(), false)?;
-        let sid = repo.store().put(&Object::Session(session)).map_err(to_io)?;
         let author = flag(args, "--author").unwrap_or("capture");
+        let erase_key = erase_key_of(args, author);
+        let session = session_from_value(&repo, &universal, &task, lesson.as_deref(), false, erase_key)?;
+        let sid = repo.store().put(&Object::Session(session)).map_err(to_io)?;
         let ts = now_secs();
         let cid = repo.commit_dir(&root, &task, author, ts, Some(sid)).map_err(to_io)?;
         if let Some(lesson) = lesson.as_deref() {
@@ -2110,7 +2171,17 @@ fn cmd_session(args: &[String]) -> io::Result<()> {
     let Some(Object::Session(s)) = repo.store().get(&sid).map_err(to_io)? else {
         return Err(io::Error::other("session object missing"));
     };
-    let count = |o: &Option<keel_store::ObjectId>| if o.is_some() { "yes" } else { "—" };
+    // A payload reads as `erased` once its crypto-shred key is gone (right-to-erasure), `yes` if
+    // present (plaintext blob or still-decryptable), `—` if the session never carried it.
+    let status = |o: &Option<keel_store::ObjectId>| -> &'static str {
+        match o {
+            None => "—",
+            Some(pid) => match repo.store().read_secret(pid) {
+                Ok(keel_store::SecretState::Shredded) => "erased",
+                _ => "yes",
+            },
+        }
+    };
     println!("session for change {}", short(&id.to_hex()));
     println!("  task:      {}", s.task);
     println!("  model:     {}", s.model);
@@ -2119,9 +2190,23 @@ fn cmd_session(args: &[String]) -> io::Result<()> {
     }
     println!("  tokens:    in {} / out {}", s.tokens_in, s.tokens_out);
     println!("  verified:  {:?}", s.verification);
-    println!("  prompts:   {}", count(&s.prompts));
-    println!("  context:   {}", count(&s.context_served));
-    println!("  tool_calls: {}   tool_results: {}", s.tool_calls.len(), s.tool_results.len());
+    // erasure-aware count for the payload vecs: N, or "N (erased)" once every entry's key is shredded.
+    let vec_status = |v: &[keel_store::ObjectId]| -> String {
+        if v.is_empty() {
+            return "0".to_string();
+        }
+        let all_erased = v
+            .iter()
+            .all(|pid| matches!(repo.store().read_secret(pid), Ok(keel_store::SecretState::Shredded)));
+        if all_erased {
+            format!("{} (erased)", v.len())
+        } else {
+            v.len().to_string()
+        }
+    };
+    println!("  prompts:   {}", status(&s.prompts));
+    println!("  context:   {}", status(&s.context_served));
+    println!("  tool_calls: {}   tool_results: {}", vec_status(&s.tool_calls), vec_status(&s.tool_results));
     Ok(())
 }
 

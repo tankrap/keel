@@ -28,6 +28,12 @@
 //!     the file until overwritten (and a stale MVCC reader can still see them).
 //!   - **Key bytes in memory.** The key/nonce buffers and `ring`'s key objects are not zeroized on
 //!     drop, so a just-deleted key can persist in freed heap for the process lifetime.
+//!   - **Plaintext dedup across namespaces.** Content is addressed by `blake3(plaintext)`. If the
+//!     *same* plaintext is ALSO stored as a normal unencrypted blob (e.g. a non-erasable capture of
+//!     the same transcript), that plaintext copy lives in the main object store and a key-shred does
+//!     NOT remove it — erasure holds only for content stored *exclusively* via [`Store::put_secret`].
+//!     `keel capture --erasable` does exactly that; mixing erasable and non-erasable captures of
+//!     identical content defeats the guarantee.
 //!
 //! A deployment needing the key material *provably* gone should hold the keyring in an external
 //! KMS/HSM (and/or add `zeroize` for the in-process buffers). Erasable granularity is the `key_id` —

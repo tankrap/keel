@@ -98,6 +98,28 @@ printf '{"task":"ci","prompts":"ran with %s here","tool_results":["out %s"]}\n' 
 LEAKS=$(grep -rl "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789ab" "$TMP/repo/.keel" 2>/dev/null | wc -l | tr -d ' ')
 if [ "${LEAKS:-1}" = "0" ]; then pass "commit --session scrubbed the token (0 raw occurrences in store)"; else fail "secret leaked into store ($LEAKS file(s))"; fi
 
+section "erasure — capture --erasable then keel erase makes payloads unrecoverable (NEW-1088)"
+printf '{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"pii user@example.com transcript body"}]}}\n' > "$TMP/esess.jsonl"
+EC=$("$KEEL" capture "$TMP/esess.jsonl" --commit --erasable --author acct:ci --root "$TMP/repo" --json 2>/dev/null | python3 -c "import sys,json;print(json.load(sys.stdin)['change'])" 2>/dev/null)
+EPRE=$("$KEEL" session "$EC" --root "$TMP/repo" 2>/dev/null | grep -c "prompts:.*yes")
+ELEAK=$(grep -rl "user@example.com" "$TMP/repo/.keel" 2>/dev/null | wc -l | tr -d ' ')
+"$KEEL" erase acct:ci --force --root "$TMP/repo" >/dev/null 2>&1
+EPOST=$("$KEEL" session "$EC" --root "$TMP/repo" 2>/dev/null | grep -c "prompts:.*erased")
+ETASK=$("$KEEL" session "$EC" --root "$TMP/repo" 2>/dev/null | grep -c "^  task:")
+if [ "${EPRE:-0}" = "1" ] && [ "${ELEAK:-1}" = "0" ] && [ "${EPOST:-0}" = "1" ] && [ "${ETASK:-0}" = "1" ]; then
+  pass "erasable payload stored encrypted (0 plaintext) → erase → prompts erased, change graph survived"
+else
+  fail "erasure flow (pre-yes=$EPRE plaintext-leaks=$ELEAK post-erased=$EPOST task-survived=$ETASK)"
+fi
+
+# guard the commit --session --erasable fix directly: it must NOT auto-attach a plaintext served-brief
+printf '{"task":"ci-cs","prompts":"erasable session body"}\n' > "$TMP/ecs.json"
+"$KEEL" brief --root "$TMP/repo" --file a.ts --symbol doA >/dev/null 2>&1  # populate last_brief (the plaintext ctx)
+"$KEEL" native commit --session "$TMP/ecs.json" --erasable --author acct:cs --root "$TMP/repo" -m "erasable cs" >/dev/null 2>&1
+ECS=$("$KEEL" native log --root "$TMP/repo" 2>/dev/null | head -1 | awk '{print $1}')
+CTX=$("$KEEL" session "$ECS" --root "$TMP/repo" 2>/dev/null | grep -c "context:.*—")
+if [ "${CTX:-0}" = "1" ]; then pass "erasable commit --session skips the plaintext auto-context"; else fail "erasable commit leaked a plaintext context_served"; fi
+
 section "benchmark suite — reproducibility manifest + compare + dry-run (no API)"
 BENCH=~/keel/src/keel-bench
 if python3 "$BENCH/test_manifest.py" >/dev/null 2>&1 && python3 "$BENCH/test_compare.py" >/dev/null 2>&1 \
