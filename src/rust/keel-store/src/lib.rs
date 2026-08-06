@@ -27,6 +27,7 @@ pub mod shred;
 pub mod snapshot;
 pub mod store;
 pub mod textdiff;
+pub mod vfs;
 
 pub use livestatus::LiveStatus;
 pub use object::{
@@ -36,6 +37,7 @@ pub use repo::{ChangeKind, PathChange, Repo};
 pub use shred::SecretState;
 pub use textdiff::{diff_lines, DiffLine, Hunk, Tag};
 pub use store::{Store, StoreError};
+pub use vfs::{Attr, DirEntry, NodeKind, Stats as VfsStats, Vfs};
 
 /// The daemon's Unix socket path for `root`. Normally `<root>/.keel/daemon.sock`, but Unix socket
 /// paths are capped (`sun_path` is 104 bytes on macOS, 108 on Linux); for a deep repo path that
