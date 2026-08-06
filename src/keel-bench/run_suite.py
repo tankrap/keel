@@ -135,47 +135,60 @@ def _keel_build_str():
     return f"{v.get('version', '?')} @ {short}" + (" (dirty)" if v.get("dirty") else "")
 
 
-def run_compare(path_a, path_b):
-    """Print whether two report artifacts reproduce within noise. Manifest-gated: differing inputs
-    (manifest SHAs) is a hard mismatch, not a noise comparison."""
+def run_compare(path_a, path_b, margin_pp=None):
+    """Certify whether two report artifacts reproduce, via an equivalence test (TOST) at a margin, with
+    a Holm-corrected regression check. Manifest-gated. Exit: 0 equivalent, 1 regression / manifest
+    mismatch, 2 read/usage error, 3 inconclusive (underpowered — can't certify equivalence)."""
     try:
         ra = bench_compare.load_report(path_a)
         rb = bench_compare.load_report(path_b)
     except (OSError, ValueError) as e:
         print(f"could not read a report: {e}", file=sys.stderr)
         return 2
-    r = bench_compare.compare(ra, rb)
+    margin = bench_compare.MARGIN_DEFAULT if margin_pp is None else margin_pp / 100.0
+    r = bench_compare.compare(ra, rb, margin=margin)
 
-    if not r["manifest_match"]:
-        print("✗ MANIFEST MISMATCH — the two runs used different inputs, so a noise comparison is meaningless.")
+    if r["verdict"] == "manifest_mismatch":
+        print("✗ MANIFEST MISMATCH — the two runs used different inputs, so a reproduction check is meaningless.")
         print(f"    A: {r['manifest_a']}")
         print(f"    B: {r['manifest_b']}")
         return 1
     print(f"manifest match: {r['manifest_a']}")
+    print(f"equivalence margin: ±{r['margin_pct']}pp   confidence: {round(100*(1-r['alpha']))}% (z={r['z']})")
     if not r["keel_match"]:
         print(f"note: different keel build (A {(r['keel_a'] or '?')[:12]} vs B {(r['keel_b'] or '?')[:12]}) — "
-              "expected to still reproduce within noise, but the tool changed.")
+              "expected to still reproduce, but the tool changed.")
     if r["unmatched"]:
         print(f"note: benchmarks in only one report (skipped): {', '.join(r['unmatched'])}")
     print()
 
     for c in r["conditions"]:
-        mark = "✓" if c["consistent"] else "✗"
-        z = "n/a" if c["z"] is None else f"z={c['z']:+.2f}"
+        mark = "✗" if c["regressed"] else ("✓" if c["equivalent"] else "~")
+        tag = "regressed" if c["regressed"] else ("equivalent" if c["equivalent"] else "inconclusive")
         print(f"  {mark} {c['id']:<16} {c['condition']:<8} "
-              f"A {c['a'][0]}/{c['a'][1]} ({c['a_pct']}%)  B {c['b'][0]}/{c['b'][1]} ({c['b_pct']}%)  {z}")
+              f"A {c['a'][0]}/{c['a'][1]} ({c['a_pct']}%)  B {c['b'][0]}/{c['b'][1]} ({c['b_pct']}%)  "
+              f"Δ{c['diff_pct']:+}pp ±{c['ci_half_pct']}  p={c['p_val']}  [{tag}]")
     print()
 
-    if not r["conditions"]:
+    v = r["verdict"]
+    if v == "no_data":
         print("reproduce check FAIL — no comparable conditions (empty or non-overlapping benchmark sets).")
         return 1
-    if r["reproduces_within_noise"]:
+    if v == "regression":
+        bad = [f"{c['id']}/{c['condition']}" for c in r["conditions"] if c["regressed"]]
+        print(f"REGRESSION — {len(bad)} condition(s) differ significantly (Holm-corrected): {', '.join(bad)}.")
+        return 1
+    if v == "equivalent":
         n = len(r["conditions"])
-        print(f"reproduce check PASS — all {n} condition(s) agree within noise (two-proportion z, 95%).")
+        print(f"EQUIVALENT — all {n} condition(s) reproduce within ±{r['margin_pct']}pp. The run reproduced.")
         return 0
-    bad = [f"{c['id']}/{c['condition']}" for c in r["conditions"] if not c["consistent"]]
-    print(f"reproduce check FAIL — {len(bad)} condition(s) differ significantly: {', '.join(bad)}.")
-    return 1
+    # inconclusive: no significant regression, but the samples can't certify equivalence within margin
+    widest = max(c["ci_half_pct"] for c in r["conditions"])
+    weak = [f"{c['id']}/{c['condition']}" for c in r["conditions"] if not c["equivalent"]]
+    print(f"INCONCLUSIVE — no significant regression, but {len(weak)} condition(s) can't be certified within "
+          f"±{r['margin_pct']}pp at this sample size (widest CI half-width ±{widest}pp).")
+    print(f"    underpowered: {', '.join(weak)}. Raise --margin, or add trials to tighten the interval.")
+    return 3
 
 
 def markdown_report(cfg, summaries):
@@ -263,12 +276,14 @@ def main():
     ap.add_argument("--verify-keel", action="store_true",
                     help="print the keel binary's build identity and require a clean, identified commit; NO API calls")
     ap.add_argument("--compare", nargs=2, metavar=("REPORT_A", "REPORT_B"),
-                    help="do two report.json runs agree within statistical noise? (manifest-gated); NO API calls")
+                    help="certify whether two report.json runs reproduce (equivalence test, manifest-gated); NO API calls")
+    ap.add_argument("--margin", type=float, metavar="PP", default=None,
+                    help="equivalence margin in percentage points for --compare (default 20)")
     ap.add_argument("--only", metavar="ID", help="run a single benchmark by its config id")
     args = ap.parse_args()
 
     if args.compare:
-        return run_compare(*args.compare)
+        return run_compare(*args.compare, margin_pp=args.margin)
 
     cfg = load_config()
     if args.manifest:

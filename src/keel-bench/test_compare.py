@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""Self-test for the reproduce-within-noise comparator (NEW-1094). No API, no token.
+"""Self-test for the reproduce/equivalence comparator (NEW-1094). No API, no token.
+
+Encodes the honest three-way contract, including the crucial one: a moderate true difference the
+sample is too small to resolve must come back INCONCLUSIVE, never a false "equivalent".
 
     python3 test_compare.py
 """
@@ -17,9 +20,10 @@ def _cond(bid, wo, wi, tot):
             "with": {"correct": wi, "total": tot, "pct": round(100 * wi / tot, 1)}}
 
 
-def _report(manifest, benches, keel="cafe1234abcd"):
+def _report(manifest, benches, keel="cafe1234abcd", wilson_z=1.96):
     return {"manifest": {"manifest_sha256": manifest},
             "environment": {"keel": {"git_commit": keel}},
+            "run": {"wilson_z": wilson_z},
             "benchmarks": benches}
 
 
@@ -33,46 +37,65 @@ def main():
 
     M = "a" * 64
 
-    # identical runs → reproduces within noise
+    # identical runs (95% base rate, n=80) → EQUIVALENT within the default ±20pp margin
     a = _report(M, [_cond("b1", 40, 76, 80)])
     r = bench_compare.compare(a, a)
-    check(r["reproduces_within_noise"], "identical runs reproduce within noise")
+    check(r["verdict"] == "equivalent", "identical runs → EQUIVALENT")
     check(r["manifest_match"] and r["keel_match"], "identical runs: manifest + keel match")
 
-    # small run-to-run wiggle (50% vs 55% at n=80) → not significant → still reproduces
-    b_wiggle = _report(M, [_cond("b1", 44, 74, 80)])
-    r = bench_compare.compare(_report(M, [_cond("b1", 40, 76, 80)]), b_wiggle)
-    check(r["reproduces_within_noise"], "a small wiggle (50%↔55%) is within noise")
-
-    # a large shift in one condition (100% vs 0% at n=80) → significant → FAILS
+    # a large regression (with: 100% → 0% at n=80) → REGRESSION (Holm-corrected, real difference)
     r = bench_compare.compare(_report(M, [_cond("b1", 40, 80, 80)]),
                               _report(M, [_cond("b1", 40, 0, 80)]))
-    check(not r["reproduces_within_noise"], "a 100%↔0% shift is flagged (not within noise)")
-    bad = [c for c in r["conditions"] if not c["consistent"]]
+    check(r["verdict"] == "regression", "a 100%→0% shift → REGRESSION")
+    bad = [c for c in r["conditions"] if c["regressed"]]
     check(len(bad) == 1 and bad[0]["condition"] == "with", "the WITH condition is the one flagged")
 
-    # different inputs (manifest mismatch) → hard mismatch, never 'reproduces'
+    # THE KEY CASE: a moderate ~17pp difference at n=48 is NOT significant AND cannot be certified
+    # equivalent within ±20pp → INCONCLUSIVE, never a false "equivalent". This is the whole point:
+    # low power makes the tool refuse to certify, not rubber-stamp.
+    r = bench_compare.compare(_report(M, [_cond("b1", 24, 30, 48)]),
+                              _report(M, [_cond("b1", 32, 30, 48)]))
+    check(r["verdict"] == "inconclusive", "a moderate underpowered gap → INCONCLUSIVE (not a false 'equivalent')")
+    check(not any(c["equivalent"] for c in r["conditions"] if c["condition"] == "without"),
+          "the underpowered WITHOUT condition is not certified equivalent")
+
+    # widening the margin to ±40pp lets that same gap certify as EQUIVALENT (margin is honest/tunable)
+    r = bench_compare.compare(_report(M, [_cond("b1", 24, 30, 48)]),
+                              _report(M, [_cond("b1", 32, 30, 48)]), margin=0.40)
+    check(r["verdict"] == "equivalent", "widening --margin to ±40pp certifies the same gap (tunable)")
+
+    # different inputs (manifest mismatch) → never a reproduction verdict
     r = bench_compare.compare(_report(M, [_cond("b1", 40, 76, 80)]),
                               _report("b" * 64, [_cond("b1", 40, 76, 80)]))
-    check(not r["manifest_match"] and not r["reproduces_within_noise"],
-          "a manifest mismatch is a hard fail, not a noise comparison")
+    check(r["verdict"] == "manifest_mismatch", "a manifest mismatch is a hard mismatch, not a reproduction")
 
-    # both conditions all-pass (se == 0 path) → consistent, no divide-by-zero
+    # Holm correction: two mildly-significant conditions (raw p≈0.03 each) must NOT be flagged as a
+    # regression at family-wise α (controls the ~40% false-fail rate a naive per-test 0.05 would give).
+    #   58/80 vs 44/80 → raw z≈2.28, p≈0.023; with m=2 conditions Holm needs p ≤ 0.05/2 = 0.025 for the
+    #   smallest, so a single such condition is borderline — use two to exercise the family-wise guard.
+    r = bench_compare.compare(_report(M, [_cond("b1", 58, 58, 80), _cond("b2", 58, 58, 80)]),
+                              _report(M, [_cond("b1", 44, 44, 80), _cond("b2", 44, 44, 80)]))
+    raw_sig = [c for c in r["conditions"] if c["p_val"] < 0.05]
+    flagged = [c for c in r["conditions"] if c["regressed"]]
+    check(len(raw_sig) >= 2 and len(flagged) < len(raw_sig),
+          "Holm correction spares at least one raw-significant condition (family-wise control)")
+
+    # both conditions all-pass (se == 0 path) → equivalent, no divide-by-zero
     r = bench_compare.compare(_report(M, [_cond("b1", 80, 80, 80)]),
                               _report(M, [_cond("b1", 80, 80, 80)]))
-    check(r["reproduces_within_noise"], "both-all-pass compares cleanly (no divide-by-zero)")
+    check(r["verdict"] == "equivalent", "both-all-pass compares cleanly (no divide-by-zero)")
 
-    # a different keel build is a note, not a failure (still reproduces within noise)
-    r = bench_compare.compare(_report(M, [_cond("b1", 40, 76, 80)], keel="1111"),
-                              _report(M, [_cond("b1", 42, 74, 80)], keel="2222"))
-    check(not r["keel_match"] and r["reproduces_within_noise"],
-          "a different keel build is noted but still reproduces within noise")
+    # malformed condition (missing 'total') is skipped, not crashed → no comparable data
+    bad_report = {"manifest": {"manifest_sha256": M}, "run": {"wilson_z": 1.96},
+                  "benchmarks": [{"id": "b1", "without": {"correct": 5}, "with": {"correct": 5}}]}
+    r = bench_compare.compare(bad_report, bad_report)
+    check(r["verdict"] == "no_data" and not r["conditions"], "a malformed condition is skipped, not crashed")
 
-    # no shared benchmarks → cannot claim reproduction
-    r = bench_compare.compare(_report(M, [_cond("b1", 40, 76, 80)]),
-                              _report(M, [_cond("b2", 40, 76, 80)]))
-    check(not r["reproduces_within_noise"] and set(r["unmatched"]) == {"b1", "b2"},
-          "no shared benchmarks → not a reproduction, unmatched reported")
+    # a benchmark missing an 'id' doesn't crash _by_id
+    idless = {"manifest": {"manifest_sha256": M}, "run": {"wilson_z": 1.96},
+              "benchmarks": [{"without": {"correct": 1, "total": 4}, "with": {"correct": 1, "total": 4}}]}
+    r = bench_compare.compare(idless, idless)
+    check(r["verdict"] == "no_data", "a benchmark without an id is ignored, not crashed")
 
     print()
     if fails == 0:
