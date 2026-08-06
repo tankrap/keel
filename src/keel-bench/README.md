@@ -51,6 +51,10 @@ python3 run_suite.py --verify-corpus
 # Free: print the keel binary's build identity and require a clean, identified commit. No API, no key.
 python3 run_suite.py --verify-keel
 
+# Free: do two report.json runs reproduce? (equivalence test, manifest-gated). No API, no key.
+python3 run_suite.py --compare run_a.json run_b.json          # default ±20pp margin
+python3 run_suite.py --compare run_a.json run_b.json --margin 15
+
 # Live (costs credits): run the packaged benchmarks and write an aggregated report.
 python3 run_suite.py
 
@@ -97,6 +101,16 @@ What it binds, and why each matters:
 
 **The keel binary is recorded, not hashed.** The keel build determines `brief`/`learn` retrieval, so it's a genuine input — but its commit advances with keel's own development, so pinning it into the manifest SHA would make the SHA churn on every keel commit and be un-pinnable ahead of a build. Instead, a live report records the keel build identity (`keel native version` → crate version + the git commit it was built from + whether that tree was dirty) under `environment.keel`, and `python3 run_suite.py --verify-keel` requires the on-disk binary to report a clean, identified commit. So the full reproducibility contract is: **match the manifest SHA (static inputs) *and* the report's `environment.keel` commit on a clean tree (the tool).** (`keel native version` is keel's own build stamp; plain `keel --version` proxies to the git binary keel wraps.) The stamp is exact for a full build from a clean checkout, which is how you should build the binary you benchmark (`cargo build --release` in a clean `src/rust`); on incremental dev rebuilds the `dirty` flag is best-effort. Nothing auto-runs `--verify-keel` before a paid run — a dirty keel is *recorded* (`environment.keel.dirty: true`), not refused, so check it before trusting a result.
 
+**Reproducing the stochastic (LLM) parts.** The manifest makes the *inputs* verifiable, but the LLM calls are stochastic — the same inputs won't reproduce byte-for-byte, so "reproducible" for the measured rates can't mean equal counts. It also can't mean "a significance test found no difference": *absence of evidence isn't evidence of reproduction*, and at these sample sizes (48–80/condition) a plain two-proportion test is too underpowered to catch a real 15-point regression, so using it to declare "reproduced" would give false confidence.
+
+So `python3 run_suite.py --compare run_a.json run_b.json` certifies via an **equivalence test (TOST)**: two runs reproduce *within a margin δ* only if the 95% CI for their per-condition difference lies entirely inside (−δ, +δ). Because equivalence is what you must reject the null to conclude, low power makes this **conservative** — too few samples yields *inconclusive*, never a false *reproduced*. It reports one of three verdicts (manifest-gated — differing `manifest_sha256` ⇒ different inputs ⇒ hard mismatch; a differing `environment.keel` commit is a note):
+
+- **EQUIVALENT** (exit 0) — every condition's difference CI ⊂ ±δ. The honest "it reproduced."
+- **REGRESSION** (exit 1) — some condition differs significantly, via a **Holm-corrected** two-proportion test (the correction stops ~40% of truly-reproducing runs from being failed by chance across the many conditions).
+- **INCONCLUSIVE** (exit 3) — neither: the samples can't certify equivalence within δ. The output prints the achievable CI half-width so you know the resolution.
+
+δ defaults to **±20 percentage points** — not a quality bar but the *floor the sample size allows*: at n=48 and a 50% base rate even two identical runs can only be certified within ≈±20pp at 95%. Tighten it with `--margin PP` once you raise the trial count (more trials ⇒ narrower CIs ⇒ smaller certifiable δ). So confirming a re-run of a published result reproduces means: same manifest SHA, and `--compare` returns **EQUIVALENT**.
+
 It's deterministic by construction (canonical JSON → identical bytes → identical hash), needs no API or token, and `--dry-run` asserts that determinism. `test_manifest.py` locks the guarantees (deterministic, scenario/source/config/corpus-commit change → SHA-change, `workers` change → SHA-*un*changed, config-vs-code model drift refused, count-drift caught), and the CI gate runs the self-test + dry-run so a scenario-table drift or a broken harness fails the build. Bump `version` in `bench-config.json` whenever the pinned inputs change.
 
 ### Reading the Wilson intervals
@@ -115,6 +129,8 @@ Each condition reports a Wilson score interval, the range the true success rate 
 | `bench-config.json` | pinned config: models, trials, workers, scenario counts, Wilson z, per-corpus repo+commit |
 | `bench_manifest.py` | reproducibility manifest: a stable SHA over every pinned input (no API) |
 | `test_manifest.py` | self-test locking the manifest's guarantees (run in the CI gate) |
+| `bench_compare.py` | reproduce check: TOST equivalence + Holm-corrected regression over two reports, manifest-gated (no API) |
+| `test_compare.py` | self-test locking the comparator's guarantees (run in the CI gate) |
 | `bench_common.py` | shared plumbing: the API client, `wilson()`, dual `judge()`, `sh()`, parallel `run_trials()` |
 | `flywheel_bench.py` | synthetic conventions, 20 scenarios |
 | `corpus_bench.py` | vs code, 16 scenarios |

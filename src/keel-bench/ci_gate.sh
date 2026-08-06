@@ -90,12 +90,13 @@ KV=$("$KEEL" native version 2>/dev/null)
 KVOK=$(print -r -- "$KV" | python3 -c "import sys,json;d=json.load(sys.stdin);print(int(bool(d.get('version')) and isinstance(d.get('dirty'),bool) and 'git_commit' in d))" 2>/dev/null)
 if [ "${KVOK:-0}" = "1" ]; then pass "keel native version ok ($(print -r -- "$KV" | python3 -c "import sys,json;d=json.load(sys.stdin);print(d['version'],(d.get('git_commit_short') or 'no-commit'))" 2>/dev/null))"; else fail "keel native version invalid"; fi
 
-section "benchmark suite — reproducibility manifest + dry-run (no API)"
+section "benchmark suite — reproducibility manifest + compare + dry-run (no API)"
 BENCH=~/keel/src/keel-bench
-if python3 "$BENCH/test_manifest.py" >/dev/null 2>&1 && python3 "$BENCH/run_suite.py" --dry-run >/dev/null 2>&1; then
-  pass "suite harnesses import + manifest deterministic"
+if python3 "$BENCH/test_manifest.py" >/dev/null 2>&1 && python3 "$BENCH/test_compare.py" >/dev/null 2>&1 \
+   && python3 "$BENCH/run_suite.py" --dry-run >/dev/null 2>&1; then
+  pass "suite harnesses import + manifest deterministic + noise-compare sound"
 else
-  fail "benchmark suite manifest / dry-run"
+  fail "benchmark suite manifest / compare / dry-run"
 fi
 
 rm -rf "$TMP"
