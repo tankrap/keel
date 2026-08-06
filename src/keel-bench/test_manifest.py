@@ -8,6 +8,7 @@ canonical hashing is key-order-independent, and a config/scenario-count drift is
 """
 import copy
 import json
+import os
 import pathlib
 import sys
 
@@ -91,6 +92,36 @@ def main():
         all("corpus" not in b for b in m["benchmarks"] if b["module"] == "flywheel_bench"),
         "a synthetic (no-corpus) benchmark carries no corpus pin",
     )
+
+    # verify_corpus must require a CLEAN tree, not just a matching HEAD: a staged/unstaged edit to a
+    # corpus file changes the bytes the benchmark reads while HEAD is unchanged. Build a throwaway
+    # repo, pin its HEAD, and confirm clean → match, one modified tracked file → dirty.
+    import shutil
+    import subprocess
+    import tempfile
+    if shutil.which("git") is None:
+        print("  … skipped verify_corpus dirty-gate (git not on PATH)")
+    else:
+        d = tempfile.mkdtemp(prefix="keel-corpus-verify-")
+        try:
+            def g(*a):
+                return subprocess.run(["git", "-C", d, *a], capture_output=True, text=True)
+            g("init", "-q"); g("config", "user.email", "a@b.co"); g("config", "user.name", "a")
+            (pathlib.Path(d) / "f.txt").write_text("hello\n")
+            g("add", "-A"); g("commit", "-qm", "c1")
+            head = g("rev-parse", "HEAD").stdout.strip()
+            tcfg = {"benchmarks": [{"id": "tmp", "module": "x",
+                                    "corpus": {"repo": "r", "commit": head,
+                                               "src_env": "KEEL_TEST_CORPUS_UNSET", "src_default": d}}]}
+            os.environ.pop("KEEL_TEST_CORPUS_UNSET", None)
+            r_clean = bench_manifest.verify_corpus(tcfg)
+            check(r_clean and r_clean[0]["status"] == "match", "verify_corpus: clean checkout at pinned commit → match")
+            (pathlib.Path(d) / "f.txt").write_text("hello\n// drift\n")  # modify a tracked file
+            r_dirty = bench_manifest.verify_corpus(tcfg)
+            check(r_dirty and r_dirty[0]["status"] == "dirty",
+                  "verify_corpus: a modified tracked file (HEAD unchanged) → dirty, not match")
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
 
     # workers is pure parallelism — it must NOT change the SHA (else identical runs look different)
     cfg_workers = copy.deepcopy(CFG)

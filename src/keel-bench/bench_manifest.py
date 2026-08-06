@@ -149,13 +149,23 @@ def build_manifest(cfg: dict) -> dict:
 
 
 def verify_corpus(cfg: dict):
-    """Check that each real-corpus checkout on disk is at the commit the manifest pins. Separate from
-    `build_manifest` on purpose: it shells out to git and needs the checkout present, so it is opt-in
-    (CI and `--manifest` stay checkout-free). Returns one row per corpus benchmark with a `status`:
-    `match` | `MISMATCH` | `absent` (no dir) | `not-a-git-checkout`. Never raises for a missing corpus
-    — the caller decides whether an absent/mismatched corpus is fatal."""
+    """Check that each real-corpus checkout on disk actually holds the pinned revision's files —
+    i.e. HEAD equals the pinned commit AND the tracked tree is clean. A matching HEAD alone is not
+    enough: an uncommitted/staged edit to a corpus file changes the bytes the benchmark reads while
+    HEAD is unchanged, so this also runs `git status --porcelain` (tracked files, submodules) and
+    fails a checkout that is `dirty`.
+
+    Separate from `build_manifest` on purpose: it shells out to git and needs the checkout present,
+    so it is opt-in (CI and `--manifest` stay checkout-free). Returns one row per corpus benchmark
+    with a `status`: `match` | `MISMATCH` (HEAD) | `dirty` (HEAD matches but tree modified) | `absent`
+    (no dir) | `not-a-git-checkout`. Never raises for a missing corpus — the caller decides whether an
+    absent/mismatched/dirty corpus is fatal. Untracked files are not flagged (they don't change the
+    pinned tracked files the benchmark reads); LFS/symlink content is a documented residual."""
     import os
     import subprocess
+
+    def _git(src, *args):
+        return subprocess.run(["git", "-C", src, *args], capture_output=True, text=True, timeout=30)
 
     rows = []
     for b in cfg["benchmarks"]:
@@ -163,21 +173,29 @@ def verify_corpus(cfg: dict):
         if not c:
             continue
         src = os.environ.get(c.get("src_env", ""), "") or os.path.expanduser(c["src_default"])
-        row = {"id": b["id"], "repo": c["repo"], "expected": c["commit"], "path": src}
+        row = {"id": b["id"], "repo": c["repo"], "expected": c["commit"], "path": src, "dirty": None}
         git_dir = pathlib.Path(src, ".git")
         if not pathlib.Path(src).is_dir() or not git_dir.exists():
             row["status"] = "absent" if not pathlib.Path(src).is_dir() else "not-a-git-checkout"
             row["actual"] = None
         else:
             try:
-                actual = subprocess.run(
-                    ["git", "-C", src, "rev-parse", "HEAD"],
-                    capture_output=True, text=True, timeout=30,
-                ).stdout.strip()
+                actual = _git(src, "rev-parse", "HEAD").stdout.strip()
             except Exception as e:  # git missing / not a repo — report, don't crash
                 actual = f"<error: {e!r}>"
             row["actual"] = actual
-            row["status"] = "match" if actual == c["commit"] else "MISMATCH"
+            if actual != c["commit"]:
+                row["status"] = "MISMATCH"
+            else:
+                # HEAD matches — now require the tracked tree to be clean, or the bytes may differ.
+                try:
+                    porcelain = _git(src, "status", "--porcelain", "--untracked-files=no",
+                                     "--ignore-submodules=none").stdout.strip()
+                except Exception as e:
+                    porcelain = f"<error: {e!r}>"
+                n_dirty = len([ln for ln in porcelain.splitlines() if ln]) if porcelain else 0
+                row["dirty"] = n_dirty
+                row["status"] = "dirty" if porcelain else "match"
         rows.append(row)
     return rows
 

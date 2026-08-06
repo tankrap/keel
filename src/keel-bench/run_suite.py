@@ -196,14 +196,17 @@ def main():
             ok = r["status"] == "match"
             bad += 0 if ok else 1
             mark = "✓" if ok else "✗"
+            note = f"  [{r['status']}]"
+            if r["status"] == "dirty":
+                note = f"  [dirty: {r['dirty']} tracked file(s) modified vs the pinned commit]"
             print(f"  {mark} {r['id']:<14} {r['repo']}")
             print(f"      expected {r['expected']}")
-            print(f"      on disk  {r['actual'] or '(none)'}  [{r['status']}]  {r['path']}")
+            print(f"      on disk  {r['actual'] or '(none)'}{note}  {r['path']}")
         print()
         if bad:
-            print(f"corpus verify FAIL — {bad} checkout(s) not at the pinned commit.")
+            print(f"corpus verify FAIL — {bad} checkout(s) not at the pinned revision (wrong commit or dirty tree).")
             return 1
-        print(f"corpus verify PASS — {len(rows)} checkout(s) at the pinned commit.")
+        print(f"corpus verify PASS — {len(rows)} checkout(s) at the pinned commit with a clean tree.")
         return 0
     if args.dry_run:
         return dry_run(cfg)
