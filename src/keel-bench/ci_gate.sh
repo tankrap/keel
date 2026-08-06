@@ -85,6 +85,11 @@ printf 'export function helper(x: number): number { return x * 3; }\n' > "$TMP/r
 ST=$("$KEEL" native status --root "$TMP/repo" 2>/dev/null)
 if print -r -- "$ST" | grep -q "util.ts"; then pass "status detects the edit"; else fail "status ($ST)"; fi
 
+section "keel build identity — native version emits a valid, current build stamp"
+KV=$("$KEEL" native version 2>/dev/null)
+KVOK=$(print -r -- "$KV" | python3 -c "import sys,json;d=json.load(sys.stdin);print(int(bool(d.get('version')) and isinstance(d.get('dirty'),bool) and 'git_commit' in d))" 2>/dev/null)
+if [ "${KVOK:-0}" = "1" ]; then pass "keel native version ok ($(print -r -- "$KV" | python3 -c "import sys,json;d=json.load(sys.stdin);print(d['version'],(d.get('git_commit_short') or 'no-commit'))" 2>/dev/null))"; else fail "keel native version invalid"; fi
+
 section "benchmark suite — reproducibility manifest + dry-run (no API)"
 BENCH=~/keel/src/keel-bench
 if python3 "$BENCH/test_manifest.py" >/dev/null 2>&1 && python3 "$BENCH/run_suite.py" --dry-run >/dev/null 2>&1; then

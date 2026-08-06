@@ -19,6 +19,7 @@ import importlib
 import json
 import os
 import pathlib
+import subprocess
 import sys
 
 HERE = pathlib.Path(__file__).resolve().parent
@@ -26,6 +27,28 @@ CONFIG_PATH = HERE / "bench-config.json"
 sys.path.insert(0, str(HERE))  # so `import flywheel_bench` / `corpus_bench` resolve
 
 import bench_manifest  # noqa: E402  (after sys.path insert so it resolves)
+
+# The keel binary under test — same resolution as bench_common (env override, else the release build).
+KEEL_BIN = os.environ.get("KEEL_BIN", str(pathlib.Path.home() / "keel/src/rust/target/release/keel"))
+
+
+def keel_version():
+    """The keel binary's own build identity ({version, git_commit, dirty}) via `keel native version` —
+    provenance tying a result to the exact keel build that produced it. Returns {"error": ...} if the
+    binary is missing, too old to know the subcommand, or emits unparseable output. Lives in the runner
+    (not bench_common) so it never changes the manifest-hashed harness surface."""
+    try:
+        r = subprocess.run([KEEL_BIN, "native", "version"], capture_output=True, text=True, timeout=30)
+    except FileNotFoundError:
+        return {"error": f"keel binary not found at {KEEL_BIN}"}
+    except Exception as e:  # timeout / OS error — report, don't crash the run
+        return {"error": f"keel native version failed: {e!r}"}
+    if r.returncode != 0:
+        return {"error": (r.stderr or r.stdout or "keel native version failed").strip()}
+    try:
+        return json.loads(r.stdout)
+    except Exception as e:
+        return {"error": f"unparseable keel native version output: {e!r}"}
 
 
 def load_config():
@@ -102,6 +125,15 @@ def dry_run(cfg):
     return 0
 
 
+def _keel_build_str():
+    """A compact keel-build label for the markdown header, e.g. `0.1.0 @ cad424fd90f3 (dirty)`."""
+    v = keel_version()
+    if "error" in v:
+        return f"unknown ({v['error']})"
+    short = v.get("git_commit_short") or (v.get("git_commit") or "")[:12] or "no-commit"
+    return f"{v.get('version', '?')} @ {short}" + (" (dirty)" if v.get("dirty") else "")
+
+
 def markdown_report(cfg, summaries):
     ts = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     ref = {b["id"]: b for b in cfg["benchmarks"]}
@@ -112,6 +144,7 @@ def markdown_report(cfg, summaries):
            f"- solver: `{cfg['models']['solver']}` · judge: `{cfg['models']['judge']}`",
            f"- trials: {cfg['run']['trials']} · workers: {cfg['run']['workers']} · Wilson z: {cfg['run']['wilson_z']}",
            f"- reproducibility manifest: `{bench_manifest.build_manifest(cfg)['manifest_sha256']}`",
+           f"- keel build: `{_keel_build_str()}`",
            ""]
     for s in summaries:
         b = ref.get(s["id"], {})
@@ -161,6 +194,10 @@ def full_run(cfg, only=None):
         # Pin the exact inputs this result was produced from: anyone can recompute the manifest and
         # confirm a later run used byte-identical inputs (reproducibility).
         "manifest": manifest,
+        # Run-environment provenance: WHICH keel build produced this result. Recorded (not hashed into
+        # the manifest) because the keel commit advances with keel development — reproducing a result
+        # means matching the manifest SHA AND this keel commit on a clean tree.
+        "environment": {"keel": keel_version()},
         "benchmarks": summaries,
     }
     json_path = HERE / "bench-report.json"
@@ -179,6 +216,8 @@ def main():
                     help="print the reproducibility manifest (SHA over pinned inputs); make NO API calls")
     ap.add_argument("--verify-corpus", action="store_true",
                     help="check each real-corpus checkout on disk is at the pinned commit; NO API calls")
+    ap.add_argument("--verify-keel", action="store_true",
+                    help="print the keel binary's build identity and require a clean, identified commit; NO API calls")
     ap.add_argument("--only", metavar="ID", help="run a single benchmark by its config id")
     args = ap.parse_args()
 
@@ -207,6 +246,25 @@ def main():
             print(f"corpus verify FAIL — {bad} checkout(s) not at the pinned revision (wrong commit or dirty tree).")
             return 1
         print(f"corpus verify PASS — {len(rows)} checkout(s) at the pinned commit with a clean tree.")
+        return 0
+    if args.verify_keel:
+        v = keel_version()
+        if "error" in v:
+            print(f"  ✗ keel native version — {v['error']}")
+            print("\nkeel verify FAIL — could not read the keel build identity (is the binary built and current?).")
+            return 1
+        commit = v.get("git_commit") or ""
+        short = v.get("git_commit_short") or commit[:12]
+        dirty = bool(v.get("dirty", False))
+        print(f"  keel version {v.get('version', '?')}  commit {short or '(none)'}  dirty={str(dirty).lower()}")
+        # reproducible iff the build is identified (has a commit) AND the source tree was clean
+        if not commit:
+            print("\nkeel verify FAIL — no embedded commit (keel built outside a checkout); build is not reproducible.")
+            return 1
+        if dirty:
+            print("\nkeel verify FAIL — the keel build tree was dirty; rebuild from a clean commit to reproduce.")
+            return 1
+        print("\nkeel verify PASS — keel built from a clean, identified commit.")
         return 0
     if args.dry_run:
         return dry_run(cfg)
