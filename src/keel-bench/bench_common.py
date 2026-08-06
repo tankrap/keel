@@ -41,6 +41,11 @@ JUDGE = "claude-sonnet-5"    # strict rule-compliance yes/no
 # format and key file differ. Default is the native Anthropic API; `openrouter` routes the same
 # models through OpenRouter's OpenAI-compatible endpoint.
 PROVIDER = os.environ.get("BENCH_PROVIDER", "anthropic").lower()
+if PROVIDER not in ("anthropic", "openrouter"):
+    # An unrecognized value must not silently run one transport while the run prints/records another
+    # (the raw-env path has no argparse `choices` guard) — fall back to the real default so the
+    # reported provider is always truthful.
+    PROVIDER = "anthropic"
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 # Pinned Anthropic model id → OpenRouter slug (same underlying model).
 OPENROUTER_SLUG = {
@@ -104,6 +109,10 @@ def api(system, user, model, max_tokens=1600):
             with urllib.request.urlopen(req, timeout=180) as r:
                 d = json.load(r)
             return parse_response(d)
+        except RuntimeError:
+            # A fatal error envelope surfaced by parse_response (no credit / auth / bad model, returned
+            # with HTTP 200). Not transient — fail fast instead of burning ~60s of backoff retrying it.
+            raise
         except urllib.error.HTTPError as e:
             if e.code in (429, 500, 529) and attempt < 5:
                 time.sleep((2 ** attempt) + random.random())

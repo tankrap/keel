@@ -8,7 +8,9 @@ offline. Run:
 
     python3 test_provider.py
 """
+import importlib
 import json
+import os
 import pathlib
 import sys
 
@@ -71,6 +73,13 @@ def main():
     # ── key file selection (no read — just the mapping) ─────────────────
     check(bc.KEY_FILE["anthropic"] == ".claude-token" and bc.KEY_FILE["openrouter"] == ".openrouter",
           "each provider reads its own key file")
+
+    # ── unknown BENCH_PROVIDER coerces to the real transport, so the recorded provider is truthful ──
+    os.environ["BENCH_PROVIDER"] = "totally-bogus"
+    importlib.reload(bc)
+    check(bc.PROVIDER == "anthropic", "unknown BENCH_PROVIDER coerces to anthropic (not the bogus name)")
+    del os.environ["BENCH_PROVIDER"]
+    importlib.reload(bc)  # restore module default state
 
     print(f"\n{'PASS' if not fails else 'FAIL'} — provider wiring ({fails} failure(s))")
     return 1 if fails else 0
