@@ -1679,6 +1679,29 @@ fn rel_time(ts: u64) -> String {
     }
 }
 
+/// keel-global flags that take a value; their argument must not be mistaken for a positional.
+const VALUE_FLAGS: [&str; 3] = ["--root", "--store", "--resolver"];
+
+/// The first positional argument (not a flag, and not the value consumed by a value-flag). So
+/// `keel walkthrough --root DIR <change>` resolves `<change>`, not `DIR` — a plain "first non-dash
+/// token" scan would wrongly pick `DIR`.
+fn first_positional(args: &[String]) -> Option<&str> {
+    let mut i = 0;
+    while i < args.len() {
+        let a = args[i].as_str();
+        if VALUE_FLAGS.contains(&a) {
+            i += 2; // skip the flag and its value
+            continue;
+        }
+        if a.starts_with('-') {
+            i += 1;
+            continue;
+        }
+        return Some(a);
+    }
+    None
+}
+
 /// Every value that follows a repeated flag (`--label a --label b` → ["a","b"]).
 fn flag_all(args: &[String], name: &str) -> Vec<String> {
     let mut out = Vec::new();
@@ -1816,9 +1839,7 @@ fn cmd_reviews(args: &[String]) -> io::Result<()> {
 /// you catch the one that matters." keel derives the walkthrough from the recorded work, which is why
 /// it's a lookup here and a re-generation nowhere.
 fn cmd_walkthrough(args: &[String]) -> io::Result<()> {
-    let change = args
-        .iter()
-        .find(|a| !a.starts_with('-'))
+    let change = first_positional(args)
         .ok_or_else(|| io::Error::other("usage: keel walkthrough <change> [--json] [--full]"))?;
     let full = has(args, "--full");
     let (_, store) = root_store(args)?;
@@ -1945,19 +1966,17 @@ fn test_covers(src_path: &str, test_path: &str) -> bool {
     if src.is_empty() {
         return false;
     }
-    let mut t = stem(test_path);
-    for p in ["test_", "spec_"] {
-        if let Some(r) = t.strip_prefix(p) {
-            t = r.to_string();
-        }
-    }
-    for p in ["_test", "_spec", "test", "spec"] {
-        if let Some(r) = t.strip_suffix(p) {
-            t = r.to_string();
-        }
-    }
-    let t = t.trim_matches('_');
-    !t.is_empty() && t == src
+    let t = stem(test_path);
+    // The test's stem is the source stem plus ONE anchored affix. Each candidate affix is tried
+    // independently against a fresh copy of `t` — never chained — so `spec_test` (a `_test` suffix on
+    // `spec`) is recognized as covering `spec`, not misread as a `spec_` prefix on `test` that then
+    // gets its bare `test` chewed off to nothing. Affixes are underscore-anchored on purpose: a bare
+    // `test`/`spec` strip would maul names like `latest` and empty out `spec_test`.
+    t == src
+        || t.strip_suffix("_test").is_some_and(|r| r == src)
+        || t.strip_suffix("_spec").is_some_and(|r| r == src)
+        || t.strip_prefix("test_").is_some_and(|r| r == src)
+        || t.strip_prefix("spec_").is_some_and(|r| r == src)
 }
 
 /// One file's block in the walkthrough: its diff shape (added/deleted line counts, hunk headers, and
@@ -2064,6 +2083,9 @@ fn render_walkthrough_human(v: &Value) -> String {
     if let Some(m) = v.get("model").and_then(Value::as_str) {
         let _ = writeln!(s, "  model: {m}");
     }
+    if let Some(l) = v.get("lesson").and_then(Value::as_str) {
+        let _ = writeln!(s, "  lesson: {l}");
+    }
     let _ = writeln!(s, "  scope: {} file(s), +{} −{}", v["files"], v["added_lines"], v["deleted_lines"]);
     let ps = &v["proof_summary"];
     let _ = writeln!(
@@ -2096,18 +2118,23 @@ fn render_walkthrough_human(v: &Value) -> String {
                 _ => "proof: UNTESTED — no colocated test and change not green; review closely".to_string(),
             };
             let _ = writeln!(s, "       {proof_txt}");
+            let heads = b["hunks"].as_array().cloned().unwrap_or_default();
             if b["binary"].as_bool().unwrap_or(false) {
                 let _ = writeln!(s, "       (binary file)");
-            } else if let Some(hunks) = b["hunks"].as_array() {
-                for h in hunks {
-                    let _ = writeln!(s, "       {}", h.as_str().unwrap_or(""));
-                }
-            }
-            if let Some(bodies) = b.get("hunk_bodies").and_then(Value::as_array) {
-                for body in bodies.iter().filter_map(Value::as_array) {
-                    for l in body.iter().filter_map(Value::as_str) {
+            } else if let Some(bodies) = b.get("hunk_bodies").and_then(Value::as_array) {
+                // --full: print each hunk's header immediately followed by its own body, so multi-hunk
+                // files stay readable (a reviewer can map every body line back to its `@@` range).
+                for (j, body) in bodies.iter().enumerate() {
+                    if let Some(h) = heads.get(j).and_then(Value::as_str) {
+                        let _ = writeln!(s, "       {h}");
+                    }
+                    for l in body.as_array().into_iter().flatten().filter_map(Value::as_str) {
                         let _ = writeln!(s, "         {l}");
                     }
+                }
+            } else {
+                for h in heads.iter().filter_map(Value::as_str) {
+                    let _ = writeln!(s, "       {h}");
                 }
             }
             let _ = writeln!(s);
@@ -2987,9 +3014,52 @@ mod tests {
         assert!(test_covers("a/parser.ts", "a/parser.test.ts"));
         assert!(test_covers("db/views.py", "db/tests/test_views.py")); // different dir still counts
         assert!(test_covers("tsdb/head.go", "tsdb/head_test.go"));
-        // non-matches: different stem must not link
+        // regression: a source whose own name starts with "spec"/"test" must still link to its
+        // `_test` sibling — the old chained prefix+bare-suffix strip emptied the stem and returned
+        // false on these standard pairings (review finding).
+        assert!(test_covers("src/spec.go", "src/spec_test.go"));
+        assert!(test_covers("src/spec_loader.rs", "src/spec_loader_test.rs"));
+        assert!(test_covers("x/test.go", "x/test_test.go"));
+        // non-matches: different stem must not link, and a lookalike name must not over-strip
         assert!(!test_covers("src/core.rs", "src/parser_test.rs"));
         assert!(!test_covers("src/core.rs", "src/other.rs"));
+        assert!(!test_covers("src/la.rs", "src/latest.rs")); // "latest" must NOT strip to "la"
+    }
+
+    #[test]
+    fn first_positional_skips_flags_and_value_flag_args() {
+        let a = |xs: &[&str]| xs.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        // the value of --root must not be mistaken for the positional <change>
+        assert_eq!(first_positional(&a(&["--root", "/repo", "abc123"])), Some("abc123"));
+        assert_eq!(first_positional(&a(&["abc123", "--root", "/repo"])), Some("abc123"));
+        assert_eq!(first_positional(&a(&["--json", "--full", "deadbeef"])), Some("deadbeef"));
+        assert_eq!(first_positional(&a(&["--store", "/s", "--json"])), None);
+        assert_eq!(first_positional(&a(&[])), None);
+    }
+
+    #[test]
+    fn full_render_interleaves_each_hunk_header_with_its_own_body() {
+        // Two hunks: in --full the human render must pair header→body, not dump all headers then all
+        // bodies (review finding — the latter is unreadable for multi-hunk files).
+        let v = json!({
+            "change": "abc", "intent": "x", "author": "a", "timestamp": 0u64,
+            "verification": "green", "files": 1, "added_lines": 2, "deleted_lines": 0,
+            "proof_summary": {"verified": true, "covered": 0, "untested": 0, "tests_changed": 0},
+            "blocks": [{
+                "path": "f.rs", "kind": "modified", "binary": false,
+                "added_lines": 2, "deleted_lines": 0,
+                "hunks": ["@@ -1,1 +1,2 @@", "@@ -10,1 +11,2 @@"],
+                "hunk_bodies": [[" ctx", "+first"], [" ctx2", "+second"]],
+                "proof": {"status": "verified", "tests": [], "verification": "green"},
+            }],
+        });
+        let h = render_walkthrough_human(&v);
+        // each body line appears AFTER its own header and BEFORE the next header
+        let p_h1 = h.find("@@ -1,1 +1,2 @@").unwrap();
+        let p_first = h.find("+first").unwrap();
+        let p_h2 = h.find("@@ -10,1 +11,2 @@").unwrap();
+        let p_second = h.find("+second").unwrap();
+        assert!(p_h1 < p_first && p_first < p_h2 && p_h2 < p_second, "hunks must interleave:\n{h}");
     }
 
     #[test]
