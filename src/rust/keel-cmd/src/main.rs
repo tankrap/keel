@@ -855,8 +855,10 @@ fn cmd_native(args: &[String]) -> io::Result<()> {
 /// `keel native version` — the keel binary's OWN build identity (crate version + the git commit it
 /// was built from, and whether that tree was dirty), as byte-stable JSON. Distinct from `keel
 /// --version`, which proxies to the git binary keel wraps. Consumers pin/record this to tie a result
-/// to the exact keel build that produced it. The git fields are embedded at build time by build.rs;
-/// an empty commit means keel was built outside a checkout (or without git available).
+/// to the keel build that produced it. The git fields are embedded at build time by build.rs; an
+/// empty commit means keel was built outside a checkout (or without git available). The stamp is
+/// exact for a full build from a clean checkout (CI / the benchmark suite); on incremental rebuilds
+/// `dirty` is best-effort (see build.rs).
 fn cmd_version() -> io::Result<()> {
     println!("{}", render_json(&version_value()));
     Ok(())
