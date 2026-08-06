@@ -27,6 +27,7 @@ CONFIG_PATH = HERE / "bench-config.json"
 sys.path.insert(0, str(HERE))  # so `import flywheel_bench` / `corpus_bench` resolve
 
 import bench_manifest  # noqa: E402  (after sys.path insert so it resolves)
+import bench_compare  # noqa: E402
 
 # The keel binary under test — same resolution as bench_common (env override, else the release build).
 KEEL_BIN = os.environ.get("KEEL_BIN", str(pathlib.Path.home() / "keel/src/rust/target/release/keel"))
@@ -134,6 +135,49 @@ def _keel_build_str():
     return f"{v.get('version', '?')} @ {short}" + (" (dirty)" if v.get("dirty") else "")
 
 
+def run_compare(path_a, path_b):
+    """Print whether two report artifacts reproduce within noise. Manifest-gated: differing inputs
+    (manifest SHAs) is a hard mismatch, not a noise comparison."""
+    try:
+        ra = bench_compare.load_report(path_a)
+        rb = bench_compare.load_report(path_b)
+    except (OSError, ValueError) as e:
+        print(f"could not read a report: {e}", file=sys.stderr)
+        return 2
+    r = bench_compare.compare(ra, rb)
+
+    if not r["manifest_match"]:
+        print("✗ MANIFEST MISMATCH — the two runs used different inputs, so a noise comparison is meaningless.")
+        print(f"    A: {r['manifest_a']}")
+        print(f"    B: {r['manifest_b']}")
+        return 1
+    print(f"manifest match: {r['manifest_a']}")
+    if not r["keel_match"]:
+        print(f"note: different keel build (A {(r['keel_a'] or '?')[:12]} vs B {(r['keel_b'] or '?')[:12]}) — "
+              "expected to still reproduce within noise, but the tool changed.")
+    if r["unmatched"]:
+        print(f"note: benchmarks in only one report (skipped): {', '.join(r['unmatched'])}")
+    print()
+
+    for c in r["conditions"]:
+        mark = "✓" if c["consistent"] else "✗"
+        z = "n/a" if c["z"] is None else f"z={c['z']:+.2f}"
+        print(f"  {mark} {c['id']:<16} {c['condition']:<8} "
+              f"A {c['a'][0]}/{c['a'][1]} ({c['a_pct']}%)  B {c['b'][0]}/{c['b'][1]} ({c['b_pct']}%)  {z}")
+    print()
+
+    if not r["conditions"]:
+        print("reproduce check FAIL — no comparable conditions (empty or non-overlapping benchmark sets).")
+        return 1
+    if r["reproduces_within_noise"]:
+        n = len(r["conditions"])
+        print(f"reproduce check PASS — all {n} condition(s) agree within noise (two-proportion z, 95%).")
+        return 0
+    bad = [f"{c['id']}/{c['condition']}" for c in r["conditions"] if not c["consistent"]]
+    print(f"reproduce check FAIL — {len(bad)} condition(s) differ significantly: {', '.join(bad)}.")
+    return 1
+
+
 def markdown_report(cfg, summaries):
     ts = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     ref = {b["id"]: b for b in cfg["benchmarks"]}
@@ -218,8 +262,13 @@ def main():
                     help="check each real-corpus checkout on disk is at the pinned commit; NO API calls")
     ap.add_argument("--verify-keel", action="store_true",
                     help="print the keel binary's build identity and require a clean, identified commit; NO API calls")
+    ap.add_argument("--compare", nargs=2, metavar=("REPORT_A", "REPORT_B"),
+                    help="do two report.json runs agree within statistical noise? (manifest-gated); NO API calls")
     ap.add_argument("--only", metavar="ID", help="run a single benchmark by its config id")
     args = ap.parse_args()
+
+    if args.compare:
+        return run_compare(*args.compare)
 
     cfg = load_config()
     if args.manifest:
