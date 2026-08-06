@@ -347,10 +347,19 @@ impl Default for CapturePolicy {
 
 impl CapturePolicy {
     /// Load the repo's `.keel/capture-policy.json`, or the defaults if it's absent/unreadable/invalid.
+    /// A PRESENT-but-invalid file warns loudly: silently falling back to defaults would disable an
+    /// admin's redaction/erasability policy without a signal — a compliance footgun.
     fn load(root: &std::path::Path) -> CapturePolicy {
         let d = CapturePolicy::default();
-        let Ok(txt) = std::fs::read_to_string(root.join(".keel/capture-policy.json")) else { return d };
-        let Ok(v) = serde_json::from_str::<Value>(&txt) else { return d };
+        let path = root.join(".keel/capture-policy.json");
+        let Ok(txt) = std::fs::read_to_string(&path) else { return d };
+        let v: Value = match serde_json::from_str::<Value>(&txt) {
+            Ok(v) if v.is_object() => v,
+            _ => {
+                eprintln!("keel: warning — {} is not valid JSON object; using the DEFAULT capture policy (redaction/erasability/retention NOT applied)", path.display());
+                return d;
+            }
+        };
         let b = |k: &str, dflt: bool| v.get(k).and_then(Value::as_bool).unwrap_or(dflt);
         CapturePolicy {
             erasable: b("erasable", d.erasable),
@@ -389,17 +398,25 @@ fn erase_key_of<'a>(args: &'a [String], author: &'a str, policy: &'a CapturePoli
 /// (from `.keel/capture-policy.json`, else the defaults). Read-only; edit the JSON file to change it.
 fn cmd_policy(args: &[String]) -> io::Result<()> {
     let root = policy_root(args).unwrap_or_else(|| std::path::PathBuf::from("."));
+    let path = root.join(".keel/capture-policy.json");
+    // label the source honestly: a present-but-broken file reports as invalid, not as if it applied
+    let source = if !path.is_file() {
+        "defaults"
+    } else if std::fs::read_to_string(&path).ok().and_then(|t| serde_json::from_str::<Value>(&t).ok()).filter(Value::is_object).is_some() {
+        "capture-policy.json"
+    } else {
+        "capture-policy.json (invalid → defaults)"
+    };
     let p = CapturePolicy::load(&root);
-    let has_file = root.join(".keel/capture-policy.json").is_file();
     if has(args, "--json") {
         println!("{}", render_json(&json!({
-            "source": if has_file { "capture-policy.json" } else { "defaults" },
+            "source": source,
             "erasable": p.erasable, "erase_key": p.erase_key,
             "redact_pii": p.redact_pii, "retain_prompts": p.retain_prompts,
             "retain_tool_results": p.retain_tool_results,
         })));
     } else {
-        println!("capture policy ({})", if has_file { "capture-policy.json" } else { "defaults" });
+        println!("capture policy ({source})");
         println!("  erasable:            {}", p.erasable);
         println!("  erase_key:           {}", p.erase_key.as_deref().unwrap_or("(author)"));
         println!("  redact_pii:          {}", p.redact_pii);
@@ -901,6 +918,11 @@ fn match_email_at(b: &[u8], i: usize) -> Option<usize> {
     let mut k = dom_start;
     while k < b.len() && is_domain_char(b[k]) {
         k += 1;
+    }
+    // Trim trailing '.'/'-' — sentence punctuation like "email foo@bar.com." must not swallow the
+    // final dot into the domain (which would empty the TLD and leak the whole address).
+    while k > dom_start && matches!(b[k - 1], b'.' | b'-') {
+        k -= 1;
     }
     let domain = &b[dom_start..k];
     let last_dot = domain.iter().rposition(|&c| c == b'.')?;
@@ -2744,12 +2766,16 @@ mod tests {
         for (input, expect_left) in [
             ("contact user@example.com now", "contact "),
             ("cc a.b+tag@sub.domain.co.uk please", "cc "),
+            ("reply to foo@bar.com.", "reply to "),        // sentence-final: trailing '.' must not leak
+            ("(user@example.org)", "("),                    // wrapped in parens
         ] {
             let (out, n) = scrub_pii(input);
             assert_eq!(n, 1, "one email in {input:?} → {out:?}");
             assert!(out.contains("[REDACTED-EMAIL]") && !out.contains('@'), "{out:?}");
             assert!(out.starts_with(expect_left));
         }
+        // the sentence-final case must keep the trailing punctuation OUTSIDE the redaction
+        assert_eq!(scrub_pii("reply to foo@bar.com.").0, "reply to [REDACTED-EMAIL].");
         // does NOT redact non-emails: @mentions, missing TLD, bare '@', code
         for safe in ["ping @alice on the thread", "user@localhost has no tld", "email me @ the office", "a @ b", "arr[i]@2"] {
             let (out, n) = scrub_pii(safe);
