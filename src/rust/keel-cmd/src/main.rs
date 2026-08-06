@@ -373,8 +373,16 @@ fn cmd_capture(args: &[String]) -> io::Result<()> {
     }
     // Capture-time secret scrubbing BEFORE anything is written or content-addressed (NEW-1088). On by
     // default because a transcript/tool-output can carry live credentials and the store is immutable;
-    // `--no-scrub` opts out for a fully private/local store.
-    let redacted = if has(args, "--no-scrub") { 0 } else { scrub_value(&mut universal) };
+    // `--no-scrub` opts out for a fully private/local store (with a loud warning — it's a footgun).
+    let redacted = if has(args, "--no-scrub") {
+        eprintln!("keel: warning — --no-scrub: storing the raw transcript unredacted; any secrets it contains will be permanent in the immutable store");
+        0
+    } else {
+        scrub_value(&mut universal)
+    };
+    // Use the SCRUBBED lesson (the override was written into `universal` before scrubbing), so a secret
+    // in --lesson can't slip past into the session blob or the lesson record.
+    let lesson = universal.get("lesson").and_then(Value::as_str).filter(|s| !s.is_empty()).map(str::to_string);
     let task = universal.get("task").and_then(Value::as_str).unwrap_or("(captured session)").to_string();
 
     // Emit the universal JSON to a file if asked (feeds `keel commit --session <file>`).
@@ -385,12 +393,12 @@ fn cmd_capture(args: &[String]) -> io::Result<()> {
     if has(args, "--commit") {
         let (root, store) = root_store(args)?;
         let repo = Repo::open(&store).map_err(to_io)?;
-        let session = session_from_value(&repo, &universal, &task, flag(args, "--lesson"))?;
+        let session = session_from_value(&repo, &universal, &task, lesson.as_deref())?;
         let sid = repo.store().put(&Object::Session(session)).map_err(to_io)?;
         let author = flag(args, "--author").unwrap_or("capture");
         let ts = now_secs();
         let cid = repo.commit_dir(&root, &task, author, ts, Some(sid)).map_err(to_io)?;
-        if let Some(lesson) = flag(args, "--lesson") {
+        if let Some(lesson) = lesson.as_deref() {
             repo.store().set_lesson(&cid, &task, lesson).map_err(to_io)?;
         }
         if has(args, "--json") {
@@ -561,8 +569,20 @@ fn match_secret_at(b: &[u8], i: usize) -> Option<(usize, &'static str)> {
     ];
     for (prefix, min_body) in PREFIXED {
         if starts(prefix) {
-            let body = tok_run(b, i + prefix.len());
+            let body_start = i + prefix.len();
+            let body = tok_run(b, body_start);
             if body >= *min_body {
+                // `sk-` is a weak prefix — a hyphenated slug like `sk-learn-model-checkpoint-v2` looks
+                // the same. Real OpenAI/Anthropic keys have a high-entropy body (mixed case + digits),
+                // so gate `sk-` on the body carrying BOTH an uppercase and a digit; lowercase slugs pass
+                // through untouched.
+                if *prefix == b"sk-" {
+                    let seg = &b[body_start..body_start + body];
+                    let entropic = seg.iter().any(u8::is_ascii_uppercase) && seg.iter().any(u8::is_ascii_digit);
+                    if !entropic {
+                        continue;
+                    }
+                }
                 return Some((prefix.len() + body, "[REDACTED-SECRET]"));
             }
         }
@@ -606,9 +626,13 @@ fn match_pem_at(b: &[u8], i: usize) -> Option<usize> {
     if !b[i..line_end].windows(11).any(|w| w == b"PRIVATE KEY") {
         return None;
     }
-    // find the matching END line and consume through its trailing dashes/newline
+    // find the matching END line and consume through its trailing dashes/newline. If the transcript
+    // was TRUNCATED before the END line, redact from BEGIN to EOF rather than leaking the partial key.
     let rest = &b[line_end..];
-    let end_rel = rest.windows(9).position(|w| w == b"-----END ")? + line_end;
+    let end_rel = match rest.windows(9).position(|w| w == b"-----END ") {
+        Some(p) => p + line_end,
+        None => return Some(b.len() - i),
+    };
     let after = b[end_rel..].iter().position(|&c| c == b'\n').map(|p| end_rel + p + 1);
     // if the END line has no trailing newline, run to the end of the last dash run
     let end = after.unwrap_or_else(|| {
@@ -2368,6 +2392,13 @@ mod tests {
         assert_eq!(n2, 1);
         assert!(out2.contains("[REDACTED-PRIVATE-KEY]") && !out2.contains("MIIEpAIBAAKCAQEA"));
         assert!(out2.starts_with("here it is:\n") && out2.ends_with("done"));
+
+        // TRUNCATED block (BEGIN present, no END — transcript cut off): must still redact the partial
+        // key body, not leak it.
+        let truncated = format!("log:\n-----BEGIN RSA {k}-----\nMIIEpAIBAAKCAQEAfakekeybytes");
+        let (out3, n3) = scrub_secrets(&truncated);
+        assert_eq!(n3, 1, "truncated PEM must be redacted: {out3:?}");
+        assert!(out3.contains("[REDACTED-PRIVATE-KEY]") && !out3.contains("MIIEpAIBAAKCAQEA"));
     }
 
     #[test]
@@ -2382,6 +2413,8 @@ mod tests {
             "the password is stored in the vault, ask the admin",    // prose containing 'password'
             "function helper(x: number): number { return x * 2; }",  // ordinary code
             "sk-spinner and xox-menu are CSS classes",               // short prefix lookalikes
+            "sk-learn-model-checkpoint-v2-final-report",             // long lowercase slug (sk- entropy gate)
+            "sk-2024-01-annual-review-notes-attached-here",          // digits but no uppercase → not a key
         ];
         for s in safe {
             let (out, n) = scrub_secrets(s);
