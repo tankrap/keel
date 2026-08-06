@@ -737,6 +737,7 @@ dependencies = [
  "keel-resolve",
  "libc",
  "miniz_oxide",
+ "ring",
 ]
 
 [[package]]
