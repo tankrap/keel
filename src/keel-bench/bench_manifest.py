@@ -91,19 +91,24 @@ def config_sha(cfg: dict) -> str:
     notes, and the key source are excluded: they don't change an outcome. Benchmarks are sorted so
     reordering the config array can't change the SHA."""
     _verify_models(cfg)
+
+    def _bench_core(b):
+        c = {"id": b["id"], "module": b["module"], "scenarios": b["scenarios"],
+             "scenario_arity": b["scenario_arity"]}
+        # a real-corpus benchmark's inputs include WHICH revision of the real files it ran against;
+        # pin the repo + commit so a different checkout yields a different SHA (the src path/env don't
+        # affect a result — only the repo identity and commit do).
+        corpus = b.get("corpus")
+        if corpus:
+            c["corpus"] = {"repo": corpus["repo"], "commit": corpus["commit"]}
+        return c
+
     core = {
         "schema": cfg["schema"],
         "version": cfg["version"],
         "models": {k: cfg["models"][k] for k in ("solver", "judge", "api_version")},
         "run": {k: cfg["run"][k] for k in ("trials", "wilson_z")},  # workers excluded on purpose
-        "benchmarks": sorted(
-            (
-                {"id": b["id"], "module": b["module"], "scenarios": b["scenarios"],
-                 "scenario_arity": b["scenario_arity"]}
-                for b in cfg["benchmarks"]
-            ),
-            key=lambda x: x["id"],
-        ),
+        "benchmarks": sorted((_bench_core(b) for b in cfg["benchmarks"]), key=lambda x: x["id"]),
     }
     return _sha(_canon(core))
 
@@ -120,13 +125,16 @@ def build_manifest(cfg: dict) -> dict:
         pinned = b.get("scenarios")
         if pinned is not None and pinned != n:
             raise ValueError(f"{b['id']}: config pins {pinned} scenarios but {b['module']}.SCEN has {n}")
-        benches.append({
+        entry = {
             "id": b["id"],
             "module": b["module"],
             "scenarios": n,
             "scenario_sha256": sha,
             "source_sha256": _source_sha(b["module"]),  # binds this harness's prompts + max_tokens
-        })
+        }
+        if b.get("corpus"):  # record the pinned real-files revision this benchmark ran against
+            entry["corpus"] = {"repo": b["corpus"]["repo"], "commit": b["corpus"]["commit"]}
+        benches.append(entry)
     benches.sort(key=lambda x: x["id"])  # order-independent
     common = _source_sha(COMMON_MODULE)  # binds the shared judge prompt, api() defaults, model constants
     core = {"config_sha256": csha, "common_source_sha256": common, "benchmarks": benches}
@@ -138,6 +146,58 @@ def build_manifest(cfg: dict) -> dict:
         "benchmarks": benches,
         "manifest_sha256": _sha(_canon(core)),
     }
+
+
+def verify_corpus(cfg: dict):
+    """Check that each real-corpus checkout on disk actually holds the pinned revision's files —
+    i.e. HEAD equals the pinned commit AND the tracked tree is clean. A matching HEAD alone is not
+    enough: an uncommitted/staged edit to a corpus file changes the bytes the benchmark reads while
+    HEAD is unchanged, so this also runs `git status --porcelain` (tracked files, submodules) and
+    fails a checkout that is `dirty`.
+
+    Separate from `build_manifest` on purpose: it shells out to git and needs the checkout present,
+    so it is opt-in (CI and `--manifest` stay checkout-free). Returns one row per corpus benchmark
+    with a `status`: `match` | `MISMATCH` (HEAD) | `dirty` (HEAD matches but tree modified) | `absent`
+    (no dir) | `not-a-git-checkout`. Never raises for a missing corpus — the caller decides whether an
+    absent/mismatched/dirty corpus is fatal. Untracked files are not flagged (they don't change the
+    pinned tracked files the benchmark reads); LFS/symlink content is a documented residual."""
+    import os
+    import subprocess
+
+    def _git(src, *args):
+        return subprocess.run(["git", "-C", src, *args], capture_output=True, text=True, timeout=30)
+
+    rows = []
+    for b in cfg["benchmarks"]:
+        c = b.get("corpus")
+        if not c:
+            continue
+        src = os.environ.get(c.get("src_env", ""), "") or os.path.expanduser(c["src_default"])
+        row = {"id": b["id"], "repo": c["repo"], "expected": c["commit"], "path": src, "dirty": None}
+        git_dir = pathlib.Path(src, ".git")
+        if not pathlib.Path(src).is_dir() or not git_dir.exists():
+            row["status"] = "absent" if not pathlib.Path(src).is_dir() else "not-a-git-checkout"
+            row["actual"] = None
+        else:
+            try:
+                actual = _git(src, "rev-parse", "HEAD").stdout.strip()
+            except Exception as e:  # git missing / not a repo — report, don't crash
+                actual = f"<error: {e!r}>"
+            row["actual"] = actual
+            if actual != c["commit"]:
+                row["status"] = "MISMATCH"
+            else:
+                # HEAD matches — now require the tracked tree to be clean, or the bytes may differ.
+                try:
+                    porcelain = _git(src, "status", "--porcelain", "--untracked-files=no",
+                                     "--ignore-submodules=none").stdout.strip()
+                except Exception as e:
+                    porcelain = f"<error: {e!r}>"
+                n_dirty = len([ln for ln in porcelain.splitlines() if ln]) if porcelain else 0
+                row["dirty"] = n_dirty
+                row["status"] = "dirty" if porcelain else "match"
+        rows.append(row)
+    return rows
 
 
 if __name__ == "__main__":
