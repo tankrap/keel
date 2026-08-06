@@ -8,8 +8,8 @@
 
 use keel_brief::BriefService;
 use keel_store::{
-    diff_lines, ChangeKind, Object, ObjectId, Repo, Review, Session, StoreError, Tag, Verdict,
-    Verification,
+    diff_lines, ChangeKind, NodeKind, Object, ObjectId, Repo, Review, Session, StoreError, Tag,
+    Verdict, Verification, Vfs,
 };
 use serde_json::{json, Value};
 use std::io::{self, BufRead, Write};
@@ -47,6 +47,7 @@ fn main() {
         Some("review") => run(cmd_review(&args[1..])),
         Some("reviews") => run(cmd_reviews(&args[1..])),
         Some("walkthrough") => run(cmd_walkthrough(&args[1..])),
+        Some("vfs") => run(cmd_vfs(&args[1..])),
         Some("why") => run(cmd_why(&args[1..])),
         Some("capture") => run(cmd_capture(&args[1..])),
         Some("erase") => run(cmd_erase(&args[1..])),
@@ -142,6 +143,7 @@ fn print_usage() {
          \x20 keel review --target <id> --verdict <approve|request-changes|reject|comment> [--label <l>]\n\
          \x20 keel reviews [--target <id>] [--label <l>] [--mentions <t>] [--no-human] [--disagreements] [--json]\n\
          \x20 keel walkthrough <change> [--full] [--json]   block-by-block review, each block cites its proof\n\
+         \x20 keel vfs <change> <ls|stat|cat> <path> [--json]   read a change's tree lazily, no checkout\n\
          \x20 keel repack [--json]                delta-compress history + GC (like `git gc`)\n\
          \x20 keel size   [--json]                logical bytes / object counts\n\
          \x20 keel mirror-in <git-repo>  ·  keel mirror-out <dir>  ·  keel import/export\n\
@@ -2145,6 +2147,120 @@ fn render_walkthrough_human(v: &Value) -> String {
         "  → record a verdict: keel review --target {change} --verdict <approve|request-changes|reject> [--human]"
     );
     s
+}
+
+/// `keel vfs <change> <ls|stat|cat> <path> [--json]`
+///
+/// Read a change's tree as a lazy filesystem, straight from the content-addressed store — no
+/// checkout. This is the read core behind a future `keel mount`: opening the view touches only the
+/// root tree, and each op fetches just the trees and blobs on the path it needs, so it behaves the
+/// same whether the change has 200 files or a million. Every invocation reports what it actually
+/// fetched (`fetched N tree(s), M blob(s), K byte(s)`) — the evidence that access is lazy rather than
+/// a whole-repo read.
+fn cmd_vfs(args: &[String]) -> io::Result<()> {
+    let pos: Vec<&String> = args.iter().filter(|a| !a.starts_with('-')).collect();
+    let change = pos
+        .first()
+        .ok_or_else(|| io::Error::other("usage: keel vfs <change> <ls|stat|cat> <path> [--json]"))?;
+    let op = pos.get(1).map(|s| s.as_str()).unwrap_or("ls");
+    let path = pos.get(2).map(|s| s.as_str()).unwrap_or("");
+    let json = has(args, "--json");
+
+    let (_, store) = root_store(args)?;
+    let repo = Repo::open(&store).map_err(to_io)?;
+    let id = resolve_change(&repo, change)?;
+    let c = repo.change(id).map_err(to_io)?.ok_or_else(|| io::Error::other("no such change"))?;
+    let vfs = Vfs::new(repo.store(), c.tree);
+
+    // Emit the fetch tally: on stderr in prose (so piped stdout stays clean), inline under --json.
+    let report = |vfs: &Vfs| {
+        let s = vfs.stats();
+        if !json {
+            eprintln!(
+                "fetched {} tree(s), {} blob(s), {} byte(s)",
+                s.trees_read, s.blobs_read, s.bytes_read
+            );
+        }
+        json!({ "trees": s.trees_read, "blobs": s.blobs_read, "bytes": s.bytes_read })
+    };
+
+    match op {
+        "ls" => {
+            let entries = vfs
+                .readdir(path)
+                .map_err(to_io)?
+                .ok_or_else(|| io::Error::other(format!("not a directory: {path:?}")))?;
+            if json {
+                let arr: Vec<Value> = entries
+                    .iter()
+                    .map(|e| json!({ "name": e.name, "kind": node_kind_str(e.kind), "mode": format!("{:o}", e.mode) }))
+                    .collect();
+                let fetched = report(&vfs);
+                println!(
+                    "{}",
+                    render_json(&json!({ "ok": true, "op": "ls", "path": path, "entries": arr, "fetched": fetched }))
+                );
+            } else {
+                for e in &entries {
+                    let marker = match e.kind {
+                        NodeKind::Dir => "/",
+                        NodeKind::Symlink => "@",
+                        NodeKind::File => "",
+                    };
+                    println!("{}{marker}", e.name);
+                }
+                report(&vfs);
+            }
+        }
+        "stat" => {
+            let a = vfs
+                .getattr(path)
+                .map_err(to_io)?
+                .ok_or_else(|| io::Error::other(format!("no such path: {path:?}")))?;
+            if json {
+                let fetched = report(&vfs);
+                println!(
+                    "{}",
+                    render_json(&json!({
+                        "ok": true, "op": "stat", "path": path,
+                        "kind": node_kind_str(a.kind), "mode": format!("{:o}", a.mode), "size": a.size,
+                        "fetched": fetched,
+                    }))
+                );
+            } else {
+                println!("{} {:o} {} bytes  {path}", node_kind_str(a.kind), a.mode, a.size);
+                report(&vfs);
+            }
+        }
+        "cat" => {
+            let bytes = vfs
+                .read(path)
+                .map_err(to_io)?
+                .ok_or_else(|| io::Error::other(format!("not a file: {path:?}")))?;
+            if json {
+                let fetched = report(&vfs);
+                println!(
+                    "{}",
+                    render_json(&json!({ "ok": true, "op": "cat", "path": path, "size": bytes.len(), "fetched": fetched }))
+                );
+            } else {
+                io::stdout().write_all(&bytes)?;
+                report(&vfs);
+            }
+        }
+        other => {
+            return Err(io::Error::other(format!("unknown vfs op {other:?}; use ls|stat|cat")))
+        }
+    }
+    Ok(())
+}
+
+fn node_kind_str(k: NodeKind) -> &'static str {
+    match k {
+        NodeKind::Dir => "dir",
+        NodeKind::File => "file",
+        NodeKind::Symlink => "symlink",
+    }
 }
 
 fn cmd_learn(args: &[String]) -> io::Result<()> {
