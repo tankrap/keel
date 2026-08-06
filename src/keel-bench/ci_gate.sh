@@ -120,6 +120,21 @@ ECS=$("$KEEL" native log --root "$TMP/repo" 2>/dev/null | head -1 | awk '{print 
 CTX=$("$KEEL" session "$ECS" --root "$TMP/repo" 2>/dev/null | grep -c "context:.*—")
 if [ "${CTX:-0}" = "1" ]; then pass "erasable commit --session skips the plaintext auto-context"; else fail "erasable commit leaked a plaintext context_served"; fi
 
+section "capture policy — .keel/capture-policy.json drives PII redaction + default erasability (NEW-1088)"
+PREPO="$TMP/policyrepo"; mkdir -p "$PREPO"; "$KEEL" init --root "$PREPO" >/dev/null 2>&1
+printf '{ "erasable": true, "redact_pii": true }\n' > "$PREPO/.keel/capture-policy.json"
+printf '{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"email alice@example.com re refund"}]}}\n' > "$PREPO/ps.jsonl"
+PJ=$("$KEEL" capture "$PREPO/ps.jsonl" --commit --author acct:carol --root "$PREPO" --json 2>/dev/null)
+PPII=$(print -r -- "$PJ" | python3 -c "import sys,json;print(json.load(sys.stdin).get('pii_redacted',0))" 2>/dev/null)
+PMAIL=$(grep -rl "alice@example.com" "$PREPO/.keel" 2>/dev/null | wc -l | tr -d ' ')
+PCH=$(print -r -- "$PJ" | python3 -c "import sys,json;print(json.load(sys.stdin)['change'])" 2>/dev/null)
+PERA=$("$KEEL" session "$PCH" --root "$PREPO" 2>/dev/null | grep -c "prompts:.*yes")  # erasable-by-default → stored, decryptable
+if [ "${PPII:-0}" = "1" ] && [ "${PMAIL:-1}" = "0" ] && [ "${PERA:-0}" = "1" ]; then
+  pass "policy: email redacted (0 plaintext), payload stored erasable — all without CLI flags"
+else
+  fail "capture policy (pii=$PPII email-leaks=$PMAIL erasable=$PERA)"
+fi
+
 section "benchmark suite — reproducibility manifest + compare + dry-run (no API)"
 BENCH=~/keel/src/keel-bench
 if python3 "$BENCH/test_manifest.py" >/dev/null 2>&1 && python3 "$BENCH/test_compare.py" >/dev/null 2>&1 \

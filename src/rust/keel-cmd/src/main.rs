@@ -49,6 +49,7 @@ fn main() {
         Some("why") => run(cmd_why(&args[1..])),
         Some("capture") => run(cmd_capture(&args[1..])),
         Some("erase") => run(cmd_erase(&args[1..])),
+        Some("policy") => run(cmd_policy(&args[1..])),
         Some("native") => run(cmd_native(&args[1..])),
         // ── git-compatible surface ──
         Some("init") => run(cmd_init(&args[1..])),   // git init + keel store
@@ -276,7 +277,8 @@ fn cmd_commit(args: &[String]) -> io::Result<()> {
     };
     let auto_ctx = last_brief_blob(&repo, &root);
     let session_id = if let Some(path) = flag(args, "--session") {
-        let ek = erase_key_of(args, author);
+        let policy = CapturePolicy::load(&root);
+        let ek = erase_key_of(args, author, &policy);
         let mut s = session_from_file(&repo, path, msg, flag(args, "--lesson"), scrub, ek)?;
         // Only auto-attach the served brief to a NON-erasable session: `last_brief_blob` is a plaintext
         // blob, so attaching it to an erasable commit would bolt on a non-erasable payload that `keel
@@ -320,19 +322,108 @@ fn session_from_file(repo: &Repo, path: &str, msg: &str, lesson_override: Option
     session_from_value(repo, &v, msg, lesson_override, scrub, erase_key)
 }
 
+/// A per-org capture policy (repo `.keel/capture-policy.json`): the enterprise knobs from NEW-1088 —
+/// what to store erasable by default, what to redact, and how much transcript to retain. All fields
+/// default to today's behavior, so a repo with no policy file is unchanged.
+#[derive(Clone)]
+struct CapturePolicy {
+    /// store captured payloads crypto-shreddable by default (as if `--erasable`).
+    erasable: bool,
+    /// the default key_id for erasable storage (else the author).
+    erase_key: Option<String>,
+    /// also redact PII (emails) — off by default (over-redaction would corrupt legitimate context).
+    redact_pii: bool,
+    /// retain the raw prompt transcript (a retention cap can drop it).
+    retain_prompts: bool,
+    /// retain tool outputs (a retention cap can drop them).
+    retain_tool_results: bool,
+}
+
+impl Default for CapturePolicy {
+    fn default() -> Self {
+        CapturePolicy { erasable: false, erase_key: None, redact_pii: false, retain_prompts: true, retain_tool_results: true }
+    }
+}
+
+impl CapturePolicy {
+    /// Load the repo's `.keel/capture-policy.json`, or the defaults if it's absent/unreadable/invalid.
+    /// A PRESENT-but-invalid file warns loudly: silently falling back to defaults would disable an
+    /// admin's redaction/erasability policy without a signal — a compliance footgun.
+    fn load(root: &std::path::Path) -> CapturePolicy {
+        let d = CapturePolicy::default();
+        let path = root.join(".keel/capture-policy.json");
+        let Ok(txt) = std::fs::read_to_string(&path) else { return d };
+        let v: Value = match serde_json::from_str::<Value>(&txt) {
+            Ok(v) if v.is_object() => v,
+            _ => {
+                eprintln!("keel: warning — {} is not valid JSON object; using the DEFAULT capture policy (redaction/erasability/retention NOT applied)", path.display());
+                return d;
+            }
+        };
+        let b = |k: &str, dflt: bool| v.get(k).and_then(Value::as_bool).unwrap_or(dflt);
+        CapturePolicy {
+            erasable: b("erasable", d.erasable),
+            erase_key: v.get("erase_key").and_then(Value::as_str).filter(|s| !s.is_empty()).map(str::to_string),
+            redact_pii: b("redact_pii", d.redact_pii),
+            retain_prompts: b("retain_prompts", d.retain_prompts),
+            retain_tool_results: b("retain_tool_results", d.retain_tool_results),
+        }
+    }
+}
+
+/// The repo root for a capture policy lookup: `--root` (or cwd) if it is a keel repo, else `None`.
+fn policy_root(args: &[String]) -> Option<std::path::PathBuf> {
+    let root = flag(args, "--root")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+    root.join(".keel").is_dir().then_some(root)
+}
+
 /// Resolve the crypto-shred key_id for an erasable capture/commit. Erasable storage is enabled by
-/// EITHER `--erasable` (keyed by the author — per-subject erasure, one subject's data erases together)
-/// OR an explicit `--erase-key <id>` (which also implies erasable; a constant id = per-repo scope, a
-/// unique id = per-session). `None` means store payloads as plaintext blobs (the default; still
-/// secret-scrubbed).
-fn erase_key_of<'a>(args: &'a [String], author: &'a str) -> Option<&'a str> {
+/// `--erasable`, an explicit `--erase-key <id>` (which also implies erasable), or the repo policy's
+/// `erasable: true`. The key_id is `--erase-key` > policy `erase_key` > the author. `None` means store
+/// payloads as plaintext blobs (still secret-scrubbed). A constant key_id = per-repo erase scope, a
+/// unique one = per-session, the author = per-subject.
+fn erase_key_of<'a>(args: &'a [String], author: &'a str, policy: &'a CapturePolicy) -> Option<&'a str> {
     if let Some(k) = flag(args, "--erase-key") {
         Some(k)
-    } else if has(args, "--erasable") {
-        Some(author)
+    } else if has(args, "--erasable") || policy.erasable {
+        Some(policy.erase_key.as_deref().unwrap_or(author))
     } else {
         None
     }
+}
+
+/// `keel policy [--root <r>] [--json]` — show the effective per-org capture policy for this repo
+/// (from `.keel/capture-policy.json`, else the defaults). Read-only; edit the JSON file to change it.
+fn cmd_policy(args: &[String]) -> io::Result<()> {
+    let root = policy_root(args).unwrap_or_else(|| std::path::PathBuf::from("."));
+    let path = root.join(".keel/capture-policy.json");
+    // label the source honestly: a present-but-broken file reports as invalid, not as if it applied
+    let source = if !path.is_file() {
+        "defaults"
+    } else if std::fs::read_to_string(&path).ok().and_then(|t| serde_json::from_str::<Value>(&t).ok()).filter(Value::is_object).is_some() {
+        "capture-policy.json"
+    } else {
+        "capture-policy.json (invalid → defaults)"
+    };
+    let p = CapturePolicy::load(&root);
+    if has(args, "--json") {
+        println!("{}", render_json(&json!({
+            "source": source,
+            "erasable": p.erasable, "erase_key": p.erase_key,
+            "redact_pii": p.redact_pii, "retain_prompts": p.retain_prompts,
+            "retain_tool_results": p.retain_tool_results,
+        })));
+    } else {
+        println!("capture policy ({source})");
+        println!("  erasable:            {}", p.erasable);
+        println!("  erase_key:           {}", p.erase_key.as_deref().unwrap_or("(author)"));
+        println!("  redact_pii:          {}", p.redact_pii);
+        println!("  retain_prompts:      {}", p.retain_prompts);
+        println!("  retain_tool_results: {}", p.retain_tool_results);
+    }
+    Ok(())
 }
 
 /// `keel erase <key-id> [--json]` — the right-to-erasure operation (NEW-1088). Crypto-shreds the data
@@ -425,7 +516,7 @@ fn cmd_capture(args: &[String]) -> io::Result<()> {
         .iter()
         .find(|a| !a.starts_with('-'))
         .cloned()
-        .ok_or_else(|| io::Error::other("usage: keel capture <session-log> [--tool claude|aider] [--commit] [--no-scrub] [--erasable [--erase-key <id>]] (Claude Code .jsonl / Aider history; secrets scrubbed unless --no-scrub; --erasable stores payloads crypto-shreddable so `keel erase` can remove them)"))?;
+        .ok_or_else(|| io::Error::other("usage: keel capture <session-log> [--tool claude|aider] [--commit] [--no-scrub] [--erasable [--erase-key <id>]] [--redact-pii] (Claude Code .jsonl / Aider history; secrets scrubbed unless --no-scrub; --erasable stores payloads crypto-shreddable so `keel erase` can remove them; --redact-pii also redacts emails; per-repo defaults via `keel policy`)"))?;
     let text = std::fs::read_to_string(&log)?;
     let tool = match flag(args, "--tool").unwrap_or("auto") {
         "auto" => detect_tool(&log, &text),
@@ -443,6 +534,9 @@ fn cmd_capture(args: &[String]) -> io::Result<()> {
     if let Some(l) = flag(args, "--lesson") {
         universal["lesson"] = json!(l);
     }
+    // Per-org capture policy (repo .keel/capture-policy.json): PII redaction, retention caps, default
+    // erasability. Absent/unreadable → today's defaults, so nothing changes for a repo without one.
+    let policy = policy_root(args).map(|r| CapturePolicy::load(&r)).unwrap_or_default();
     // Capture-time secret scrubbing BEFORE anything is written or content-addressed (NEW-1088). On by
     // default because a transcript/tool-output can carry live credentials and the store is immutable;
     // `--no-scrub` opts out for a fully private/local store (with a loud warning — it's a footgun).
@@ -452,6 +546,17 @@ fn cmd_capture(args: &[String]) -> io::Result<()> {
     } else {
         scrub_value(&mut universal)
     };
+    // Opt-in PII (email) redaction, and retention caps that drop payloads entirely — both from policy
+    // (or --redact-pii). Applied before the -o emit and before storage, so every downstream copy honours it.
+    let pii_redacted = if has(args, "--redact-pii") || policy.redact_pii { scrub_value_pii(&mut universal) } else { 0 };
+    if let Some(o) = universal.as_object_mut() {
+        if !policy.retain_prompts {
+            o.remove("prompts");
+        }
+        if !policy.retain_tool_results {
+            o.remove("tool_results");
+        }
+    }
     // Use the SCRUBBED lesson (the override was written into `universal` before scrubbing), so a secret
     // in --lesson can't slip past into the session blob or the lesson record.
     let lesson = universal.get("lesson").and_then(Value::as_str).filter(|s| !s.is_empty()).map(str::to_string);
@@ -468,7 +573,7 @@ fn cmd_capture(args: &[String]) -> io::Result<()> {
         // scrub=false: cmd_capture already scrubbed `universal` (and the lesson) above, respecting
         // --no-scrub — don't double-work.
         let author = flag(args, "--author").unwrap_or("capture");
-        let erase_key = erase_key_of(args, author);
+        let erase_key = erase_key_of(args, author, &policy);
         let session = session_from_value(&repo, &universal, &task, lesson.as_deref(), false, erase_key)?;
         let sid = repo.store().put(&Object::Session(session)).map_err(to_io)?;
         let ts = now_secs();
@@ -477,10 +582,9 @@ fn cmd_capture(args: &[String]) -> io::Result<()> {
             repo.store().set_lesson(&cid, &task, lesson).map_err(to_io)?;
         }
         if has(args, "--json") {
-            println!("{}", render_json(&json!({ "ok": true, "change": cid.to_hex(), "session": sid.to_hex(), "tool": tool, "redacted": redacted })));
+            println!("{}", render_json(&json!({ "ok": true, "change": cid.to_hex(), "session": sid.to_hex(), "tool": tool, "redacted": redacted, "pii_redacted": pii_redacted })));
         } else {
-            let note = if redacted > 0 { format!(" · redacted {redacted} secret(s)") } else { String::new() };
-            println!("captured {} session → change {} (session {}){}", tool, short(&cid.to_hex()), short(&sid.to_hex()), note);
+            println!("captured {} session → change {} (session {}){}", tool, short(&cid.to_hex()), short(&sid.to_hex()), redaction_note(redacted, pii_redacted));
         }
         return Ok(());
     }
@@ -492,11 +596,12 @@ fn cmd_capture(args: &[String]) -> io::Result<()> {
         "tokens_in": universal.get("tokens_in"), "tokens_out": universal.get("tokens_out"),
         "tool_calls": universal.get("tool_calls").and_then(Value::as_array).map(|a| a.len()).unwrap_or(0),
         "redacted": redacted,
+        "pii_redacted": pii_redacted,
     });
     if has(args, "--json") {
         println!("{}", render_json(&summary));
     } else {
-        let note = if redacted > 0 { format!(" · redacted {redacted} secret(s)") } else { String::new() };
+        let note = redaction_note(redacted, pii_redacted);
         println!(
             "captured {} session: task={:?} model={} tools={}{} (add --commit to record it, or -o file.json)",
             tool,
@@ -762,20 +867,117 @@ fn scrub_secrets(text: &str) -> (String, usize) {
     (out, count)
 }
 
-/// Recursively scrub every string in a captured-session JSON value, in place. Returns the total
-/// number of redactions across all fields, so `keel capture` can report that scrubbing happened.
-fn scrub_value(v: &mut Value) -> usize {
+/// Recursively apply a text-scrub pass to every string in a captured-session JSON value, in place.
+/// Returns the total number of redactions across all fields.
+fn scrub_value_with(v: &mut Value, pass: &dyn Fn(&str) -> (String, usize)) -> usize {
     match v {
         Value::String(s) => {
-            let (scrubbed, n) = scrub_secrets(s);
+            let (scrubbed, n) = pass(s);
             if n > 0 {
                 *s = scrubbed;
             }
             n
         }
-        Value::Array(a) => a.iter_mut().map(scrub_value).sum(),
-        Value::Object(o) => o.iter_mut().map(|(_, val)| scrub_value(val)).sum(),
+        Value::Array(a) => a.iter_mut().map(|x| scrub_value_with(x, pass)).sum(),
+        Value::Object(o) => o.iter_mut().map(|(_, val)| scrub_value_with(val, pass)).sum(),
         _ => 0,
+    }
+}
+
+/// Recursively scrub secrets from a captured-session JSON value (always-on). Returns the redaction
+/// count so `keel capture` can report that scrubbing happened.
+fn scrub_value(v: &mut Value) -> usize {
+    scrub_value_with(v, &|t| scrub_secrets(t))
+}
+
+// ── opt-in PII redaction (per-org capture policy, NEW-1088) ────────────────────────────────────
+// Emails are common, legitimate context (authors, config) AND sensitive PII, so — unlike secret
+// scrubbing — this is OFF by default and enabled per-repo (capture-policy.json `redact_pii`) or with
+// `--redact-pii`. Conservative: only well-formed `local@domain.tld` addresses, so an `@mention`, a
+// `foo@bar` with no TLD, or a lone `@` in prose is left untouched.
+
+fn is_email_local(c: u8) -> bool {
+    c.is_ascii_alphanumeric() || matches!(c, b'.' | b'_' | b'%' | b'+' | b'-')
+}
+
+fn is_domain_char(c: u8) -> bool {
+    c.is_ascii_alphanumeric() || c == b'.' || c == b'-'
+}
+
+/// Length of an `local@domain.tld` email starting at `b[i]` (caller guarantees a boundary before `i`),
+/// or `None`. Requires a non-empty local part, an `@`, and a domain ending in `.` + a 2+ alpha TLD.
+fn match_email_at(b: &[u8], i: usize) -> Option<usize> {
+    let mut j = i;
+    while j < b.len() && is_email_local(b[j]) {
+        j += 1;
+    }
+    if j == i || b.get(j) != Some(&b'@') {
+        return None; // empty local part, or no '@'
+    }
+    let dom_start = j + 1;
+    let mut k = dom_start;
+    while k < b.len() && is_domain_char(b[k]) {
+        k += 1;
+    }
+    // Trim trailing '.'/'-' — sentence punctuation like "email foo@bar.com." must not swallow the
+    // final dot into the domain (which would empty the TLD and leak the whole address).
+    while k > dom_start && matches!(b[k - 1], b'.' | b'-') {
+        k -= 1;
+    }
+    let domain = &b[dom_start..k];
+    let last_dot = domain.iter().rposition(|&c| c == b'.')?;
+    if last_dot == 0 {
+        return None; // domain starts with '.'
+    }
+    let tld = &domain[last_dot + 1..];
+    if tld.len() < 2 || !tld.iter().all(u8::is_ascii_alphabetic) {
+        return None;
+    }
+    Some(k - i)
+}
+
+/// Redact well-formed email addresses. Returns the scrubbed copy and the redaction count.
+fn scrub_pii(text: &str) -> (String, usize) {
+    let b = text.as_bytes();
+    let mut out = String::with_capacity(b.len());
+    let mut i = 0;
+    let mut count = 0usize;
+    while i < b.len() {
+        let boundary = i == 0 || !is_email_local(b[i - 1]);
+        if boundary {
+            if let Some(len) = match_email_at(b, i) {
+                out.push_str("[REDACTED-EMAIL]");
+                i += len;
+                count += 1;
+                continue;
+            }
+        }
+        let ch = text[i..].chars().next().unwrap();
+        let clen = ch.len_utf8();
+        out.push_str(&text[i..i + clen]);
+        i += clen;
+    }
+    (out, count)
+}
+
+/// Recursively redact PII (emails) from a captured-session JSON value. Opt-in (see the note above).
+fn scrub_value_pii(v: &mut Value) -> usize {
+    scrub_value_with(v, &|t| scrub_pii(t))
+}
+
+/// A human-readable ` · redacted N secret(s) + M email(s)` suffix for capture output (empty if none).
+fn redaction_note(secrets: usize, pii: usize) -> String {
+    let mut parts = Vec::new();
+    if secrets > 0 {
+        parts.push(format!("{secrets} secret(s)"));
+    }
+    if pii > 0 {
+        parts.push(format!("{pii} email(s)"));
+    }
+    if parts.is_empty() {
+        String::new()
+    } else {
+        format!(" · redacted {}", parts.join(" + "))
     }
 }
 
@@ -2556,6 +2758,37 @@ mod tests {
         let dump = serde_json::to_string(&v).unwrap();
         assert!(!dump.contains("ghp_") && !dump.contains("AKIA") && !dump.contains("sk-ant-"));
         assert_eq!(v["tokens_in"], json!(42), "non-string fields untouched");
+    }
+
+    #[test]
+    fn scrub_pii_redacts_emails_conservatively() {
+        // redacts well-formed addresses, preserving surrounding text
+        for (input, expect_left) in [
+            ("contact user@example.com now", "contact "),
+            ("cc a.b+tag@sub.domain.co.uk please", "cc "),
+            ("reply to foo@bar.com.", "reply to "),        // sentence-final: trailing '.' must not leak
+            ("(user@example.org)", "("),                    // wrapped in parens
+        ] {
+            let (out, n) = scrub_pii(input);
+            assert_eq!(n, 1, "one email in {input:?} → {out:?}");
+            assert!(out.contains("[REDACTED-EMAIL]") && !out.contains('@'), "{out:?}");
+            assert!(out.starts_with(expect_left));
+        }
+        // the sentence-final case must keep the trailing punctuation OUTSIDE the redaction
+        assert_eq!(scrub_pii("reply to foo@bar.com.").0, "reply to [REDACTED-EMAIL].");
+        // does NOT redact non-emails: @mentions, missing TLD, bare '@', code
+        for safe in ["ping @alice on the thread", "user@localhost has no tld", "email me @ the office", "a @ b", "arr[i]@2"] {
+            let (out, n) = scrub_pii(safe);
+            assert_eq!(n, 0, "false positive on {safe:?} → {out:?}");
+            assert_eq!(out, safe);
+        }
+    }
+
+    #[test]
+    fn capture_policy_defaults_are_conservative() {
+        let d = CapturePolicy::default();
+        assert!(!d.erasable && !d.redact_pii && d.retain_prompts && d.retain_tool_results,
+                "a repo with no policy file must behave exactly as before");
     }
 
     #[test]
