@@ -108,8 +108,9 @@ def main():
                 return subprocess.run(["git", "-C", d, *a], capture_output=True, text=True)
             g("init", "-q"); g("config", "user.email", "a@b.co"); g("config", "user.name", "a")
             (pathlib.Path(d) / "f.txt").write_text("hello\n")
-            g("add", "-A"); g("commit", "-qm", "c1")
+            g("add", "-A"); g("commit", "-qm", "c1", "--no-gpg-sign")
             head = g("rev-parse", "HEAD").stdout.strip()
+            check(len(head) == 40, "throwaway repo produced a real HEAD (dirty-gate test is not vacuous)")
             tcfg = {"benchmarks": [{"id": "tmp", "module": "x",
                                     "corpus": {"repo": "r", "commit": head,
                                                "src_env": "KEEL_TEST_CORPUS_UNSET", "src_default": d}}]}
