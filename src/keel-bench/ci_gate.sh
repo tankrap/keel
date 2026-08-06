@@ -85,6 +85,14 @@ printf 'export function helper(x: number): number { return x * 3; }\n' > "$TMP/r
 ST=$("$KEEL" native status --root "$TMP/repo" 2>/dev/null)
 if print -r -- "$ST" | grep -q "util.ts"; then pass "status detects the edit"; else fail "status ($ST)"; fi
 
+section "benchmark suite — reproducibility manifest + dry-run (no API)"
+BENCH=~/keel/src/keel-bench
+if python3 "$BENCH/test_manifest.py" >/dev/null 2>&1 && python3 "$BENCH/run_suite.py" --dry-run >/dev/null 2>&1; then
+  pass "suite harnesses import + manifest deterministic"
+else
+  fail "benchmark suite manifest / dry-run"
+fi
+
 rm -rf "$TMP"
 print -r -- ""
 print -r -- "════════════════════════════════════════"

@@ -42,6 +42,9 @@ A live run calls the Anthropic API thousands of times (each scenario, times cond
 # Free: import every harness and check the scenario tables parse. No API calls, no key.
 python3 run_suite.py --dry-run
 
+# Free: print the reproducibility manifest (a stable SHA over every pinned input). No API, no key.
+python3 run_suite.py --manifest
+
 # Live (costs credits): run the packaged benchmarks and write an aggregated report.
 python3 run_suite.py
 
@@ -69,6 +72,21 @@ Prerequisites for a live run:
 
 Solver, judge, trials, workers, and the Wilson z are pinned in [bench-config.json](./bench-config.json) so runs stay comparable over time. `run_suite.py` reads it and exports `TRIALS`/`WORKERS` before importing the harnesses, and an env var you set yourself still wins for a quick smoke run. No temperature is ever sent: opus-4-8's adaptive thinking forces temp=1, and sending a temperature returns HTTP 400. Bump `version` in that file whenever the models, scenario tables, or trial design change, so older reports stay comparable like-for-like.
 
+### Reproducibility manifest
+
+A benchmark is only a *proof* if the inputs that determine a result are pinned and verifiable. `bench_manifest.py` computes a stable SHA-256 over exactly those inputs, and every live report carries the `manifest_sha256` it was produced under. Anyone can `python3 run_suite.py --manifest` and confirm a later run used byte-identical inputs.
+
+What it binds, and why each matters:
+
+- **each harness's scenario table** (`SCEN`) — the conventions/tasks/lessons under test;
+- **each harness's source** — because the solver prompt, the per-scenario prompt assembly, and `max_tokens` live in the harness *code*, not in `SCEN`; two runs with different prompts must not share a SHA;
+- **`bench_common.py`'s source** — the shared dual-judge prompt, the `api()` defaults, and the `SOLVER`/`JUDGE`/`API_VERSION` constants the harnesses *actually call* (the run reads these, not the config's `models` block);
+- **the result-affecting config** — schema/version, the pinned model IDs (verified to equal the constants the code uses, so the config can't silently drift from the run), `trials`, the Wilson `z`, and each benchmark's shape.
+
+`workers` is deliberately **excluded** (pure parallelism — it changes wall-clock, never an outcome). Hashing source is conservative on purpose: a comment edit bumps the SHA (a harmless false "not reproducible"), the safe direction. **Not yet bound:** the *content* of the real corpus checkouts — pinning each corpus's git commit is the tracked follow-up; the gap is small because the solver prompt is built from `SCEN` (path/hint/task/lesson), not the file bytes, so a different checkout moves essentially only the retrieval-hit count, not the headline lift.
+
+It's deterministic by construction (canonical JSON → identical bytes → identical hash), needs no API or token, and `--dry-run` asserts that determinism. `test_manifest.py` locks the guarantees (deterministic, scenario/source/config change → SHA-change, `workers` change → SHA-*un*changed, config-vs-code model drift refused, count-drift caught), and the CI gate runs both so a scenario-table drift or a broken harness fails the build. Bump `version` in `bench-config.json` whenever the pinned inputs change.
+
 ### Reading the Wilson intervals
 
 Each condition reports a Wilson score interval, the range the true success rate plausibly sits in for a finite sample. It is the right interval near 0% or 100%, where the naive interval can run below 0 or above 1.
@@ -81,8 +99,10 @@ Each condition reports a Wilson score interval, the range the true success rate 
 
 | file | role |
 |---|---|
-| `run_suite.py` | single entry point; `--dry-run`, aggregates a JSON and markdown report |
+| `run_suite.py` | single entry point; `--dry-run` / `--manifest`, aggregates a JSON and markdown report |
 | `bench-config.json` | pinned config: models, trials, workers, scenario counts, Wilson z |
+| `bench_manifest.py` | reproducibility manifest: a stable SHA over every pinned input (no API) |
+| `test_manifest.py` | self-test locking the manifest's guarantees (run in the CI gate) |
 | `bench_common.py` | shared plumbing: the API client, `wilson()`, dual `judge()`, `sh()`, parallel `run_trials()` |
 | `flywheel_bench.py` | synthetic conventions, 20 scenarios |
 | `corpus_bench.py` | vs code, 16 scenarios |
