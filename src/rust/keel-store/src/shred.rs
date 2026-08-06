@@ -18,12 +18,25 @@
 //!     ciphertext can't be moved to a different address and still open. Nonces + keys come from
 //!     `ring`'s CSPRNG. We never hand-roll cryptography.
 //!
-//! Honest limits (documented, not hidden): crypto-shredding makes the payload *undecryptable*, which
-//! is the erasure guarantee — but LMDB reuses freed pages lazily, so the deleted **key bytes** may
-//! linger in the file until overwritten. A deployment that needs the key material provably gone
-//! should hold the keyring outside this store (an external KMS/HSM); this module's contract is
-//! "delete the key ⇒ the payload can never be read again", which holds regardless. Erasable
-//! granularity is the `key_id` — choose it per subject/org so a shred erases exactly the right set.
+//! Honest limits (documented, not hidden). The contract is: *delete the key ⇒ the payload can never
+//! be decrypted again*. That holds cryptographically. What it does NOT by itself guarantee, and what a
+//! legal right-to-erasure deployment must handle:
+//!   - **Backups / replicas / remotes.** A shred deletes the key only in *this* store. Any copy —
+//!     a filesystem backup, a synced replica, a pushed remote — retains recoverable ciphertext **and**
+//!     key until it too is shredded. This is the largest scope gap for an erasure claim.
+//!   - **Key bytes on disk.** LMDB reuses freed pages lazily, so the deleted key bytes may linger in
+//!     the file until overwritten (and a stale MVCC reader can still see them).
+//!   - **Key bytes in memory.** The key/nonce buffers and `ring`'s key objects are not zeroized on
+//!     drop, so a just-deleted key can persist in freed heap for the process lifetime.
+//!
+//! A deployment needing the key material *provably* gone should hold the keyring in an external
+//! KMS/HSM (and/or add `zeroize` for the in-process buffers). Erasable granularity is the `key_id` —
+//! choose it per subject/org so a shred erases exactly the right set.
+//!
+//! Nonce budget: a fresh random 96-bit nonce per seal under a shared per-`key_id` key. The safe
+//! ceiling for random nonces is ~2^32 distinct payloads per `key_id` (birthday bound keeps reuse
+//! probability negligible); rotate the `key_id` beyond that. (`ring` offers no XChaCha20/192-bit
+//! nonce, so random-96 is the pragmatic choice.)
 use crate::object::ObjectId;
 use crate::store::{Result, Store, StoreError};
 use ring::aead;
@@ -51,19 +64,28 @@ fn crypto_err() -> StoreError {
 }
 
 impl Store {
-    /// Ensure a data key exists for `key_id`, generating a fresh random one if absent. Returns `true`
-    /// if a key was created, `false` if one already existed. Idempotent.
-    pub fn create_key(&self, key_id: &str) -> Result<bool> {
+    /// Atomically fetch the data key for `key_id`, generating a fresh random one if absent. Uses a
+    /// put-if-absent (single write txn) so a concurrent first use of a `key_id` can't have two callers
+    /// each generate a different key and clobber each other — which would silently make one caller's
+    /// payloads unrecoverable. Returns the key and whether it was just created.
+    fn ensure_key(&self, key_id: &str) -> Result<([u8; KEY_LEN], bool)> {
         if key_id.is_empty() || key_id.len() > 255 {
             return Err(StoreError::Io(std::io::Error::other("crypto-shred: key_id must be 1..=255 bytes")));
         }
-        if self.aux_get(NS_KEY, key_id.as_bytes())?.is_some() {
-            return Ok(false);
-        }
-        let mut key = [0u8; KEY_LEN];
-        SystemRandom::new().fill(&mut key).map_err(|_| crypto_err())?;
-        self.aux_put(NS_KEY, key_id.as_bytes(), &key)?;
-        Ok(true)
+        let (v, created) = self.aux_get_or_insert(NS_KEY, key_id.as_bytes(), &|| {
+            let mut key = vec![0u8; KEY_LEN];
+            SystemRandom::new().fill(&mut key).map_err(|_| crypto_err())?;
+            Ok(key)
+        })?;
+        let key = <[u8; KEY_LEN]>::try_from(v.as_slice()).map_err(|_| crypto_err())?;
+        Ok((key, created))
+    }
+
+    /// Ensure a data key exists for `key_id`, generating a fresh random one if absent. Returns `true`
+    /// if a key was created, `false` if one already existed. Idempotent, and safe under concurrent
+    /// first use (never overwrites an existing key — see [`ensure_key`]).
+    pub fn create_key(&self, key_id: &str) -> Result<bool> {
+        Ok(self.ensure_key(key_id)?.1)
     }
 
     /// Whether a data key currently exists for `key_id` (i.e. its payloads are still recoverable).
@@ -81,8 +103,7 @@ impl Store {
     /// erasable side-store, addressed by `blake3(plaintext)`. Returns that address — the pointer the
     /// immutable graph holds. Storing the same plaintext again is idempotent (same address).
     pub fn put_secret(&self, plaintext: &[u8], key_id: &str) -> Result<ObjectId> {
-        self.create_key(key_id)?; // no-op if it already exists
-        let key = self.data_key(key_id)?.ok_or_else(crypto_err)?;
+        let (key, _) = self.ensure_key(key_id)?; // atomic get-or-create; never overwrites
         let id = ObjectId(*blake3::hash(plaintext).as_bytes());
 
         let mut nonce = [0u8; NONCE_LEN];
@@ -117,6 +138,11 @@ impl Store {
             return Err(StoreError::Corrupt(*id));
         }
         let kl = rec[0] as usize;
+        // a well-formed record always has a non-empty key_id (put_secret rejects empty); kl==0 is
+        // corruption, not a shredded key — don't let it masquerade as `Shredded`.
+        if kl == 0 {
+            return Err(StoreError::Corrupt(*id));
+        }
         let head = 1 + kl + NONCE_LEN;
         if rec.len() < head + aead::CHACHA20_POLY1305.tag_len() {
             return Err(StoreError::Corrupt(*id));
@@ -228,6 +254,22 @@ mod tests {
         assert_eq!(s.read_secret(&id2).unwrap(), SecretState::Shredded);
         // a different subject's key is untouched — erasure is scoped to the key_id
         assert_eq!(s.read_secret(&other).unwrap(), SecretState::Plaintext(b"unrelated".to_vec()));
+    }
+
+    #[test]
+    fn re_creating_a_key_does_not_overwrite_it() {
+        // the property the atomic put-if-absent guarantees: a second create_key must NOT mint a new
+        // key over the existing one, or already-stored payloads would fail to authenticate.
+        let t = Tmp::new();
+        let s = store(&t);
+        assert!(s.create_key("org-1").unwrap(), "first create mints the key");
+        let id = s.put_secret(b"payload under the original key", "org-1").unwrap();
+        assert!(!s.create_key("org-1").unwrap(), "second create is a no-op, not a re-mint");
+        // if the key had been overwritten, this would be Corrupt (auth failure), not Plaintext
+        assert_eq!(
+            s.read_secret(&id).unwrap(),
+            SecretState::Plaintext(b"payload under the original key".to_vec())
+        );
     }
 
     #[test]
