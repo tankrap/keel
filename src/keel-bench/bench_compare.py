@@ -9,11 +9,14 @@ test is so underpowered it would accept a real 15-point regression most of the t
 false confidence.
 
 So certification here is an EQUIVALENCE test (TOST): the two runs reproduce *within a margin δ* only
-if the (1−α) confidence interval for their difference lies entirely inside (−δ, +δ). Because
-equivalence is the thing we must *reject the null to conclude*, low power makes this CONSERVATIVE —
-too few samples means "inconclusive," never a false "reproduced." Separately, we still flag a genuine
-REGRESSION with a Holm-corrected two-proportion test (correcting the family-wise error across the many
-conditions, so a run that truly reproduced isn't failed by chance ~40% of the time).
+if the **95% confidence interval** for their difference lies entirely inside (−δ, +δ). (Using the 95%
+CI makes this a conservative ~2.5%-level TOST — a 5% TOST would use the 90% CI; we deliberately take
+the stricter interval, since erring toward "can't certify" is the safe direction for a reproduction
+claim.) Because equivalence is the thing we must *reject the null to conclude*, low power makes it
+CONSERVATIVE — too few samples means "inconclusive," never a false "reproduced." Separately, we still
+flag a genuine REGRESSION with a Holm-corrected two-proportion test at ~5% (correcting the family-wise
+error across the many conditions, so a run that truly reproduced isn't failed by chance ~40% of the
+time).
 
 Three outcomes, manifest-gated (differing `manifest_sha256` ⇒ different inputs ⇒ not comparable):
   - EQUIVALENT   — every condition's difference CI ⊂ (−δ, +δ). The strong, honest "it reproduced."
@@ -59,7 +62,10 @@ def _analyze(k1, n1, k2, n2, z_crit, margin):
         p_val = _two_sided_p(z_diff)
 
     # Equivalence (TOST) uses the UNPOOLED variance — we are NOT assuming the rates are equal. The run
-    # reproduces within margin iff the whole (1−α) CI for d sits inside (−margin, +margin).
+    # reproduces within margin iff the whole 95% CI for d (at z_crit) sits inside (−margin, +margin).
+    # Caveat: this is a Wald interval, which degenerates to zero width at p̂∈{0,1} (boundary
+    # undercoverage), so near-100%/0% conditions get slightly optimistic intervals. Low practical risk
+    # at the ±20pp default; switch to a Newcombe/Wilson-score difference interval if δ is tightened.
     se_unp = math.sqrt(p1 * (1 - p1) / n1 + p2 * (1 - p2) / n2)
     ci_half = z_crit * se_unp
     equivalent = (abs(d) + ci_half) <= margin
@@ -152,6 +158,9 @@ def compare(report_a, report_b, margin=MARGIN_DEFAULT, z=None):
     for c, r in zip(conditions, reject):
         c["regressed"] = bool(r)
 
+    # Regression is checked before equivalence: a condition that is both within-margin AND
+    # Holm-significant reports as REGRESSION (a real, detected change outranks a within-margin pass —
+    # the safe direction for a reproduction check).
     if not manifest_match:
         verdict = "manifest_mismatch"
     elif not conditions:
