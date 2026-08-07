@@ -3297,6 +3297,9 @@ fn walkthrough_semantic(
             "removed_lines": rs.added_lines,
             "substantive_lines": s.substantive_lines, "mechanical_lines": s.mechanical_lines,
             "anomalies": s.anomaly_count, "groups": semantic_groups_json(&s),
+            "operator_anomalies": s.operator_anomalies.iter()
+                .map(|a| json!({"file": a.file, "symbol": a.symbol, "text": a.text, "reason": a.reason}))
+                .collect::<Vec<_>>(),
             "removed": json!({
                 "substantive_lines": rs.substantive_lines, "mechanical_lines": rs.mechanical_lines,
                 "anomalies": rs.anomaly_count, "groups": semantic_groups_json(&rs),
@@ -3385,9 +3388,14 @@ fn print_semantic_body(s: &SemanticSummary, removed: bool) {
     // Operator anomalies cut across the shape groups above (the flipped line is its own tiny shape), so
     // they get their own section — a `<=`→`<`, `&&`→`||` one site broke from an overwhelming majority.
     if !s.operator_anomalies.is_empty() {
-        println!("\noperator anomalies — a flipped operator one site breaks from the rest:");
+        let head = if removed {
+            "\noperator anomalies in deletions — a flipped operator one deleted site breaks from the rest:"
+        } else {
+            "\noperator anomalies — a flipped operator one site breaks from the rest:"
+        };
+        println!("{head}");
         for a in &s.operator_anomalies {
-            println!("  ⚠ {}: {}  — {}", loc(&a.file, &a.symbol), a.text, a.reason);
+            println!("  ⚠ {mark} {}: {}  — {}", loc(&a.file, &a.symbol), a.text, a.reason);
         }
     }
 }
