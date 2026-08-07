@@ -2246,6 +2246,9 @@ fn cmd_walkthrough(args: &[String]) -> io::Result<()> {
 
     let mut blocks = Vec::new();
     let (mut tot_add, mut tot_del) = (0usize, 0usize);
+    // Collect the added lines from the SAME bytes the blocks are built from, so the anomaly banner
+    // below costs no extra file reads (vs a second `change_added_lines` pass over the whole change).
+    let mut wt_added: Vec<AddedLine> = Vec::new();
     for f in &files {
         let old = match (parent, f.kind) {
             (_, ChangeKind::Added) => Vec::new(),
@@ -2256,6 +2259,7 @@ fn cmd_walkthrough(args: &[String]) -> io::Result<()> {
             ChangeKind::Deleted => Vec::new(),
             _ => repo.file_bytes_at(id, &f.path).map_err(to_io)?.unwrap_or_default(),
         };
+        wt_added.extend(added_lines_from(&f.path, &old, &new));
         let block = walkthrough_block(&f.path, f.kind, &old, &new, &test_paths, verif, full);
         tot_add += block["added_lines"].as_u64().unwrap_or(0) as usize;
         tot_del += block["deleted_lines"].as_u64().unwrap_or(0) as usize;
@@ -2290,6 +2294,20 @@ fn cmd_walkthrough(args: &[String]) -> io::Result<()> {
     }
     if let Some(l) = lesson {
         out["lesson"] = json!(l);
+    }
+
+    // Surface literal anomalies (smuggled constants) in the DEFAULT review too — a signal shown only
+    // behind `--semantic` is one most reviewers never see. Runs over the lines gathered above (no
+    // extra file reads).
+    let sem = semantic_summarize(&wt_added);
+    if sem.anomaly_count > 0 {
+        let anoms: Vec<Value> = sem
+            .groups
+            .iter()
+            .flat_map(|g| g.anomalies.iter())
+            .map(|a| json!({ "file": a.file, "symbol": a.symbol, "text": a.text, "reason": a.reason }))
+            .collect();
+        out["anomalies"] = json!(anoms);
     }
 
     if has(args, "--json") {
@@ -2460,6 +2478,19 @@ fn render_walkthrough_human(v: &Value) -> String {
         "  proof: {} covered · {} untested · {} test file(s) changed",
         ps["covered"], ps["untested"], ps["tests_changed"]
     );
+    // Anomaly banner: the smuggled-constant signal, surfaced up front so it isn't missed in the
+    // block-by-block scroll. `keel walkthrough --semantic` shows the full operation view.
+    if let Some(anoms) = v["anomalies"].as_array().filter(|a| !a.is_empty()) {
+        let _ = writeln!(s, "  ⚠ {} literal anomaly(ies) — a value one site breaks from the rest:", anoms.len());
+        for a in anoms {
+            let file = a["file"].as_str().unwrap_or("");
+            let loc = match a["symbol"].as_str() {
+                Some(sym) => format!("{file} · {sym}"),
+                None => file.to_string(),
+            };
+            let _ = writeln!(s, "      {loc}: {}  — {}", a["text"].as_str().unwrap_or("").trim(), a["reason"].as_str().unwrap_or(""));
+        }
+    }
     let _ = writeln!(s);
     if let Some(blocks) = v["blocks"].as_array() {
         for (i, b) in blocks.iter().enumerate() {
@@ -2839,22 +2870,7 @@ fn semantic_diff(
             continue; // binary file — nothing to mask
         }
         files += 1;
-        let (o, n) = (String::from_utf8_lossy(&old), String::from_utf8_lossy(&new));
-        let new_lines: Vec<&str> = n.lines().collect();
-        for h in diff_lines(&o, &n) {
-            let mut newpos = h.new_start;
-            for line in h.lines {
-                match line.tag {
-                    Tag::Add => {
-                        let symbol = enclosing_symbol(&new_lines, newpos.saturating_sub(1));
-                        added.push(AddedLine { file: c.path.clone(), text: line.text, symbol });
-                        newpos += 1;
-                    }
-                    Tag::Context => newpos += 1,
-                    Tag::Del => {}
-                }
-            }
-        }
+        added.extend(added_lines_from(&c.path, &old, &new));
     }
     let s = semantic_summarize(&added);
 
@@ -2975,6 +2991,34 @@ fn def_symbol(trimmed: &str) -> Option<String> {
     None
 }
 
+/// The added lines of one file's `old`→`new` diff, each tagged with the file and its best-effort
+/// enclosing symbol. Empty for a binary file (a NUL byte on either side — nothing to mask). The one
+/// place that maps a diff to `AddedLine`s, so `change_added_lines`, the working-tree `semantic_diff`,
+/// and the default walkthrough all agree and read each file's bytes once.
+fn added_lines_from(path: &str, old: &[u8], new: &[u8]) -> Vec<AddedLine> {
+    if old.contains(&0) || new.contains(&0) {
+        return Vec::new();
+    }
+    let (o, n) = (String::from_utf8_lossy(old), String::from_utf8_lossy(new));
+    let new_lines: Vec<&str> = n.lines().collect();
+    let mut out = Vec::new();
+    for h in diff_lines(&o, &n) {
+        let mut newpos = h.new_start; // 1-based new-file line of the next Context/Add line
+        for line in h.lines {
+            match line.tag {
+                Tag::Add => {
+                    let symbol = enclosing_symbol(&new_lines, newpos.saturating_sub(1));
+                    out.push(AddedLine { file: path.to_string(), text: line.text, symbol });
+                    newpos += 1;
+                }
+                Tag::Context => newpos += 1,
+                Tag::Del => {} // removed line — the new file doesn't advance
+            }
+        }
+    }
+    out
+}
+
 /// The added lines of a committed change (vs its first parent), skipping binary files. Returns
 /// `(added_lines, non_binary_files, binary_files)`. Shared by the semantic walkthrough and the
 /// semantic review — both want "what did this change add", masked and grouped downstream.
@@ -2999,22 +3043,7 @@ fn change_added_lines(repo: &Repo, id: ObjectId) -> io::Result<(Vec<AddedLine>, 
             continue;
         }
         nfiles += 1;
-        let (o, n) = (String::from_utf8_lossy(&old), String::from_utf8_lossy(&new));
-        let new_lines: Vec<&str> = n.lines().collect();
-        for h in diff_lines(&o, &n) {
-            let mut newpos = h.new_start; // 1-based new-file line of the next Context/Add line
-            for line in h.lines {
-                match line.tag {
-                    Tag::Add => {
-                        let symbol = enclosing_symbol(&new_lines, newpos.saturating_sub(1));
-                        added.push(AddedLine { file: f.path.clone(), text: line.text, symbol });
-                        newpos += 1;
-                    }
-                    Tag::Context => newpos += 1,
-                    Tag::Del => {} // removed line — the new file doesn't advance
-                }
-            }
-        }
+        added.extend(added_lines_from(&f.path, &old, &new));
     }
     Ok((added, nfiles, binary))
 }
@@ -3885,6 +3914,22 @@ mod tests {
     }
 
     #[test]
+    fn walkthrough_human_render_shows_the_anomaly_banner() {
+        let v = json!({
+            "change": "abc", "intent": "x", "author": "a", "timestamp": 0u64,
+            "verification": "green", "files": 1, "added_lines": 6, "deleted_lines": 0,
+            "proof_summary": {"verified": true, "covered": 0, "untested": 0, "tests_changed": 0},
+            "blocks": [],
+            "anomalies": [
+                {"file": "b.rs", "symbol": "fn compute", "text": "  y6 = new(i6, 7);", "reason": "literal 7 where 5/6 use 2"},
+            ],
+        });
+        let h = render_walkthrough_human(&v);
+        assert!(h.contains("⚠ 1 literal anomaly(ies)"), "banner header: {h}");
+        assert!(h.contains("b.rs · fn compute: y6 = new(i6, 7);  — literal 7 where 5/6 use 2"), "banner line: {h}");
+    }
+
+    #[test]
     fn full_render_interleaves_each_hunk_header_with_its_own_body() {
         // Two hunks: in --full the human render must pair header→body, not dump all headers then all
         // bodies (review finding — the latter is unreadable for multi-hunk files).
@@ -3954,6 +3999,8 @@ mod tests {
             }],
         });
         let h = render_walkthrough_human(&v);
+        // no "anomalies" key → no banner (default clean case)
+        assert!(!h.contains("literal anomaly"), "no banner when key absent: {h}");
         assert!(h.contains("walkthrough · ✓"), "verdict mark in header: {h}");
         assert!(h.contains("task:  make the client retry"));
         assert!(h.contains("proof: exercised by src/client_test.rs"), "proof link before diff: {h}");
