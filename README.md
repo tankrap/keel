@@ -147,6 +147,8 @@ keel show <finding>                         # read any object: finding, session,
 
 The "smuggled constant" case is concrete: a rename `render → scale` across fifteen call sites, one of which quietly changes `* 2` to `* 3`. A line diff buries it among fifteen near-identical additions; keel collapses the fourteen mechanical renames and surfaces the fifteenth as `literal 3 where 14/15 use 2`, naming the function it hides in. The same split works for string constants (a `"v3"` among `"v2"`). This is Level 0–1 of a [depth ladder](src/docs/semantic-depth-and-decentralization.md) that climbs toward AST- and dataflow-aware review.
 
+Which function a change lives in is named by a fast, parser-free heuristic by default. Add `--ast` (to `keel walkthrough --semantic`, `keel native diff --semantic`, `keel review --semantic`, or `keel anomalies`) to attribute TypeScript changes by the TypeScript compiler's exact definition boundaries instead — so an arrow-const method or a nested function the heuristic can't name is named precisely. `--ast` needs the Node resolver sidecar; it degrades to the heuristic per file when that's unavailable, so the default path stays pure-Rust and dependency-free.
+
 Because a review is itself a first-class object, questions git keeps in a spreadsheet become queries: every change reviewed without a human in the loop (`keel reviews --no-human`), every target its reviewers disagreed on (`keel reviews --disagreements`), every change that smuggled a constant (`keel reviews --label anomaly`).
 
 ## Benchmark your own repo
