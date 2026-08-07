@@ -85,14 +85,32 @@ pub fn mask_shape(line: &str) -> String {
     shape
 }
 
-/// The numeric literals in a line, in order (the Level-1 vector recovered from what the mask erases).
-pub fn numeric_literals(line: &str) -> Vec<String> {
-    let (_, lits) = mask_and_literals(line);
-    lits
+/// A literal recovered from what the mask erases: a number (behind `#`) or a string body (behind
+/// `""`). Both are Level-1 anomaly material — a smuggled `* 3` and a smuggled `"v3"` are the same bug.
+#[derive(Clone, PartialEq, Eq, Debug)]
+struct Lit {
+    is_string: bool,
+    value: String,
 }
 
-/// Single pass producing both the shape and the numeric-literal vector.
-fn mask_and_literals(line: &str) -> (String, Vec<String>) {
+impl Lit {
+    /// How the value reads in an anomaly reason: strings are re-quoted, numbers bare.
+    fn show(&self) -> String {
+        if self.is_string {
+            format!("{:?}", self.value)
+        } else {
+            self.value.clone()
+        }
+    }
+}
+
+/// The numeric literals in a line, in order (the Level-1 vector recovered from what the mask erases).
+pub fn numeric_literals(line: &str) -> Vec<String> {
+    mask_and_literals(line).1.into_iter().filter(|l| !l.is_string).map(|l| l.value).collect()
+}
+
+/// Single pass producing both the shape and the literal vector (numbers and string bodies, in order).
+fn mask_and_literals(line: &str) -> (String, Vec<Lit>) {
     let chars: Vec<char> = line.chars().collect();
     let mut i = 0;
     let mut out = String::new();
@@ -123,7 +141,7 @@ fn mask_and_literals(line: &str) -> (String, Vec<String>) {
             {
                 i += 1;
             }
-            lits.push(chars[start..i].iter().collect());
+            lits.push(Lit { is_string: false, value: chars[start..i].iter().collect() });
             out.push('#');
         } else if c == '"' && chars[i + 1..].contains(&'"') {
             // A *balanced* double-quoted string → `""`, body skipped (honoring `\` escapes). The
@@ -134,12 +152,16 @@ fn mask_and_literals(line: &str) -> (String, Vec<String>) {
             // (`&'a`), an apostrophe (`// don't`), or a char literal than the start of a string — so
             // treating it as a plain char keeps `... = f(2)` vs `... = f(3)` literals intact.
             i += 1;
+            let start = i;
             while i < chars.len() && chars[i] != '"' {
                 if chars[i] == '\\' {
                     i += 1;
                 }
                 i += 1;
             }
+            // Capture the body (escapes verbatim, so comparison is exact) — a smuggled string constant
+            // is as much an anomaly as a smuggled number.
+            lits.push(Lit { is_string: true, value: chars[start..i.min(chars.len())].iter().collect() });
             i += 1; // closing quote
             out.push('"');
             out.push('"');
@@ -155,7 +177,7 @@ fn mask_and_literals(line: &str) -> (String, Vec<String>) {
 pub fn summarize(added: &[String]) -> SemanticSummary {
     // Preserve first-seen order of shapes for stable output.
     let mut order: Vec<String> = Vec::new();
-    let mut by_shape: BTreeMap<String, Vec<(String, Vec<String>)>> = BTreeMap::new();
+    let mut by_shape: BTreeMap<String, Vec<(String, Vec<Lit>)>> = BTreeMap::new();
     for line in added {
         let (shape, lits) = mask_and_literals(line);
         if !by_shape.contains_key(&shape) {
@@ -207,13 +229,15 @@ pub fn summarize(added: &[String]) -> SemanticSummary {
 const ANOMALY_SUPERMAJORITY_NUM: usize = 4;
 const ANOMALY_SUPERMAJORITY_DEN: usize = 5;
 
-/// Level 1: within one mechanical group, flag a site whose numeric literal at some position differs
-/// from a value an *overwhelming supermajority* (≥ 80%, see [`ANOMALY_SUPERMAJORITY_NUM`]) of sites
-/// share. A position where values are spread out (uniform variation like `i = 0..19`) has no such
-/// dominant value and flags nothing, and neither does a near-even split.
-fn detect_anomalies(sites: &[(String, Vec<String>)]) -> Vec<Anomaly> {
+/// Level 1: within one mechanical group, flag a site whose literal (number *or* string body) at some
+/// position differs from a value an *overwhelming supermajority* (≥ 80%, see
+/// [`ANOMALY_SUPERMAJORITY_NUM`]) of sites share. A position where values are spread out (uniform
+/// variation like `i = 0..19`) has no such dominant value and flags nothing, and neither does a
+/// near-even split.
+fn detect_anomalies(sites: &[(String, Vec<Lit>)]) -> Vec<Anomaly> {
     let n = sites.len();
-    // All sites share a shape ⇒ the same number of `#` placeholders ⇒ equal-length literal vectors.
+    // All sites share a shape ⇒ the same sequence of `#`/`""` placeholders ⇒ equal-length literal
+    // vectors with the same kind at each position.
     let width = sites.first().map(|(_, l)| l.len()).unwrap_or(0);
     if width == 0 {
         return Vec::new(); // no literals to compare
@@ -222,11 +246,11 @@ fn detect_anomalies(sites: &[(String, Vec<String>)]) -> Vec<Anomaly> {
     // reasons[site_index] accumulates the anomalous positions for that site.
     let mut reasons: Vec<Vec<String>> = vec![Vec::new(); n];
     for p in 0..width {
-        // Tally values at position p.
+        // Tally values at position p (by string value; kind is constant across sites at a position).
         let mut counts: BTreeMap<&str, usize> = BTreeMap::new();
         for (_, lits) in sites {
             if let Some(v) = lits.get(p) {
-                *counts.entry(v.as_str()).or_default() += 1;
+                *counts.entry(v.value.as_str()).or_default() += 1;
             }
         }
         let Some((mode, &mode_count)) = counts.iter().max_by_key(|(_, &c)| c).map(|(m, c)| (*m, c))
@@ -240,8 +264,12 @@ fn detect_anomalies(sites: &[(String, Vec<String>)]) -> Vec<Anomaly> {
         }
         for (idx, (_, lits)) in sites.iter().enumerate() {
             if let Some(v) = lits.get(p) {
-                if v != mode {
-                    reasons[idx].push(format!("literal {v} where {mode_count}/{n} use {mode}"));
+                if v.value != mode {
+                    let mode_show = if v.is_string { format!("{mode:?}") } else { mode.to_string() };
+                    reasons[idx].push(format!(
+                        "literal {} where {mode_count}/{n} use {mode_show}",
+                        v.show()
+                    ));
                 }
             }
         }
@@ -351,6 +379,27 @@ mod tests {
         assert_eq!(mask_shape(r#"f("hi")"#), "_(\"\")");
         // an UNbalanced double quote (comment) must not swallow the rest — literal survives
         assert_eq!(numeric_literals("say \"hi and 2"), vec!["2"]);
+    }
+
+    #[test]
+    fn string_literal_anomaly_surfaces_a_smuggled_constant() {
+        // a flag/version codemod: 15 sites set "v2", one botched to "v3" — same bug class as numbers,
+        // now caught because string bodies are recovered too
+        let mut added: Vec<String> = (0..15).map(|i| format!("cfg{i}.set(\"v2\")")).collect();
+        added.push("cfgX.set(\"v3\")".to_string());
+        let s = summarize(&added);
+        assert_eq!(s.groups.len(), 1);
+        assert_eq!(s.groups[0].anomalies.len(), 1);
+        assert_eq!(s.groups[0].anomalies[0].text, "cfgX.set(\"v3\")");
+        // the reason re-quotes the string values
+        assert!(
+            s.groups[0].anomalies[0].reason.contains("literal \"v3\" where 15/16 use \"v2\""),
+            "{}",
+            s.groups[0].anomalies[0].reason
+        );
+        // uniform string variation (each site a distinct label) must NOT flag
+        let labels: Vec<String> = (0..20).map(|i| format!("register(\"evt{i}\")")).collect();
+        assert_eq!(summarize(&labels).groups[0].anomalies.len(), 0);
     }
 
     #[test]
