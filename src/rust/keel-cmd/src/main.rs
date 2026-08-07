@@ -2284,6 +2284,7 @@ fn cmd_walkthrough(args: &[String]) -> io::Result<()> {
     // Collect the added lines from the SAME bytes the blocks are built from, so the anomaly banner
     // below costs no extra file reads (vs a second `change_added_lines` pass over the whole change).
     let mut wt_added: Vec<AddedLine> = Vec::new();
+    let mut wt_removed: Vec<AddedLine> = Vec::new();
     for f in &files {
         let old = match (parent, f.kind) {
             (_, ChangeKind::Added) => Vec::new(),
@@ -2295,6 +2296,7 @@ fn cmd_walkthrough(args: &[String]) -> io::Result<()> {
             _ => repo.file_bytes_at(id, &f.path).map_err(to_io)?.unwrap_or_default(),
         };
         wt_added.extend(added_lines_from(&f.path, &old, &new, None));
+        wt_removed.extend(removed_lines_from(&f.path, &old, &new, None));
         let block = walkthrough_block(&f.path, f.kind, &old, &new, &test_paths, verif, full);
         tot_add += block["added_lines"].as_u64().unwrap_or(0) as usize;
         tot_del += block["deleted_lines"].as_u64().unwrap_or(0) as usize;
@@ -2333,14 +2335,20 @@ fn cmd_walkthrough(args: &[String]) -> io::Result<()> {
 
     // Surface anomalies (smuggled constants AND flipped operators) in the DEFAULT review too — a signal
     // shown only behind `--semantic` is one most reviewers never see. Runs over the lines gathered above
-    // (no extra file reads).
+    // (no extra file reads). Both sides: an added smuggled `* 3`, and a removed guard whose deletion
+    // broke from its siblings — the scariest, easiest-to-miss AI edit.
+    let anoms_json = |sum: &SemanticSummary| -> Vec<Value> {
+        sum.all_anomalies()
+            .map(|a| json!({ "file": a.file, "symbol": a.symbol, "text": a.text, "reason": a.reason }))
+            .collect()
+    };
     let sem = semantic_summarize(&wt_added);
     if sem.anomaly_count > 0 {
-        let anoms: Vec<Value> = sem
-            .all_anomalies()
-            .map(|a| json!({ "file": a.file, "symbol": a.symbol, "text": a.text, "reason": a.reason }))
-            .collect();
-        out["anomalies"] = json!(anoms);
+        out["anomalies"] = json!(anoms_json(&sem));
+    }
+    let sem_removed = semantic_summarize(&wt_removed);
+    if sem_removed.anomaly_count > 0 {
+        out["removed_anomalies"] = json!(anoms_json(&sem_removed));
     }
 
     if has(args, "--json") {
@@ -2511,19 +2519,23 @@ fn render_walkthrough_human(v: &Value) -> String {
         "  proof: {} covered · {} untested · {} test file(s) changed",
         ps["covered"], ps["untested"], ps["tests_changed"]
     );
-    // Anomaly banner: the smuggled-constant signal, surfaced up front so it isn't missed in the
-    // block-by-block scroll. `keel walkthrough --semantic` shows the full operation view.
-    if let Some(anoms) = v["anomalies"].as_array().filter(|a| !a.is_empty()) {
-        let _ = writeln!(s, "  ⚠ {} anomaly(ies) — a value or operator one site breaks from the rest:", anoms.len());
-        for a in anoms {
-            let file = a["file"].as_str().unwrap_or("");
-            let loc = match a["symbol"].as_str() {
-                Some(sym) => format!("{file} · {sym}"),
-                None => file.to_string(),
-            };
-            let _ = writeln!(s, "      {loc}: {}  — {}", a["text"].as_str().unwrap_or("").trim(), a["reason"].as_str().unwrap_or(""));
+    // Anomaly banner: the smuggled-constant / flipped-operator / dropped-guard signal, surfaced up front
+    // so it isn't missed in the block-by-block scroll. `keel walkthrough --semantic` shows the full view.
+    let mut banner = |key: &str, header: &str| {
+        if let Some(anoms) = v[key].as_array().filter(|a| !a.is_empty()) {
+            let _ = writeln!(s, "  ⚠ {} {header}", anoms.len());
+            for a in anoms {
+                let file = a["file"].as_str().unwrap_or("");
+                let loc = match a["symbol"].as_str() {
+                    Some(sym) => format!("{file} · {sym}"),
+                    None => file.to_string(),
+                };
+                let _ = writeln!(s, "      {loc}: {}  — {}", a["text"].as_str().unwrap_or("").trim(), a["reason"].as_str().unwrap_or(""));
+            }
         }
-    }
+    };
+    banner("anomalies", "anomaly(ies) — a value or operator one site breaks from the rest:");
+    banner("removed_anomalies", "removed-line anomaly(ies) — a deletion one site breaks from the rest (dropped guard?):");
     let _ = writeln!(s);
     if let Some(blocks) = v["blocks"].as_array() {
         for (i, b) in blocks.iter().enumerate() {
@@ -4227,6 +4239,25 @@ mod tests {
         let h = render_walkthrough_human(&v);
         assert!(h.contains("⚠ 1 anomaly(ies)"), "banner header: {h}");
         assert!(h.contains("b.rs · fn compute: y6 = new(i6, 7);  — literal 7 where 5/6 use 2"), "banner line: {h}");
+    }
+
+    #[test]
+    fn walkthrough_human_render_shows_the_removed_anomaly_banner() {
+        // the default (non-semantic) walkthrough must surface a dropped-guard signal too — a deletion
+        // one site broke from its siblings, shown under its own removed-line banner
+        let v = json!({
+            "change": "abc", "intent": "x", "author": "a", "timestamp": 0u64,
+            "verification": "green", "files": 1, "added_lines": 0, "deleted_lines": 6,
+            "proof_summary": {"verified": true, "covered": 0, "untested": 0, "tests_changed": 0},
+            "blocks": [],
+            "removed_anomalies": [
+                {"file": "h.go", "symbol": "func h2", "text": "  if n < max { return }", "reason": "operator < where 5/6 use <="},
+            ],
+        });
+        let h = render_walkthrough_human(&v);
+        assert!(h.contains("⚠ 1 removed-line anomaly(ies)"), "removed banner header: {h}");
+        assert!(h.contains("dropped guard?"), "removed banner wording: {h}");
+        assert!(h.contains("h.go · func h2: if n < max { return }  — operator < where 5/6 use <="), "removed line: {h}");
     }
 
     #[test]
