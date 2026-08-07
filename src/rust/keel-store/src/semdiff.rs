@@ -125,19 +125,24 @@ fn mask_and_literals(line: &str) -> (String, Vec<String>) {
             }
             lits.push(chars[start..i].iter().collect());
             out.push('#');
-        } else if c == '"' || c == '\'' {
-            // string / char literal → `""` or `''` (skip the body, honoring `\` escapes)
-            let quote = c;
+        } else if c == '"' && chars[i + 1..].contains(&'"') {
+            // A *balanced* double-quoted string → `""`, body skipped (honoring `\` escapes). The
+            // balance check matters: an UNbalanced `"` (a quote inside a comment, a mismatched
+            // delimiter) must NOT be treated as a string, or it would swallow the rest of the line and
+            // drop the numeric literals Level 1 depends on. Single quotes are never string delimiters
+            // here — in the languages keel targets a lone `'` is far more often a Rust lifetime
+            // (`&'a`), an apostrophe (`// don't`), or a char literal than the start of a string — so
+            // treating it as a plain char keeps `... = f(2)` vs `... = f(3)` literals intact.
             i += 1;
-            while i < chars.len() && chars[i] != quote {
+            while i < chars.len() && chars[i] != '"' {
                 if chars[i] == '\\' {
                     i += 1;
                 }
                 i += 1;
             }
-            i += 1; // closing quote (if present)
-            out.push(quote);
-            out.push(quote);
+            i += 1; // closing quote
+            out.push('"');
+            out.push('"');
         } else {
             out.push(c);
             i += 1;
@@ -195,10 +200,17 @@ pub fn summarize(added: &[String]) -> SemanticSummary {
     }
 }
 
+/// The mode at a literal position must cover at least this fraction of sites (an *overwhelming*
+/// supermajority) before a differing site is called an anomaly. A bare 50%+1 is not enough: at ~50/50
+/// (or a 2-vs-1 split at the [`MECHANICAL_MIN`] floor) the "minority" is just ordinary variation, not
+/// a smuggled outlier. Expressed as integers below (`mode_count * 5 >= n * 4`) to avoid floats.
+const ANOMALY_SUPERMAJORITY_NUM: usize = 4;
+const ANOMALY_SUPERMAJORITY_DEN: usize = 5;
+
 /// Level 1: within one mechanical group, flag a site whose numeric literal at some position differs
-/// from a value the group *overwhelmingly* agrees on. "Overwhelmingly" = a strict majority (> N/2)
-/// share one value at that position; a position where values are spread out (uniform variation) has
-/// no such majority and flags nothing.
+/// from a value an *overwhelming supermajority* (≥ 80%, see [`ANOMALY_SUPERMAJORITY_NUM`]) of sites
+/// share. A position where values are spread out (uniform variation like `i = 0..19`) has no such
+/// dominant value and flags nothing, and neither does a near-even split.
 fn detect_anomalies(sites: &[(String, Vec<String>)]) -> Vec<Anomaly> {
     let n = sites.len();
     // All sites share a shape ⇒ the same number of `#` placeholders ⇒ equal-length literal vectors.
@@ -221,8 +233,9 @@ fn detect_anomalies(sites: &[(String, Vec<String>)]) -> Vec<Anomaly> {
         else {
             continue;
         };
-        // Only a strict majority makes a minority "anomalous"; otherwise it's expected variation.
-        if mode_count * 2 <= n {
+        // Only an overwhelming supermajority (≥ 80%) makes a minority "anomalous"; a near-even split
+        // or high-cardinality position is expected variation, not a smuggled outlier.
+        if mode_count * ANOMALY_SUPERMAJORITY_DEN < n * ANOMALY_SUPERMAJORITY_NUM {
             continue;
         }
         for (idx, (_, lits)) in sites.iter().enumerate() {
@@ -319,6 +332,38 @@ mod tests {
         assert_eq!(g.anomalies.len(), 1);
         assert_eq!(g.anomalies[0].text, "buf[99] = read(9)");
         assert!(g.anomalies[0].reason.contains("literal 9 where 10/11 use 8"));
+    }
+
+    #[test]
+    fn lifetimes_and_apostrophes_do_not_swallow_later_literals() {
+        // A Rust lifetime must not start a "string" that eats the trailing literal — the exact
+        // smuggled-constant bug this feature targets, in the Rust codebase keel itself is.
+        let mut added: Vec<String> = (0..8).map(|i| format!("let r{i}: &'a T = scale(2)")).collect();
+        added.push("let rX: &'a T = scale(3)".to_string());
+        let s = summarize(&added);
+        assert_eq!(s.groups.len(), 1, "one shape despite the lifetime");
+        assert_eq!(s.groups[0].anomalies.len(), 1, "smuggled 3 still surfaced");
+        assert!(s.groups[0].anomalies[0].text.ends_with("scale(3)"));
+        // an apostrophe in prose/comment must not drop the literal after it
+        assert_eq!(numeric_literals("// don't scale by 2"), vec!["2"]);
+        // a BALANCED double-quoted string is still a string: its inner number is not a literal
+        assert_eq!(numeric_literals(r#"log("scaled by 2")"#), Vec::<String>::new());
+        assert_eq!(mask_shape(r#"f("hi")"#), "_(\"\")");
+        // an UNbalanced double quote (comment) must not swallow the rest — literal survives
+        assert_eq!(numeric_literals("say \"hi and 2"), vec!["2"]);
+    }
+
+    #[test]
+    fn near_even_and_small_splits_are_not_flagged() {
+        // 3-vs-2 at N=5 (60%) is ordinary variation, not a smuggled outlier
+        let mut added: Vec<String> = (0..3).map(|i| format!("a{i} = f(2)")).collect();
+        added.extend((0..2).map(|i| format!("b{i} = f(7)")));
+        let s = summarize(&added);
+        assert_eq!(s.groups[0].kind, GroupKind::Mechanical);
+        assert_eq!(s.groups[0].anomalies.len(), 0, "60% is not an overwhelming majority");
+        // 2-vs-1 at the MECHANICAL_MIN floor (N=3, 67%) must not flag either
+        let added2 = vec!["p = g(4)".to_string(), "q = g(4)".to_string(), "r = g(9)".to_string()];
+        assert_eq!(summarize(&added2).groups[0].anomalies.len(), 0);
     }
 
     #[test]
