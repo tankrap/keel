@@ -141,6 +141,7 @@ fn print_usage() {
          \x20 keel learn --lesson <text> [--task <text>]   record what a change taught (flywheel)\n\
          \x20 keel sessions [--file <path>]       ·   keel session <change>\n\
          \x20 keel review --target <id> --verdict <approve|request-changes|reject|comment> [--label <l>]\n\
+         \x20 keel review --target <change> --semantic   auto-review: record the change's anomalies as findings\n\
          \x20 keel reviews [--target <id>] [--label <l>] [--mentions <t>] [--no-human] [--disagreements] [--json]\n\
          \x20 keel walkthrough <change> [--full] [--semantic] [--json]   block-by-block (or operation-level) review\n\
          \x20 keel vfs <change> <ls|stat|cat> <path> [--json]   read a change's tree lazily, no checkout\n\
@@ -1750,6 +1751,11 @@ fn flag_all(args: &[String], name: &str) -> Vec<String> {
 /// Record a review of a session or change as a first-class object (peer to a session). Several
 /// reviews of one target with different verdicts express disagreement.
 fn cmd_review(args: &[String]) -> io::Result<()> {
+    // `--semantic`: derive the review from the change itself — run the semantic engine and record its
+    // anomalies as findings — instead of taking a hand-authored verdict/findings.
+    if has(args, "--semantic") {
+        return review_semantic(args);
+    }
     let target = flag(args, "--target").and_then(ObjectId::from_hex).ok_or_else(|| {
         fail_fix("missing or invalid --target", "pass the session/change id as 64 hex chars")
     })?;
@@ -1774,6 +1780,84 @@ fn cmd_review(args: &[String]) -> io::Result<()> {
             "verdict": verdict.name(), "by_human": by_human, "target_known": target_known,
         }))
     );
+    Ok(())
+}
+
+/// `keel review --target <change> --semantic [--verdict <v>] [--reviewer <who>] [--human] [--json]`
+///
+/// An automated review derived from the change itself: run the semantic engine over its added lines
+/// and record each literal anomaly (a smuggled `* 3` among `* 2`, a `"v3"` among `"v2"`) as a review
+/// finding, with a machine summary and a `semantic` / `anomaly` label. Closes the loop — the
+/// anomalies are now first-class, queryable objects (`keel reviews --label anomaly`), not console
+/// output that scrolls away. Default verdict is `comment` (a flag, not a judgment); pass `--verdict`
+/// to assert one.
+fn review_semantic(args: &[String]) -> io::Result<()> {
+    let raw = flag(args, "--target")
+        .ok_or_else(|| fail_fix("missing --target", "pass the change id to review"))?;
+    let verdict = Verdict::from_name(flag(args, "--verdict").unwrap_or("comment"))
+        .ok_or_else(|| fail_fix("invalid --verdict", "one of: approve, request-changes, reject, comment"))?;
+    let reviewer = flag(args, "--reviewer").unwrap_or("keel-semantic").to_string();
+    let by_human = has(args, "--human");
+
+    let (_, store) = root_store(args)?;
+    let repo = Repo::open(&store).map_err(to_io)?;
+    let id = resolve_change(&repo, raw)?;
+    let (added, nfiles, binary) = change_added_lines(&repo, id)?;
+    let s = semantic_summarize(&added);
+
+    // Each anomaly becomes a finding blob (the write-up), referenced by the Review.
+    let mut findings: Vec<ObjectId> = Vec::new();
+    for g in &s.groups {
+        for a in &g.anomalies {
+            let text = format!("semantic anomaly [{}]\n  site:   {}\n  reason: {}\n", g.shape, a.text, a.reason);
+            let fid = repo.store().put(&Object::Blob(text.into_bytes())).map_err(to_io)?;
+            findings.push(fid);
+        }
+    }
+    let mut labels = flag_all(args, "--label");
+    if !labels.iter().any(|l| l == "semantic") {
+        labels.push("semantic".to_string());
+    }
+    if s.anomaly_count > 0 && !labels.iter().any(|l| l == "anomaly") {
+        labels.push("anomaly".to_string());
+    }
+    let summary = format!(
+        "semantic review: {} anomaly(ies), {} mechanical / {} substantive added line(s) across {} file(s)",
+        s.anomaly_count, s.mechanical_lines, s.substantive_lines, nfiles
+    );
+    let review = Review {
+        target: id,
+        reviewer,
+        by_human,
+        verdict,
+        summary: summary.clone(),
+        labels: labels.clone(),
+        findings: findings.clone(),
+    };
+    let rid = repo.store().record_review(&review).map_err(to_io)?;
+
+    if has(args, "--json") {
+        println!(
+            "{}",
+            render_json(&json!({
+                "ok": true, "review": rid.to_hex(), "target": id.to_hex(), "verdict": verdict.name(),
+                "anomalies": s.anomaly_count, "findings": findings.iter().map(|f| f.to_hex()).collect::<Vec<_>>(),
+                "labels": labels, "binary_files": binary, "summary": summary,
+            }))
+        );
+    } else {
+        println!("recorded semantic review {} of {}", short(&rid.to_hex()), short(&id.to_hex()));
+        println!("  {summary}");
+        for g in &s.groups {
+            for a in &g.anomalies {
+                println!("  ⚠ {}  — {}", a.text, a.reason);
+            }
+        }
+        if binary > 0 {
+            println!("  ({binary} binary file(s) skipped)");
+        }
+        println!("  query later: keel reviews --label anomaly   ·   keel reviews --target {}", id.to_hex());
+    }
     Ok(())
 }
 
@@ -1904,7 +1988,7 @@ fn cmd_walkthrough(args: &[String]) -> io::Result<()> {
     if has(args, "--semantic") {
         return walkthrough_semantic(
             &repo, id, &c.intent, &c.author, c.timestamp, verif,
-            task.as_deref(), model.as_deref(), lesson.as_deref(), &files, parent, has(args, "--json"),
+            task.as_deref(), model.as_deref(), lesson.as_deref(), has(args, "--json"),
         );
     }
 
@@ -2559,28 +2643,16 @@ fn semantic_groups_json(s: &SemanticSummary) -> Vec<Value> {
         .collect()
 }
 
-/// `keel walkthrough <change> --semantic` — the operation view of a *committed* change (vs its
-/// parent), under the session header. Same engine as `keel native diff --semantic`, but over the
-/// change's added lines rather than the working tree, so reviewing an agent's change reads as
-/// operations + anomalies instead of thousands of hunk lines.
-#[allow(clippy::too_many_arguments)]
-fn walkthrough_semantic(
-    repo: &Repo,
-    id: ObjectId,
-    intent: &str,
-    author: &str,
-    timestamp: u64,
-    verif: &str,
-    task: Option<&str>,
-    model: Option<&str>,
-    lesson: Option<&str>,
-    files: &[keel_store::PathChange],
-    parent: Option<ObjectId>,
-    json: bool,
-) -> io::Result<()> {
+/// The added lines of a committed change (vs its first parent), skipping binary files. Returns
+/// `(added_lines, non_binary_files, binary_files)`. Shared by the semantic walkthrough and the
+/// semantic review — both want "what did this change add", masked and grouped downstream.
+fn change_added_lines(repo: &Repo, id: ObjectId) -> io::Result<(Vec<String>, usize, usize)> {
+    let c = repo.change(id).map_err(to_io)?.ok_or_else(|| io::Error::other("no such change"))?;
+    let files = repo.change_files(id).map_err(to_io)?;
+    let parent = c.parents.first().copied();
     let mut added: Vec<String> = Vec::new();
     let (mut nfiles, mut binary) = (0usize, 0usize);
-    for f in files {
+    for f in &files {
         let old = match (parent, f.kind) {
             (_, ChangeKind::Added) => Vec::new(),
             (Some(p), _) => repo.file_bytes_at(p, &f.path).map_err(to_io)?.unwrap_or_default(),
@@ -2604,6 +2676,27 @@ fn walkthrough_semantic(
             }
         }
     }
+    Ok((added, nfiles, binary))
+}
+
+/// `keel walkthrough <change> --semantic` — the operation view of a *committed* change (vs its
+/// parent), under the session header. Same engine as `keel native diff --semantic`, but over the
+/// change's added lines rather than the working tree, so reviewing an agent's change reads as
+/// operations + anomalies instead of thousands of hunk lines.
+#[allow(clippy::too_many_arguments)]
+fn walkthrough_semantic(
+    repo: &Repo,
+    id: ObjectId,
+    intent: &str,
+    author: &str,
+    timestamp: u64,
+    verif: &str,
+    task: Option<&str>,
+    model: Option<&str>,
+    lesson: Option<&str>,
+    json: bool,
+) -> io::Result<()> {
+    let (added, nfiles, binary) = change_added_lines(repo, id)?;
     let s = semantic_summarize(&added);
 
     if json {
