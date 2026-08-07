@@ -310,11 +310,25 @@ function safeRead(p) {
   }
 }
 
-// The top-level funcs, methods, and named types in `file` with 1-based inclusive line ranges —
+// True if `n` sits inside a function/method body or a func literal. Go funcs/methods are always
+// package-scope (there are no nested func *declarations*, only `func_literal`s), so this only ever
+// fires for a `type` — which Go does allow function-local. Those locals are implementation noise, not
+// package API: a line inside one reads better attributed to its enclosing func than to some obscure,
+// possibly-non-unique local type, so `collectSymbols` skips them. (Contrast the Python sidecar, where
+// nested classes/defs are deliberate structural units and ARE emitted.)
+function insideFunc(n) {
+  for (let p = n.parent; p; p = p.parent) {
+    if (p.type === "function_declaration" || p.type === "method_declaration" || p.type === "func_literal") return true;
+  }
+  return false;
+}
+
+// The package-scope funcs, methods, and named types in `file` with 1-based inclusive line ranges —
 // AST-accurate symbol boundaries the semantic diff uses to name which symbol an added line lives in.
 // A method's name field is a `field_identifier` and a type's is a `type_identifier` (not the plain
-// `identifier` that `defName` insists on), so read the "name" field's text directly here. tree-sitter
-// positions are 0-based rows, so +1.
+// `identifier` that `defName` insists on), so read the "name" field's text directly here. Both defining
+// forms count as a "type": `type_spec` (`type Foo struct/interface/…`) and `type_alias` (`type Foo = Bar`).
+// tree-sitter positions are 0-based rows, so +1.
 function collectSymbols(dir, file) {
   const src = safeRead(path.resolve(dir, file));
   if (src == null) throw new Error(`file not found: ${file}`);
@@ -327,7 +341,7 @@ function collectSymbols(dir, file) {
   walk(tree.rootNode, (n) => {
     if (n.type === "function_declaration") push(n, "function");
     else if (n.type === "method_declaration") push(n, "method");
-    else if (n.type === "type_spec") push(n, "type"); // `type Foo struct/interface/... {…}`
+    else if ((n.type === "type_spec" || n.type === "type_alias") && !insideFunc(n)) push(n, "type");
   });
   return out;
 }

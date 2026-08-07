@@ -919,6 +919,23 @@ mod tests {
         assert_eq!(record.kind, "method");
         assert_eq!((record.start_line, record.end_line), (11, 13));
 
+        // package-scope `type X = Y` (a `type_alias` node, not `type_spec`) is emitted; function-local
+        // types (Go allows them) are NOT — they're implementation noise, so a line inside the func must
+        // attribute to the func, not to some obscure local type.
+        let src2 = "package p\n\ntype Handler = func(int) int\n\nfunc Run() {\n\ttype local struct {\n\t\tn int\n\t}\n\tvar _ local\n}\n";
+        fs::write(dir.join("scope.go"), src2).unwrap();
+        let s2 = sc.symbols(&dir, "scope.go").unwrap();
+        let g = |name: &str| s2.iter().find(|s| s.name == name).cloned();
+        assert_eq!(g("Handler").expect("package-scope type alias is a symbol").kind, "type");
+        assert_eq!(g("Run").expect("func").kind, "function");
+        assert!(g("local").is_none(), "function-local type must not leak as a package symbol; got {s2:?}");
+        // the local struct's field line (line 7) resolves to `Run`, the innermost *emitted* symbol
+        let at7: Vec<_> = s2.iter().filter(|s| s.start_line <= 7 && 7 <= s.end_line).collect();
+        assert!(
+            at7.iter().all(|s| s.name == "Run"),
+            "line inside a function-local type attributes to the enclosing func; got {at7:?}"
+        );
+
         let _ = fs::remove_dir_all(&dir);
     }
 
