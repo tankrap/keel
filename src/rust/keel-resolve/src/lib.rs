@@ -39,6 +39,17 @@ pub struct SliceDef {
     pub text: String,
 }
 
+/// A definition in a file and its 1-based, inclusive line range — the AST-accurate symbol boundary
+/// the semantic diff uses to name which function/class an added line lives in. `kind` is one of
+/// `function` / `method` / `class` / `interface` / `enum`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SymbolRange {
+    pub name: String,
+    pub kind: String,
+    pub start_line: u32,
+    pub end_line: u32,
+}
+
 /// Why a sidecar stopped being usable. A **crash** (the process exited / the pipe broke /
 /// the id stream desynced) is healed by respawning a fresh child on the next call. A
 /// **wedge** (a request timed out — the process is alive but stuck) is *not* retried: a
@@ -290,6 +301,37 @@ impl Sidecar {
             Ok(defs)
         } else {
             let msg = r.get("error").and_then(Value::as_str).unwrap_or("slice error");
+            Err(io::Error::other(msg.to_string()))
+        }
+    }
+
+    /// The definitions in `file` with their 1-based inclusive line ranges (AST-accurate, via the TS
+    /// compiler). Nested defs are included, so the caller can pick the innermost range containing a
+    /// line — the intended lookup. Names are NOT unique (overload signatures repeat a name, each with
+    /// its own range), so resolve by range, not by a name-keyed map. Errors if the sidecar has no
+    /// TypeScript or the file isn't in its program — callers that want a graceful fallback should
+    /// treat an `Err` as "no symbol info for this file".
+    pub fn symbols(&mut self, dir: &Path, file: &str) -> io::Result<Vec<SymbolRange>> {
+        let r = self.call(json!({ "op": "symbols", "dir": dir.to_string_lossy(), "file": file }))?;
+        if r.get("ok").and_then(Value::as_bool) == Some(true) {
+            let syms = r["result"]["symbols"]
+                .as_array()
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|s| {
+                            Some(SymbolRange {
+                                name: s.get("name")?.as_str()?.to_string(),
+                                kind: s.get("kind").and_then(Value::as_str).unwrap_or("").to_string(),
+                                start_line: s.get("startLine")?.as_u64()? as u32,
+                                end_line: s.get("endLine")?.as_u64()? as u32,
+                            })
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            Ok(syms)
+        } else {
+            let msg = r.get("error").and_then(Value::as_str).unwrap_or("symbols error");
             Err(io::Error::other(msg.to_string()))
         }
     }
@@ -646,6 +688,54 @@ mod tests {
             defs.iter().any(|d| d.symbol == "shared" && d.file == "src/util/shared.ts"),
             "path-aliased import resolved cross-package; got {defs:?}"
         );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The `symbols` op reports each definition's name, kind, and 1-based inclusive line range — the
+    /// AST-accurate boundaries the semantic diff uses to name which function an added line lives in.
+    /// Nested defs (an arrow fn inside a fn, a method inside a class) are included.
+    #[test]
+    fn ts_symbols_reports_definitions_with_line_ranges() {
+        let mut sc = match Sidecar::spawn(&script()) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("skipping symbols test: node not available ({e})");
+                return;
+            }
+        };
+        if sc.health().unwrap().get("ts").map(|v| v.is_null()).unwrap_or(true) {
+            eprintln!("skipping symbols test: typescript not installed in sidecar");
+            return;
+        }
+        let dir = tmp();
+        // 1: fn outer {  2: const helper = (y) => {  3: body  4: };  5: return  6: }  7: class Order {  8: method  9: }
+        let src = "export function outer(x: number) {\n  const helper = (y: number) => {\n    return y * 2;\n  };\n  return helper(x);\n}\nexport class Order {\n  total(): number { return 0; }\n}\n";
+        fs::write(dir.join("m.ts"), src).unwrap();
+
+        let syms = sc.symbols(&dir, "m.ts").unwrap();
+        let by = |name: &str| syms.iter().find(|s| s.name == name).cloned();
+
+        let outer = by("outer").expect("outer fn found");
+        assert_eq!(outer.kind, "function");
+        assert_eq!((outer.start_line, outer.end_line), (1, 6), "outer spans its whole body");
+
+        let helper = by("helper").expect("nested arrow fn found");
+        assert_eq!(helper.kind, "function");
+        assert_eq!(helper.start_line, 2, "helper starts at its declaration");
+        assert!(helper.end_line >= 3 && helper.end_line <= 4, "helper is the INNER range; got {helper:?}");
+
+        assert_eq!(by("Order").expect("class found").kind, "class");
+        assert_eq!(by("total").expect("method found").kind, "method");
+
+        // broadened coverage (review): anonymous default, class expression, constructor
+        let src2 = "export default function () {\n  return 1;\n}\nconst Widget = class {\n  constructor() {}\n  render() {}\n};\n";
+        fs::write(dir.join("n.ts"), src2).unwrap();
+        let syms2 = sc.symbols(&dir, "n.ts").unwrap();
+        let by2 = |name: &str, kind: &str| syms2.iter().any(|s| s.name == name && s.kind == kind);
+        assert!(by2("default", "function"), "anonymous default export named 'default'; got {syms2:?}");
+        assert!(by2("Widget", "class"), "class expression assigned to const captured; got {syms2:?}");
+        assert!(by2("constructor", "constructor"), "constructor captured; got {syms2:?}");
+        assert!(by2("render", "method"), "method inside the class-expression captured; got {syms2:?}");
         let _ = fs::remove_dir_all(&dir);
     }
 
