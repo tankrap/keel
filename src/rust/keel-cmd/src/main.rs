@@ -2877,7 +2877,7 @@ fn semantic_diff(
     // `.ts`/`.tsx` file (no point paying for node on a markdown-only diff). Per file we ask it for
     // AST-accurate symbol ranges, falling back to the heuristic if it's unavailable or errors.
     let want_ast = ast_script.is_some()
-        && changes.iter().any(|c| c.kind != ChangeKind::Deleted && is_ts(&c.path));
+        && changes.iter().any(|c| c.kind != ChangeKind::Deleted && is_ts_js(&c.path));
     let mut sidecar = if want_ast {
         ast_script.as_ref().and_then(|s| Sidecar::spawn(s).ok())
     } else {
@@ -3025,12 +3025,14 @@ fn def_symbol(trimmed: &str) -> Option<String> {
     None
 }
 
-/// Whether the resolver sidecar (`resolve.mjs`) puts this file in its TypeScript program and can
-/// therefore report symbols for it. Only `.ts`/`.tsx` — the sidecar's file discovery collects exactly
-/// those, so claiming `.js`/`.mjs`/… here would just force a doomed round-trip that errors and falls
-/// back to the heuristic anyway. (Widening the sidecar to `allowJs` is a follow-up.)
-fn is_ts(path: &str) -> bool {
-    matches!(path.rsplit('.').next().map(str::to_ascii_lowercase).as_deref(), Some("ts" | "tsx"))
+/// Whether the resolver sidecar (`resolve.mjs`, TypeScript with `allowJs`) puts this file in its
+/// program and can therefore report symbols for it — TypeScript and JavaScript. Must stay in lockstep
+/// with the sidecar's `walkFiles` extension set, else a claimed file forces a doomed round-trip.
+fn is_ts_js(path: &str) -> bool {
+    matches!(
+        path.rsplit('.').next().map(str::to_ascii_lowercase).as_deref(),
+        Some("ts" | "tsx" | "mts" | "cts" | "js" | "jsx" | "mjs" | "cjs")
+    )
 }
 
 /// AST symbol ranges for `path` from the (already-spawned) sidecar — `Some` (possibly empty, meaning
@@ -3038,7 +3040,7 @@ fn is_ts(path: &str) -> bool {
 /// back to the heuristic" (no sidecar, non-TS file, or a sidecar error).
 fn ast_symbols(sidecar: Option<&mut Sidecar>, root: &Path, path: &str) -> Option<Vec<SymbolRange>> {
     let sc = sidecar?;
-    if !is_ts(path) {
+    if !is_ts_js(path) {
         return None;
     }
     sc.symbols(root, path).ok()
@@ -3143,7 +3145,7 @@ fn change_added_lines(
 
     // `--ast`: only bother spawning node if the change touches a non-deleted `.ts`/`.tsx` file.
     let want_ast = ast_script.is_some()
-        && files.iter().any(|f| f.kind != ChangeKind::Deleted && is_ts(&f.path));
+        && files.iter().any(|f| f.kind != ChangeKind::Deleted && is_ts_js(&f.path));
     let scratch = if want_ast { make_scratch_dir() } else { None };
     let mut sidecar = match (&scratch, &ast_script) {
         (Some(_), Some(s)) => Sidecar::spawn(s).ok(),
@@ -3173,10 +3175,14 @@ fn change_added_lines(
         // AST symbols for a committed `.ts`/`.tsx` blob: write it to a FLAT temp file (a generated
         // `sN.<ext>`, so a crafted tree path can never escape the scratch dir) and query the sidecar.
         let syms = match (scratch.as_ref(), sidecar.as_mut()) {
-            (Some(dir), Some(sc)) if is_ts(&f.path) && !new.is_empty() => {
-                // Preserve a `.d.ts` suffix so the sidecar excludes declaration files exactly as the
-                // working-tree path does (consistency), instead of AST-parsing them as `.ts`.
-                let ext = if f.path.ends_with(".d.ts") { "d.ts" } else { f.path.rsplit('.').next().unwrap_or("ts") };
+            (Some(dir), Some(sc)) if is_ts_js(&f.path) && !new.is_empty() => {
+                // Preserve a declaration-file suffix so the sidecar excludes it exactly as the
+                // working-tree path does (consistency), instead of AST-parsing it as plain `.ts`.
+                let ext = [".d.ts", ".d.mts", ".d.cts"]
+                    .iter()
+                    .find(|s| f.path.ends_with(**s))
+                    .map(|s| s.trim_start_matches('.'))
+                    .unwrap_or_else(|| f.path.rsplit('.').next().unwrap_or("ts"));
                 let name = format!("s{nfiles}.{ext}");
                 std::fs::write(dir.0.join(&name), &new).ok().and_then(|_| sc.symbols(&dir.0, &name).ok())
             }
@@ -3913,13 +3919,13 @@ mod tests {
     }
 
     #[test]
-    fn is_ts_matches_only_what_the_sidecar_parses() {
-        for p in ["a.ts", "b.TSX", "src/c.ts"] {
-            assert!(is_ts(p), "should be TS: {p}");
+    fn is_ts_js_matches_the_sidecars_extension_set() {
+        // TS and JS (with allowJs) — must mirror the sidecar's walkFiles regex
+        for p in ["a.ts", "b.TSX", "src/c.ts", "d.mts", "e.cts", "f.js", "g.jsx", "h.mjs", "i.cjs"] {
+            assert!(is_ts_js(p), "should be claimed: {p}");
         }
-        // .js/.mjs/.mts etc. are NOT parsed by the sidecar's file discovery → not claimed here
-        for p in ["a.js", "b.mjs", "c.cts", "d.jsx", "e.rs", "f.py", "noext"] {
-            assert!(!is_ts(p), "should NOT be claimed (sidecar can't attribute): {p}");
+        for p in ["e.rs", "f.py", "g.go", "Makefile", "noext"] {
+            assert!(!is_ts_js(p), "should NOT be claimed: {p}");
         }
     }
 

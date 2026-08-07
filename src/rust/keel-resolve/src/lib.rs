@@ -736,6 +736,19 @@ mod tests {
         assert!(by2("Widget", "class"), "class expression assigned to const captured; got {syms2:?}");
         assert!(by2("constructor", "constructor"), "constructor captured; got {syms2:?}");
         assert!(by2("render", "method"), "method inside the class-expression captured; got {syms2:?}");
+
+        // JavaScript too (allowJs): a plain .js file reports its functions/classes with ranges
+        let js = "function jsHelper(a) {\n  return a + 1;\n}\nclass Store {\n  put(k) {}\n}\n";
+        fs::write(dir.join("m.js"), js).unwrap();
+        let jsy = sc.symbols(&dir, "m.js").unwrap();
+        assert!(jsy.iter().any(|s| s.name == "jsHelper" && s.kind == "function"), "JS fn; got {jsy:?}");
+        assert!(jsy.iter().any(|s| s.name == "put" && s.kind == "method"), "JS class method; got {jsy:?}");
+
+        // excluded from the program (→ error → heuristic fallback): minified JS and declaration files
+        fs::write(dir.join("vendor.min.js"), js).unwrap();
+        assert!(sc.symbols(&dir, "vendor.min.js").is_err(), "minified JS is not parsed");
+        fs::write(dir.join("types.d.mts"), "export declare function gone(): void;\n").unwrap();
+        assert!(sc.symbols(&dir, "types.d.mts").is_err(), ".d.mts declaration file is not parsed");
         let _ = fs::remove_dir_all(&dir);
     }
 
