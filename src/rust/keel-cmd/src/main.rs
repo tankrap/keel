@@ -1946,11 +1946,7 @@ fn cmd_show(args: &[String]) -> io::Result<()> {
         .ok_or_else(|| io::Error::other("usage: keel show <object-id> [--json]"))?;
     let (_, store) = root_store(args)?;
     let repo = Repo::open(&store).map_err(to_io)?;
-    // Full 64-hex id (any object), else a change-id prefix (the common interactive case).
-    let id = ObjectId::from_hex(raw)
-        .filter(|i| repo.store().has(i).unwrap_or(false))
-        .or_else(|| resolve_change(&repo, raw).ok())
-        .ok_or_else(|| io::Error::other(format!("no object matches {raw:?}")))?;
+    let id = resolve_object(&repo, raw)?;
     let obj = repo.store().get(&id).map_err(to_io)?.ok_or_else(|| io::Error::other("no such object"))?;
     let json = has(args, "--json");
     let hex = id.to_hex();
@@ -2070,6 +2066,40 @@ fn verif_str(v: Verification) -> &'static str {
         Verification::Green => "green",
         Verification::Red => "red",
         Verification::Unverified => "unverified",
+    }
+}
+
+/// Resolve an object id for `keel show`: a full 64-hex id of ANY stored object (blob / tree / change /
+/// session / review), or a unique hex prefix of one. Unlike [`resolve_change`] this searches every
+/// object kind — so the short ids printed in headers and finding hints actually resolve — and it
+/// distinguishes "no match", "ambiguous prefix", and an empty/invalid argument rather than silently
+/// treating `""` as a match-all.
+fn resolve_object(repo: &Repo, raw: &str) -> io::Result<ObjectId> {
+    if raw.is_empty() {
+        return Err(fail_fix("empty object id", "pass a 64-hex id or a unique id prefix"));
+    }
+    // Exact full id first (cheap, and unambiguous).
+    if let Some(id) = ObjectId::from_hex(raw) {
+        if repo.store().has(&id).map_err(to_io)? {
+            return Ok(id);
+        }
+    }
+    let lower = raw.to_lowercase();
+    if !lower.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(fail_fix(format!("no object matches {raw:?}"), "an id is hex"));
+    }
+    // Prefix scan across every stored object kind (interactive command, not a hot path).
+    let hits: Vec<ObjectId> = repo
+        .store()
+        .content_ids()
+        .map_err(to_io)?
+        .into_iter()
+        .filter(|id| id.to_hex().starts_with(&lower))
+        .collect();
+    match hits.len() {
+        1 => Ok(hits[0]),
+        0 => Err(io::Error::other(format!("no object matches {raw:?}"))),
+        n => Err(fail_fix(format!("ambiguous id prefix {raw:?} — {n} objects match"), "use more characters")),
     }
 }
 
