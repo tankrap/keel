@@ -15,12 +15,14 @@
 //!   position (`i = 0`, `1`, … `19` across 20 sites) stays compressed with no false anomaly.
 //! - **Level 1b — operator-anomaly split.** The Level-0 mask keeps operators *verbatim*, so a flipped
 //!   comparison lands in a different shape group and hides in plain sight (9 sites `if (i <= n)`, one
-//!   `if (i < n)`). A second, *operator-agnostic* mask collapses the flip-prone operators (comparison,
-//!   logical, arithmetic, bitwise, compound-assign) to a placeholder so those lines regroup; within a
-//!   group we recover each site's operator vector and surface a *minority* operator the same 80%-
-//!   supermajority way — the `<=`→`<`, `&&`→`||`, `+`→`-` smuggled into a bulk edit. Structural tokens
-//!   (a bare `=`, a `=>`/`->`/`<-` digraph, brackets) stay verbatim, so assignments never regroup with
-//!   comparisons and genuinely-varied operators (no 80% agreement) never fire.
+//!   `if (i < n)`). A second, *operator-agnostic* mask collapses the flip-prone operators — comparison
+//!   and logical (`<`, `<=`, `==`, `&&`, `||`, `!`, …) — to a placeholder so those lines regroup; within
+//!   a group we recover each site's operator vector and surface a *minority* operator the same 80%-
+//!   supermajority way — the `<=`→`<` off-by-one, the `&&`→`||` guard inversion smuggled into a bulk
+//!   edit. Structural tokens (a bare `=`, a `=>`/`->`/`<-` digraph, arithmetic/bitwise ops, brackets)
+//!   stay verbatim, so assignments never regroup with comparisons and genuinely-varied operators (no
+//!   80% agreement) never fire. Arithmetic/bitwise flips are excluded on purpose (they vary legitimately
+//!   line-to-line — noise, not signal); see [`is_flip_op`].
 //!
 //! The unit is the **added line** (the new state a reviewer scrutinizes). Deeper levels (AST,
 //! dataflow, cross-file) are roadmapped and need the hosted, memoized graph.
@@ -177,18 +179,20 @@ fn is_op_char(c: char) -> bool {
     matches!(c, '<' | '>' | '=' | '!' | '&' | '|' | '^' | '~' | '+' | '-' | '*' | '/' | '%')
 }
 
-/// Whether an operator token is *flip-prone* — the comparison / logical / arithmetic / bitwise /
-/// compound-assignment operators a one-character slip silently inverts. A run that isn't one of these
-/// (a bare `=`, a `=>` / `->` / `<-` digraph, a spaceship `<=>`) is structural: kept verbatim in the
-/// operator mask so it still distinguishes shapes but is never grouped-across or flagged.
+/// Whether an operator token is *flip-prone* — a comparison (`<`,`<=`,`==`,…) or logical (`&&`,`||`,`!`)
+/// operator, where a one-character slip silently inverts the meaning (`<=`→`<` off-by-one, `&&`→`||`
+/// guard inversion, a dropped `!`). These are the high-signal, low-noise flips: parallel bound checks
+/// or guards rarely differ by design, so a lone outlier is worth a look.
+///
+/// Deliberately *excluded*: arithmetic (`+ - * / %`), bitwise (`& | ^ ~ << >>`), and compound
+/// assignment. Those legitimately vary line-to-line in parallel-looking code (offsets, deltas,
+/// bitmasks), so flagging a minority there is noise, not signal — precision matters more than recall
+/// for a review tool (a detector that cries wolf gets ignored). A run that isn't a flip — a bare `=`,
+/// a `=>`/`->`/`<-` digraph, any arithmetic/bitwise op — is structural: kept verbatim in the operator
+/// mask so it still distinguishes shapes but is never grouped-across or flagged. Arithmetic/bitwise
+/// flips are roadmapped once a lower-noise heuristic (e.g. same-operand-shape) proves out.
 fn is_flip_op(s: &str) -> bool {
-    matches!(
-        s,
-        "==" | "!=" | "<" | "<=" | ">" | ">=" | "&&" | "||" | "!"
-            | "+" | "-" | "*" | "/" | "%"
-            | "&" | "|" | "^" | "~" | "<<" | ">>"
-            | "+=" | "-=" | "*=" | "/=" | "%=" | "&=" | "|=" | "^=" | "<<=" | ">>="
-    )
+    matches!(s, "==" | "!=" | "<" | "<=" | ">" | ">=" | "&&" | "||" | "!")
 }
 
 /// Split a line into [`Tok`]s. Mirrors the original single-pass masker exactly for identifiers,
@@ -435,29 +439,37 @@ fn detect_anomalies(sites: &[(AddedLine, Vec<Lit>)]) -> Vec<Anomaly> {
 /// whose operators genuinely vary has no dominant value at any position and flags nothing. The 80%
 /// gate means a group needs ≥ 5 sites before any minority can be called anomalous, exactly as Level 1.
 fn detect_operator_anomalies(added: &[AddedLine]) -> Vec<Anomaly> {
-    // Group by op-shape, first-seen order preserved for stable output.
-    let mut order: Vec<String> = Vec::new();
-    let mut by_shape: BTreeMap<String, Vec<(&AddedLine, Vec<String>)>> = BTreeMap::new();
+    // Group by (op-shape, operator count), first-seen order preserved for stable output. Normally the
+    // op-shape alone determines the operator count (one `∘` per flip-op), but a source line can carry a
+    // *literal* `∘` (U+2218 — a composition operator, or one in a comment): it renders verbatim into the
+    // shape yet records no operator, so two same-shape lines can disagree on `ops.len()`. Keying on the
+    // count too keeps every group's operator vectors equal-length (no out-of-bounds) and positionally
+    // comparable, and only isolates those pathological lines — for all real code the key is redundant.
+    // A line paired with its recovered operator vector (the sites that share one op-shape+count key).
+    type OpSites<'a> = Vec<(&'a AddedLine, Vec<String>)>;
+    let mut order: Vec<(String, usize)> = Vec::new();
+    let mut by_shape: BTreeMap<(String, usize), OpSites> = BTreeMap::new();
     for line in added {
         let (shape, ops) = mask_and_operators(&line.text);
         if ops.is_empty() {
             continue; // no flip-operators on this line ⇒ it can't carry an operator anomaly
         }
-        if !by_shape.contains_key(&shape) {
-            order.push(shape.clone());
+        let key = (shape, ops.len());
+        if !by_shape.contains_key(&key) {
+            order.push(key.clone());
         }
-        by_shape.entry(shape).or_default().push((line, ops));
+        by_shape.entry(key).or_default().push((line, ops));
     }
 
     let mut out = Vec::new();
-    for shape in &order {
-        let sites = &by_shape[shape];
+    for key in &order {
+        let sites = &by_shape[key];
         let n = sites.len();
         if n < MECHANICAL_MIN {
             continue; // a one-off flip is a substantive line, not a bulk-edit outlier
         }
-        // Same op-shape ⇒ same `∘` count ⇒ equal-length, positionally-aligned operator vectors.
-        let width = sites[0].1.len();
+        // Group key pins the operator count ⇒ equal-length, positionally-aligned operator vectors.
+        let width = key.1;
         let mut reasons: Vec<Vec<String>> = vec![Vec::new(); n];
         for p in 0..width {
             let mut counts: BTreeMap<&str, usize> = BTreeMap::new();
@@ -671,18 +683,21 @@ mod tests {
 
     #[test]
     fn operator_mask_records_flip_operators_and_keeps_structural_ones() {
-        // flip operators (comparison here) → `∘`, recorded in order; identifiers/numbers masked as usual
+        // flip operators (comparison + logical) → `∘`, recorded in order; ids/numbers masked as usual
         assert_eq!(mask_and_operators("if (i <= n) {"), ("_ (_ ∘ _) {".to_string(), vec!["<=".to_string()]));
         assert_eq!(
-            mask_and_operators("x = a + b * c"),
-            // bare `=` is structural (kept), `+` and `*` are flips
-            ("_ = _ ∘ _ ∘ _".to_string(), vec!["+".to_string(), "*".to_string()])
+            mask_and_operators("a == b && c != d"),
+            ("_ ∘ _ ∘ _ ∘ _".to_string(), vec!["==".to_string(), "&&".to_string(), "!=".to_string()])
         );
         // structural digraphs stay verbatim and record NO operator (so they never regroup/flag)
         assert_eq!(mask_and_operators("a => b").1, Vec::<String>::new());
         assert_eq!(mask_and_operators("f() -> T").1, Vec::<String>::new());
         assert_eq!(mask_and_operators("ch <- v").1, Vec::<String>::new());
         assert_eq!(mask_and_operators("x = y").1, Vec::<String>::new());
+        // arithmetic and bitwise are deliberately structural (excluded), so they record NO operator —
+        // they vary legitimately line-to-line and would be noise
+        assert_eq!(mask_and_operators("w = base + delta").1, Vec::<String>::new());
+        assert_eq!(mask_and_operators("m = a & b | c").1, Vec::<String>::new());
         // `==` is a flip (comparison), a bare `=` is not — so they mask to DIFFERENT shapes and an
         // assignment can never regroup with a comparison
         assert_ne!(mask_and_operators("a == b").0, mask_and_operators("a = b").0);
@@ -746,10 +761,39 @@ mod tests {
     #[test]
     fn near_even_operator_split_is_not_flagged() {
         // 3-vs-2 at N=5 (60%) is ordinary variation, not a smuggled flip
-        let mut added: Vec<String> = (0..3).map(|i| format!("g{i} = x{i} + y{i}")).collect();
-        added.extend((0..2).map(|i| format!("h{i} = p{i} - q{i}")));
+        let mut added: Vec<String> = (0..3).map(|i| format!("g{i} = x{i} < y{i}")).collect();
+        added.extend((0..2).map(|i| format!("h{i} = p{i} > q{i}")));
         let s = summarize(&al(added));
         assert_eq!(s.operator_anomalies.len(), 0, "60% is not an overwhelming majority");
+    }
+
+    #[test]
+    fn arithmetic_and_bitwise_differences_are_not_flagged() {
+        // the realistic false positive: a block of offset computations where one line legitimately
+        // subtracts. Arithmetic is excluded from the flip set precisely so this is silent, not noise.
+        let mut added: Vec<String> = (0..4).map(|i| format!("r{i} = base + delta{i}")).collect();
+        added.push("rX = base - deltaX".to_string()); // legitimate subtraction, 4/5 use `+`
+        let s = summarize(&al(added));
+        assert_eq!(s.operator_anomalies.len(), 0, "arithmetic variation is not flagged");
+        // same for a lone bitwise `|` among `&`s
+        let mut bits: Vec<String> = (0..5).map(|i| format!("m{i} = a{i} & MASK")).collect();
+        bits.push("mX = aX | MASK".to_string());
+        assert_eq!(summarize(&al(bits)).operator_anomalies.len(), 0, "bitwise variation is not flagged");
+    }
+
+    #[test]
+    fn literal_composition_operator_does_not_panic() {
+        // A source line carrying a *literal* `∘` (U+2218) renders that char verbatim into the op-shape
+        // but records no operator, so two same-shape lines can disagree on operator count. The grouping
+        // key pins the count, so this must NOT panic (regression: it indexed past the operator vector).
+        let added = vec![
+            "r1 = a1 < b1 < c1".to_string(),
+            "r2 = a2 < b2 < c2".to_string(),
+            "r3 = a3 < b3 ∘ c3".to_string(), // one flip-op + a literal ∘ ⇒ shorter operator vector
+        ];
+        let s = summarize(&al(added)); // no panic
+        // the two full `< … <` lines are only a 2-site group (< MECHANICAL_MIN), so nothing fires
+        assert_eq!(s.operator_anomalies.len(), 0);
     }
 
     #[test]
