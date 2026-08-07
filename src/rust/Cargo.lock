@@ -669,6 +669,7 @@ dependencies = [
  "keel-brief",
  "keel-git",
  "keel-net",
+ "keel-resolve",
  "keel-store",
  "miniz_oxide",
  "serde_json",

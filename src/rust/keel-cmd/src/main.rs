@@ -7,6 +7,7 @@
 //! `keel commit` / `keel log` are the write/history side.
 
 use keel_brief::BriefService;
+use keel_resolve::{Sidecar, SymbolRange};
 use keel_store::{
     diff_lines, semantic_summarize, AddedLine, ChangeGroup, ChangeKind, GroupKind, NodeKind, Object,
     ObjectId, Repo, Review, SemanticSummary, Session, StoreError, Tag, Verdict, Verification, Vfs,
@@ -154,7 +155,7 @@ fn print_usage() {
          \x20 keel mirror-in <git-repo>  ·  keel mirror-out <dir>  ·  keel import/export\n\
          \x20 keel verify <change> --green|--red\n\
          \x20 keel native <commit|status|log|diff>   keel's own store-backed operations\n\
-         \x20 keel native diff --semantic            operation view: collapse bulk edits, surface anomalies\n\n\
+         \x20 keel native diff --semantic [--ast]     operation view: collapse bulk edits, surface anomalies\n\n\
          A running `keeld` for the repo answers briefs warm; otherwise runs in-process."
     );
 }
@@ -2271,7 +2272,7 @@ fn cmd_walkthrough(args: &[String]) -> io::Result<()> {
             ChangeKind::Deleted => Vec::new(),
             _ => repo.file_bytes_at(id, &f.path).map_err(to_io)?.unwrap_or_default(),
         };
-        wt_added.extend(added_lines_from(&f.path, &old, &new));
+        wt_added.extend(added_lines_from(&f.path, &old, &new, None));
         let block = walkthrough_block(&f.path, f.kind, &old, &new, &test_paths, verif, full);
         tot_add += block["added_lines"].as_u64().unwrap_or(0) as usize;
         tot_del += block["deleted_lines"].as_u64().unwrap_or(0) as usize;
@@ -2835,8 +2836,10 @@ fn cmd_diff(args: &[String]) -> io::Result<()> {
     }
 
     // `--semantic`: instead of raw hunks, collapse the mechanical bulk and surface what needs eyes.
+    // `--ast` opts into AST-accurate symbol attribution (TS/JS, via the resolver sidecar).
     if has(args, "--semantic") {
-        return semantic_diff(&repo, &root, head, &changes, has(args, "--json"));
+        let ast_script = has(args, "--ast").then(|| sidecar_dir(args).join("resolve.mjs"));
+        return semantic_diff(&repo, &root, head, &changes, has(args, "--json"), ast_script);
     }
 
     for c in &changes {
@@ -2865,7 +2868,14 @@ fn semantic_diff(
     head: Option<ObjectId>,
     changes: &[keel_store::PathChange],
     json: bool,
+    ast_script: Option<PathBuf>,
 ) -> io::Result<()> {
+    // `--ast`: spawn the TS resolver sidecar once; per TS/JS file we ask it for AST-accurate symbol
+    // ranges (falling back to the indentation heuristic per file if it's unavailable or errors).
+    let mut sidecar = ast_script.as_ref().and_then(|s| Sidecar::spawn(s).ok());
+    if ast_script.is_some() && sidecar.is_none() {
+        eprintln!("keel: --ast: resolver sidecar unavailable (node?) — using the heuristic");
+    }
     let mut added: Vec<AddedLine> = Vec::new();
     let (mut files, mut binary) = (0usize, 0usize);
     for c in changes {
@@ -2882,7 +2892,8 @@ fn semantic_diff(
             continue; // binary file — nothing to mask
         }
         files += 1;
-        added.extend(added_lines_from(&c.path, &old, &new));
+        let syms = ast_symbols(sidecar.as_mut(), root, &c.path);
+        added.extend(added_lines_from(&c.path, &old, &new, syms.as_deref()));
     }
     let s = semantic_summarize(&added);
 
@@ -3003,11 +3014,42 @@ fn def_symbol(trimmed: &str) -> Option<String> {
     None
 }
 
-/// The added lines of one file's `old`→`new` diff, each tagged with the file and its best-effort
-/// enclosing symbol. Empty for a binary file (a NUL byte on either side — nothing to mask). The one
-/// place that maps a diff to `AddedLine`s, so `change_added_lines`, the working-tree `semantic_diff`,
-/// and the default walkthrough all agree and read each file's bytes once.
-fn added_lines_from(path: &str, old: &[u8], new: &[u8]) -> Vec<AddedLine> {
+/// Whether the resolver sidecar (`resolve.mjs`, TypeScript) can parse this file for symbols.
+fn is_ts_js(path: &str) -> bool {
+    matches!(
+        path.rsplit('.').next().map(str::to_ascii_lowercase).as_deref(),
+        Some("ts" | "tsx" | "js" | "jsx" | "mjs" | "cjs" | "mts" | "cts")
+    )
+}
+
+/// AST symbol ranges for `path` from the (already-spawned) sidecar — `Some` (possibly empty, meaning
+/// "parsed, no enclosing defs") for a TS/JS file the sidecar could read, `None` to signal "fall back
+/// to the heuristic" (no sidecar, non-TS file, or a sidecar error).
+fn ast_symbols(sidecar: Option<&mut Sidecar>, root: &Path, path: &str) -> Option<Vec<SymbolRange>> {
+    let sc = sidecar?;
+    if !is_ts_js(path) {
+        return None;
+    }
+    sc.symbols(root, path).ok()
+}
+
+/// The innermost AST symbol whose 1-based line range contains `line`, as `"kind name"` (e.g.
+/// `function computeTax`). Ranges nest, so the smallest span containing the line is the tightest
+/// enclosing definition.
+fn symbol_at_line(symbols: &[SymbolRange], line: u32) -> Option<String> {
+    symbols
+        .iter()
+        .filter(|s| s.start_line <= line && line <= s.end_line)
+        .min_by_key(|s| s.end_line.saturating_sub(s.start_line))
+        .map(|s| format!("{} {}", s.kind, s.name))
+}
+
+/// The added lines of one file's `old`→`new` diff, each tagged with the file and its enclosing
+/// symbol. When `symbols` is `Some` (AST-accurate ranges for the new file), a line is attributed to
+/// the innermost range containing it; otherwise the parser-free indentation heuristic is used. Empty
+/// for a binary file (a NUL byte on either side). The one place that maps a diff to `AddedLine`s, so
+/// every semantic surface agrees and reads each file's bytes once.
+fn added_lines_from(path: &str, old: &[u8], new: &[u8], symbols: Option<&[SymbolRange]>) -> Vec<AddedLine> {
     if old.contains(&0) || new.contains(&0) {
         return Vec::new();
     }
@@ -3019,7 +3061,10 @@ fn added_lines_from(path: &str, old: &[u8], new: &[u8]) -> Vec<AddedLine> {
         for line in h.lines {
             match line.tag {
                 Tag::Add => {
-                    let symbol = enclosing_symbol(&new_lines, newpos.saturating_sub(1));
+                    let symbol = match symbols {
+                        Some(syms) => symbol_at_line(syms, newpos as u32),
+                        None => enclosing_symbol(&new_lines, newpos.saturating_sub(1)),
+                    };
                     out.push(AddedLine { file: path.to_string(), text: line.text, symbol });
                     newpos += 1;
                 }
@@ -3055,7 +3100,7 @@ fn change_added_lines(repo: &Repo, id: ObjectId) -> io::Result<(Vec<AddedLine>, 
             continue;
         }
         nfiles += 1;
-        added.extend(added_lines_from(&f.path, &old, &new));
+        added.extend(added_lines_from(&f.path, &old, &new, None));
     }
     Ok((added, nfiles, binary))
 }
@@ -3770,6 +3815,29 @@ fn render_human(v: &Value) -> String {
 mod tests {
     use super::*;
     use keel_brief::{Brief, ContextDef, CoordConflict, Provenance, RelevantSession};
+
+    #[test]
+    fn symbol_at_line_picks_the_innermost_range() {
+        let syms = vec![
+            SymbolRange { name: "outer".into(), kind: "function".into(), start_line: 1, end_line: 10 },
+            SymbolRange { name: "inner".into(), kind: "function".into(), start_line: 3, end_line: 6 },
+            SymbolRange { name: "Order".into(), kind: "class".into(), start_line: 12, end_line: 20 },
+        ];
+        assert_eq!(symbol_at_line(&syms, 4).as_deref(), Some("function inner")); // innermost wins
+        assert_eq!(symbol_at_line(&syms, 8).as_deref(), Some("function outer")); // only outer contains 8
+        assert_eq!(symbol_at_line(&syms, 15).as_deref(), Some("class Order"));
+        assert_eq!(symbol_at_line(&syms, 11), None); // between defs → no symbol
+    }
+
+    #[test]
+    fn is_ts_js_matches_the_supported_extensions() {
+        for p in ["a.ts", "b.TSX", "c/d.mjs", "e.jsx", "f.cts"] {
+            assert!(is_ts_js(p), "should be TS/JS: {p}");
+        }
+        for p in ["a.rs", "b.py", "c.go", "Makefile", "noext"] {
+            assert!(!is_ts_js(p), "should NOT be TS/JS: {p}");
+        }
+    }
 
     #[test]
     fn def_symbol_detects_defs_and_ignores_the_rest() {

@@ -10,6 +10,7 @@ path = "src/main.rs"
 
 [dependencies]
 keel-brief = { path = "../keel-brief" }
+keel-resolve = { path = "../keel-resolve" }
 keel-store = { path = "../keel-store" }
 keel-git = { path = "../keel-git" }
 keel-net = { path = "../keel-net" }
