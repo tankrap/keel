@@ -743,6 +743,12 @@ mod tests {
         let jsy = sc.symbols(&dir, "m.js").unwrap();
         assert!(jsy.iter().any(|s| s.name == "jsHelper" && s.kind == "function"), "JS fn; got {jsy:?}");
         assert!(jsy.iter().any(|s| s.name == "put" && s.kind == "method"), "JS class method; got {jsy:?}");
+
+        // excluded from the program (→ error → heuristic fallback): minified JS and declaration files
+        fs::write(dir.join("vendor.min.js"), js).unwrap();
+        assert!(sc.symbols(&dir, "vendor.min.js").is_err(), "minified JS is not parsed");
+        fs::write(dir.join("types.d.mts"), "export declare function gone(): void;\n").unwrap();
+        assert!(sc.symbols(&dir, "types.d.mts").is_err(), ".d.mts declaration file is not parsed");
         let _ = fs::remove_dir_all(&dir);
     }
 

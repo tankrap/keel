@@ -144,7 +144,8 @@ const services = new Map();
 function tsCompilerOptions(ts, dir) {
   const opts = {
     // Include JavaScript so `symbols`/`slice` work on .js/.jsx/.mjs/.cjs too, not just TypeScript.
-    // (node_modules/dist/build are excluded by walkFiles, so this doesn't pull in dependencies.)
+    // walkFiles collects only hand-written JS (skips node_modules/dist/build, minified, and >1 MB
+    // files), so this doesn't pull dependency or bundled code into the program.
     allowJs: true,
     checkJs: false,
     noEmit: true,
@@ -245,7 +246,18 @@ function walkFiles(dir) {
       continue;
     const p = path.join(dir, e.name);
     if (e.isDirectory()) out.push(...walkFiles(p));
-    else if (/\.(ts|tsx|mts|cts|js|jsx|mjs|cjs)$/.test(e.name) && !e.name.endsWith(".d.ts")) out.push(p);
+    else if (/\.(ts|tsx|mts|cts)$/.test(e.name)) {
+      if (!/\.d\.(ts|mts|cts)$/.test(e.name)) out.push(p); // TS, excluding declaration files
+    } else if (/\.(js|jsx|mjs|cjs)$/.test(e.name) && !/\.min\./.test(e.name)) {
+      // Hand-written JS/JSX only. Skip minified/bundled files and anything too large to be source —
+      // committed `vendor/`, `public/`, bundles etc. would otherwise be parsed by TS on every query
+      // (a brief-path cost), since they don't live under the node_modules/dist/build dirs we skip.
+      try {
+        if (fs.statSync(p).size <= 1024 * 1024) out.push(p);
+      } catch {
+        /* unreadable — skip */
+      }
+    }
   }
   return out;
 }

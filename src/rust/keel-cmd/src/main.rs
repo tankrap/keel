@@ -3176,9 +3176,13 @@ fn change_added_lines(
         // `sN.<ext>`, so a crafted tree path can never escape the scratch dir) and query the sidecar.
         let syms = match (scratch.as_ref(), sidecar.as_mut()) {
             (Some(dir), Some(sc)) if is_ts_js(&f.path) && !new.is_empty() => {
-                // Preserve a `.d.ts` suffix so the sidecar excludes declaration files exactly as the
-                // working-tree path does (consistency), instead of AST-parsing them as `.ts`.
-                let ext = if f.path.ends_with(".d.ts") { "d.ts" } else { f.path.rsplit('.').next().unwrap_or("ts") };
+                // Preserve a declaration-file suffix so the sidecar excludes it exactly as the
+                // working-tree path does (consistency), instead of AST-parsing it as plain `.ts`.
+                let ext = [".d.ts", ".d.mts", ".d.cts"]
+                    .iter()
+                    .find(|s| f.path.ends_with(**s))
+                    .map(|s| s.trim_start_matches('.'))
+                    .unwrap_or_else(|| f.path.rsplit('.').next().unwrap_or("ts"));
                 let name = format!("s{nfiles}.{ext}");
                 std::fs::write(dir.0.join(&name), &new).ok().and_then(|_| sc.symbols(&dir.0, &name).ok())
             }
