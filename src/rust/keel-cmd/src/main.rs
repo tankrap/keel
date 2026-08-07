@@ -9,7 +9,7 @@
 use keel_brief::BriefService;
 use keel_store::{
     diff_lines, semantic_summarize, ChangeGroup, ChangeKind, GroupKind, NodeKind, Object, ObjectId,
-    Repo, Review, Session, StoreError, Tag, Verdict, Verification, Vfs,
+    Repo, Review, SemanticSummary, Session, StoreError, Tag, Verdict, Verification, Vfs,
 };
 use serde_json::{json, Value};
 use std::io::{self, BufRead, Write};
@@ -142,7 +142,7 @@ fn print_usage() {
          \x20 keel sessions [--file <path>]       ·   keel session <change>\n\
          \x20 keel review --target <id> --verdict <approve|request-changes|reject|comment> [--label <l>]\n\
          \x20 keel reviews [--target <id>] [--label <l>] [--mentions <t>] [--no-human] [--disagreements] [--json]\n\
-         \x20 keel walkthrough <change> [--full] [--json]   block-by-block review, each block cites its proof\n\
+         \x20 keel walkthrough <change> [--full] [--semantic] [--json]   block-by-block (or operation-level) review\n\
          \x20 keel vfs <change> <ls|stat|cat> <path> [--json]   read a change's tree lazily, no checkout\n\
          \x20 keel repack [--json]                delta-compress history + GC (like `git gc`)\n\
          \x20 keel size   [--json]                logical bytes / object counts\n\
@@ -1898,6 +1898,16 @@ fn cmd_walkthrough(args: &[String]) -> io::Result<()> {
 
     let files = repo.change_files(id).map_err(to_io)?;
     let parent = c.parents.first().copied();
+
+    // `--semantic`: the operation view of this change under the session header — bulk edits collapsed,
+    // unique changes and smuggled-constant anomalies surfaced — instead of block-by-block hunks.
+    if has(args, "--semantic") {
+        return walkthrough_semantic(
+            &repo, id, &c.intent, &c.author, c.timestamp, verif,
+            task.as_deref(), model.as_deref(), lesson.as_deref(), &files, parent, has(args, "--json"),
+        );
+    }
+
     // The test files this change touched — the pool each source block draws its proof link from.
     let test_paths: Vec<String> =
         files.iter().filter(|f| is_test_path(&f.path)).map(|f| f.path.clone()).collect();
@@ -2509,41 +2519,146 @@ fn semantic_diff(
     let s = semantic_summarize(&added);
 
     if json {
-        let groups: Vec<Value> = s
-            .groups
-            .iter()
-            .map(|g| {
-                json!({
-                    "kind": if g.kind == GroupKind::Mechanical { "mechanical" } else { "substantive" },
-                    "shape": g.shape,
-                    "count": g.count(),
-                    "representative": g.representative(),
-                    "members": g.members,
-                    "anomalies": g.anomalies.iter().map(|a| json!({"text": a.text, "reason": a.reason})).collect::<Vec<_>>(),
-                })
-            })
-            .collect();
         println!(
             "{}",
             render_json(&json!({
                 "ok": true, "files": files, "binary_files": binary,
                 "added_lines": s.added_lines, "substantive_lines": s.substantive_lines,
                 "mechanical_lines": s.mechanical_lines, "anomalies": s.anomaly_count,
-                "groups": groups,
+                "groups": semantic_groups_json(&s),
             }))
         );
         return Ok(());
     }
 
     let bin = if binary > 0 { format!(" ({binary} binary skipped)") } else { String::new() };
-    println!(
-        "semantic diff · {files} file(s){bin} · {} added line(s)",
-        s.added_lines
-    );
+    println!("semantic diff · {files} file(s){bin} · {} added line(s)", s.added_lines);
     println!(
         "  {} substantive · {} mechanical · {} anomaly(ies)",
         s.substantive_lines, s.mechanical_lines, s.anomaly_count
     );
+    print_semantic_body(&s);
+    Ok(())
+}
+
+/// The JSON form of a semantic summary's groups (shared by `keel native diff --semantic` and
+/// `keel walkthrough --semantic`).
+fn semantic_groups_json(s: &SemanticSummary) -> Vec<Value> {
+    s.groups
+        .iter()
+        .map(|g| {
+            json!({
+                "kind": if g.kind == GroupKind::Mechanical { "mechanical" } else { "substantive" },
+                "shape": g.shape,
+                "count": g.count(),
+                "representative": g.representative(),
+                "members": g.members,
+                "anomalies": g.anomalies.iter().map(|a| json!({"text": a.text, "reason": a.reason})).collect::<Vec<_>>(),
+            })
+        })
+        .collect()
+}
+
+/// `keel walkthrough <change> --semantic` — the operation view of a *committed* change (vs its
+/// parent), under the session header. Same engine as `keel native diff --semantic`, but over the
+/// change's added lines rather than the working tree, so reviewing an agent's change reads as
+/// operations + anomalies instead of thousands of hunk lines.
+#[allow(clippy::too_many_arguments)]
+fn walkthrough_semantic(
+    repo: &Repo,
+    id: ObjectId,
+    intent: &str,
+    author: &str,
+    timestamp: u64,
+    verif: &str,
+    task: Option<&str>,
+    model: Option<&str>,
+    lesson: Option<&str>,
+    files: &[keel_store::PathChange],
+    parent: Option<ObjectId>,
+    json: bool,
+) -> io::Result<()> {
+    let mut added: Vec<String> = Vec::new();
+    let (mut nfiles, mut binary) = (0usize, 0usize);
+    for f in files {
+        let old = match (parent, f.kind) {
+            (_, ChangeKind::Added) => Vec::new(),
+            (Some(p), _) => repo.file_bytes_at(p, &f.path).map_err(to_io)?.unwrap_or_default(),
+            (None, _) => Vec::new(),
+        };
+        let new = match f.kind {
+            ChangeKind::Deleted => Vec::new(),
+            _ => repo.file_bytes_at(id, &f.path).map_err(to_io)?.unwrap_or_default(),
+        };
+        if old.contains(&0) || new.contains(&0) {
+            binary += 1;
+            continue;
+        }
+        nfiles += 1;
+        let (o, n) = (String::from_utf8_lossy(&old), String::from_utf8_lossy(&new));
+        for h in diff_lines(&o, &n) {
+            for line in h.lines {
+                if line.tag == Tag::Add {
+                    added.push(line.text);
+                }
+            }
+        }
+    }
+    let s = semantic_summarize(&added);
+
+    if json {
+        let mut out = json!({
+            "ok": true, "view": "semantic", "change": id.to_hex(), "intent": intent,
+            "author": author, "timestamp": timestamp, "verification": verif,
+            "files": nfiles, "binary_files": binary, "added_lines": s.added_lines,
+            "substantive_lines": s.substantive_lines, "mechanical_lines": s.mechanical_lines,
+            "anomalies": s.anomaly_count, "groups": semantic_groups_json(&s),
+        });
+        if let Some(t) = task {
+            out["task"] = json!(t);
+        }
+        if let Some(m) = model {
+            out["model"] = json!(m);
+        }
+        if let Some(l) = lesson {
+            out["lesson"] = json!(l);
+        }
+        println!("{}", render_json(&out));
+        return Ok(());
+    }
+
+    let mark = match verif {
+        "green" => "✓",
+        "red" => "✗",
+        _ => "·",
+    };
+    println!("walkthrough · {} {}  {intent}  (semantic)", mark, short(&id.to_hex()));
+    println!("  by {author} · {} · verified {verif}", rel_time(timestamp));
+    if let Some(t) = task {
+        println!("  task:  {t}");
+    }
+    if let Some(m) = model {
+        println!("  model: {m}");
+    }
+    if let Some(l) = lesson {
+        println!("  lesson: {l}");
+    }
+    let bin = if binary > 0 { format!(" ({binary} binary skipped)") } else { String::new() };
+    println!(
+        "  scope: {nfiles} file(s){bin} · {} added · {} substantive · {} mechanical · {} anomaly(ies)",
+        s.added_lines, s.substantive_lines, s.mechanical_lines, s.anomaly_count
+    );
+    print_semantic_body(&s);
+    println!(
+        "\n  → record a verdict: keel review --target {} --verdict <approve|request-changes|reject> [--human]",
+        id.to_hex()
+    );
+    Ok(())
+}
+
+/// Print the substantive/mechanical body of a semantic summary — unique lines to read, then bulk
+/// edits collapsed to a count + one representative, each anomaly flagged with its reason.
+fn print_semantic_body(s: &SemanticSummary) {
     let subst: Vec<&ChangeGroup> = s.groups.iter().filter(|g| g.kind == GroupKind::Substantive).collect();
     let mech: Vec<&ChangeGroup> = s.groups.iter().filter(|g| g.kind == GroupKind::Mechanical).collect();
     if !subst.is_empty() {
@@ -2563,7 +2678,6 @@ fn semantic_diff(
             }
         }
     }
-    Ok(())
 }
 
 /// Render one file's change as a plain unified diff. Binary content (NUL byte) is reported,
