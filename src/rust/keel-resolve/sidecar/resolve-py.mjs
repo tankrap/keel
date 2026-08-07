@@ -38,7 +38,7 @@ rl.on("line", (line) => {
   const id = req.id;
   try {
     if (req.op === "health") {
-      respond({ id, ok: true, result: { lang: "py", version: "0.1", treeSitter: !TS_ERR } });
+      respond({ id, ok: true, result: { lang: "py", version: "0.2", treeSitter: !TS_ERR } });
       return;
     }
     if (req.op === "imports") {
@@ -50,6 +50,8 @@ rl.on("line", (line) => {
       respond({ id, ok: true, result: { defs: doSlice(req.dir, req.file, req.symbol, req.depth ?? 2) } });
     } else if (req.op === "targets") {
       respond({ id, ok: true, result: { targets: discoverTargets(req.dir, req.limit ?? 20) } });
+    } else if (req.op === "symbols") {
+      respond({ id, ok: true, result: { symbols: collectSymbols(req.dir, req.file) } });
     } else {
       respond({ id, ok: false, error: `unknown op: ${req.op}` });
     }
@@ -294,4 +296,36 @@ function safeRead(p) {
   } catch {
     return null;
   }
+}
+
+// The defs in `file` with 1-based inclusive line ranges — AST-accurate symbol boundaries the
+// semantic diff uses to name which def/class an added line lives in. `def`s (module-level, nested,
+// and methods) and classes; tree-sitter positions are 0-based rows, so +1.
+function collectSymbols(dir, file) {
+  const src = safeRead(path.resolve(dir, file));
+  if (src == null) throw new Error(`file not found: ${file}`);
+  const tree = parser.parse(src);
+  const out = [];
+  const push = (n, kind) => {
+    const name = defName(n); // childForFieldName("name") — works for def and class
+    if (name) out.push({ name, kind, startLine: n.startPosition.row + 1, endLine: n.endPosition.row + 1 });
+  };
+  walk(tree.rootNode, (n) => {
+    if (n.type === "function_definition") push(n, "function");
+    else if (n.type === "class_definition") push(n, "class");
+    else if (n.type === "decorated_definition") {
+      // Also emit the decorated node's WIDER range (name/kind from the inner def) so a change to a
+      // `@decorator` line above a def attributes to that def, not just its enclosing scope. The inner
+      // def is still emitted above with its tighter range, so a body line resolves to it (innermost).
+      const inner = n.namedChildren.find(
+        (c) => c.type === "function_definition" || c.type === "class_definition"
+      );
+      if (inner) {
+        const name = defName(inner);
+        const kind = inner.type === "class_definition" ? "class" : "function";
+        if (name) out.push({ name, kind, startLine: n.startPosition.row + 1, endLine: n.endPosition.row + 1 });
+      }
+    }
+  });
+  return out;
 }

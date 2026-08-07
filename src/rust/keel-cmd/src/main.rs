@@ -7,7 +7,7 @@
 //! `keel commit` / `keel log` are the write/history side.
 
 use keel_brief::BriefService;
-use keel_resolve::{Sidecar, SymbolRange};
+use keel_resolve::{Router, SymbolRange};
 use keel_store::{
     diff_lines, semantic_summarize, AddedLine, ChangeGroup, ChangeKind, GroupKind, NodeKind, Object,
     ObjectId, Repo, Review, SemanticSummary, Session, StoreError, Tag, Verdict, Verification, Vfs,
@@ -1807,7 +1807,7 @@ fn review_semantic(args: &[String]) -> io::Result<()> {
     let (_, store) = root_store(args)?;
     let repo = Repo::open(&store).map_err(to_io)?;
     let id = resolve_change(&repo, raw)?;
-    let ast_script = has(args, "--ast").then(|| sidecar_dir(args).join("resolve.mjs"));
+    let ast_script = has(args, "--ast").then(|| sidecar_dir(args));
     let (added, nfiles, binary) = change_added_lines(&repo, id, ast_script)?;
     let s = semantic_summarize(&added);
 
@@ -2098,7 +2098,7 @@ fn cmd_anomalies(args: &[String]) -> io::Result<()> {
     for id in repo.log().map_err(to_io)?.into_iter().take(limit) {
         let Some(c) = repo.change(id).map_err(to_io)? else { continue };
         scanned += 1;
-        let ast_script = has(args, "--ast").then(|| sidecar_dir(args).join("resolve.mjs"));
+        let ast_script = has(args, "--ast").then(|| sidecar_dir(args));
         let (added, _n, _b) = change_added_lines(&repo, id, ast_script)?;
         let s = semantic_summarize(&added);
         if s.anomaly_count == 0 {
@@ -2249,7 +2249,7 @@ fn cmd_walkthrough(args: &[String]) -> io::Result<()> {
     // `--semantic`: the operation view of this change under the session header — bulk edits collapsed,
     // unique changes and smuggled-constant anomalies surfaced — instead of block-by-block hunks.
     if has(args, "--semantic") {
-        let ast_script = has(args, "--ast").then(|| sidecar_dir(args).join("resolve.mjs"));
+        let ast_script = has(args, "--ast").then(|| sidecar_dir(args));
         return walkthrough_semantic(
             &repo, id, &c.intent, &c.author, c.timestamp, verif,
             task.as_deref(), model.as_deref(), lesson.as_deref(), has(args, "--json"), ast_script,
@@ -2841,7 +2841,7 @@ fn cmd_diff(args: &[String]) -> io::Result<()> {
     // `--semantic`: instead of raw hunks, collapse the mechanical bulk and surface what needs eyes.
     // `--ast` opts into AST-accurate symbol attribution (TS/JS, via the resolver sidecar).
     if has(args, "--semantic") {
-        let ast_script = has(args, "--ast").then(|| sidecar_dir(args).join("resolve.mjs"));
+        let ast_script = has(args, "--ast").then(|| sidecar_dir(args));
         return semantic_diff(&repo, &root, head, &changes, has(args, "--json"), ast_script);
     }
 
@@ -2871,21 +2871,12 @@ fn semantic_diff(
     head: Option<ObjectId>,
     changes: &[keel_store::PathChange],
     json: bool,
-    ast_script: Option<PathBuf>,
+    ast_dir: Option<PathBuf>,
 ) -> io::Result<()> {
-    // `--ast`: spawn the TS resolver sidecar once — but only if the change actually touches a
-    // `.ts`/`.tsx` file (no point paying for node on a markdown-only diff). Per file we ask it for
-    // AST-accurate symbol ranges, falling back to the heuristic if it's unavailable or errors.
-    let want_ast = ast_script.is_some()
-        && changes.iter().any(|c| c.kind != ChangeKind::Deleted && is_ts_js(&c.path));
-    let mut sidecar = if want_ast {
-        ast_script.as_ref().and_then(|s| Sidecar::spawn(s).ok())
-    } else {
-        None
-    };
-    if want_ast && sidecar.is_none() {
-        eprintln!("keel: --ast: resolver sidecar unavailable (node?) — using the heuristic");
-    }
+    // `--ast`: a language Router (spawns each sidecar lazily on first use, so a markdown-only diff
+    // starts no node). Per supported file we ask it for AST-accurate symbol ranges, falling back to
+    // the indentation heuristic for unsupported languages or any sidecar error.
+    let mut router = ast_dir.as_deref().map(Router::new);
     let mut added: Vec<AddedLine> = Vec::new();
     let (mut files, mut binary) = (0usize, 0usize);
     for c in changes {
@@ -2903,7 +2894,7 @@ fn semantic_diff(
         }
         files += 1;
         // Skip the sidecar round-trip when there's nothing to attribute (a deleted file → empty new).
-        let syms = if new.is_empty() { None } else { ast_symbols(sidecar.as_mut(), root, &c.path) };
+        let syms = if new.is_empty() { None } else { ast_symbols(router.as_mut(), root, &c.path) };
         added.extend(added_lines_from(&c.path, &old, &new, syms.as_deref()));
     }
     let s = semantic_summarize(&added);
@@ -3025,25 +3016,26 @@ fn def_symbol(trimmed: &str) -> Option<String> {
     None
 }
 
-/// Whether the resolver sidecar (`resolve.mjs`, TypeScript with `allowJs`) puts this file in its
-/// program and can therefore report symbols for it — TypeScript and JavaScript. Must stay in lockstep
-/// with the sidecar's `walkFiles` extension set, else a claimed file forces a doomed round-trip.
-fn is_ts_js(path: &str) -> bool {
+/// Whether a language sidecar has a `symbols` op for this extension (so `--ast` can attribute it):
+/// TypeScript + JavaScript (resolve.mjs, allowJs) and Python (resolve-py.mjs). Go/C route through the
+/// [`Router`] but have no `symbols` op yet, so they're excluded here to avoid a doomed spawn (add them
+/// as those ops land). `.pyi` (a stub, like `.d.ts`) is excluded so it falls back to the heuristic.
+fn ast_supported(path: &str) -> bool {
     matches!(
         path.rsplit('.').next().map(str::to_ascii_lowercase).as_deref(),
-        Some("ts" | "tsx" | "mts" | "cts" | "js" | "jsx" | "mjs" | "cjs")
+        Some("ts" | "tsx" | "mts" | "cts" | "js" | "jsx" | "mjs" | "cjs" | "py")
     )
 }
 
-/// AST symbol ranges for `path` from the (already-spawned) sidecar — `Some` (possibly empty, meaning
-/// "parsed, no enclosing defs") for a `.ts`/`.tsx` file the sidecar could read, `None` to signal "fall
-/// back to the heuristic" (no sidecar, non-TS file, or a sidecar error).
-fn ast_symbols(sidecar: Option<&mut Sidecar>, root: &Path, path: &str) -> Option<Vec<SymbolRange>> {
-    let sc = sidecar?;
-    if !is_ts_js(path) {
+/// AST symbol ranges for `path` via the language [`Router`] — `Some` (possibly empty, "parsed, no
+/// enclosing defs") for a supported file, `None` to signal "fall back to the heuristic" (no router,
+/// unsupported language, or a sidecar error).
+fn ast_symbols(router: Option<&mut Router>, root: &Path, path: &str) -> Option<Vec<SymbolRange>> {
+    let r = router?;
+    if !ast_supported(path) {
         return None;
     }
-    sc.symbols(root, path).ok()
+    r.symbols(root, path).ok()
 }
 
 /// The innermost AST symbol whose 1-based line range contains `line`, as `"kind name"` (e.g.
@@ -3131,29 +3123,26 @@ fn make_scratch_dir() -> Option<ScratchDir> {
 
 /// The added lines of a committed change (vs its first parent), skipping binary files. Returns
 /// `(added_lines, non_binary_files, binary_files)`. Shared by the semantic walkthrough, review, and
-/// history audit. With `ast_script` set (`--ast`), each `.ts`/`.tsx` file's NEW content is written to
-/// a flat, safe-named temp file and parsed by the sidecar for AST-accurate symbol ranges; everything
-/// else falls back to the parser-free indentation heuristic.
+/// history audit. With `ast_dir` set (`--ast`), each supported file's NEW content is written to a
+/// flat, safe-named temp file and parsed by the language sidecar (via the [`Router`]) for AST-accurate
+/// symbol ranges; everything else falls back to the parser-free indentation heuristic.
 fn change_added_lines(
     repo: &Repo,
     id: ObjectId,
-    ast_script: Option<PathBuf>,
+    ast_dir: Option<PathBuf>,
 ) -> io::Result<(Vec<AddedLine>, usize, usize)> {
     let c = repo.change(id).map_err(to_io)?.ok_or_else(|| io::Error::other("no such change"))?;
     let files = repo.change_files(id).map_err(to_io)?;
     let parent = c.parents.first().copied();
 
-    // `--ast`: only bother spawning node if the change touches a non-deleted `.ts`/`.tsx` file.
-    let want_ast = ast_script.is_some()
-        && files.iter().any(|f| f.kind != ChangeKind::Deleted && is_ts_js(&f.path));
+    // `--ast`: materialize supported blobs into a scratch dir and route each to its language sidecar.
+    let want_ast = ast_dir.is_some()
+        && files.iter().any(|f| f.kind != ChangeKind::Deleted && ast_supported(&f.path));
     let scratch = if want_ast { make_scratch_dir() } else { None };
-    let mut sidecar = match (&scratch, &ast_script) {
-        (Some(_), Some(s)) => Sidecar::spawn(s).ok(),
+    let mut router = match (&scratch, ast_dir.as_deref()) {
+        (Some(_), Some(d)) => Some(Router::new(d)),
         _ => None,
     };
-    if want_ast && (scratch.is_none() || sidecar.is_none()) {
-        eprintln!("keel: --ast: resolver sidecar unavailable — using the heuristic");
-    }
 
     let mut added: Vec<AddedLine> = Vec::new();
     let (mut nfiles, mut binary) = (0usize, 0usize);
@@ -3172,10 +3161,10 @@ fn change_added_lines(
             continue;
         }
         nfiles += 1;
-        // AST symbols for a committed `.ts`/`.tsx` blob: write it to a FLAT temp file (a generated
-        // `sN.<ext>`, so a crafted tree path can never escape the scratch dir) and query the sidecar.
-        let syms = match (scratch.as_ref(), sidecar.as_mut()) {
-            (Some(dir), Some(sc)) if is_ts_js(&f.path) && !new.is_empty() => {
+        // AST symbols for a committed supported blob: write it to a FLAT temp file (a generated
+        // `sN.<ext>`, so a crafted tree path can never escape the scratch dir) and route it by ext.
+        let syms = match (scratch.as_ref(), router.as_mut()) {
+            (Some(dir), Some(r)) if ast_supported(&f.path) && !new.is_empty() => {
                 // Preserve a declaration-file suffix so the sidecar excludes it exactly as the
                 // working-tree path does (consistency), instead of AST-parsing it as plain `.ts`.
                 let ext = [".d.ts", ".d.mts", ".d.cts"]
@@ -3184,7 +3173,7 @@ fn change_added_lines(
                     .map(|s| s.trim_start_matches('.'))
                     .unwrap_or_else(|| f.path.rsplit('.').next().unwrap_or("ts"));
                 let name = format!("s{nfiles}.{ext}");
-                std::fs::write(dir.0.join(&name), &new).ok().and_then(|_| sc.symbols(&dir.0, &name).ok())
+                std::fs::write(dir.0.join(&name), &new).ok().and_then(|_| r.symbols(&dir.0, &name).ok())
             }
             _ => None,
         };
@@ -3919,13 +3908,14 @@ mod tests {
     }
 
     #[test]
-    fn is_ts_js_matches_the_sidecars_extension_set() {
-        // TS and JS (with allowJs) — must mirror the sidecar's walkFiles regex
-        for p in ["a.ts", "b.TSX", "src/c.ts", "d.mts", "e.cts", "f.js", "g.jsx", "h.mjs", "i.cjs"] {
-            assert!(is_ts_js(p), "should be claimed: {p}");
+    fn ast_supported_covers_languages_with_a_symbols_op() {
+        // TS + JS + Python (the languages whose sidecar has a `symbols` op)
+        for p in ["a.ts", "b.TSX", "src/c.ts", "d.mts", "e.cts", "f.js", "g.jsx", "h.mjs", "i.cjs", "j.py"] {
+            assert!(ast_supported(p), "should be supported: {p}");
         }
-        for p in ["e.rs", "f.py", "g.go", "Makefile", "noext"] {
-            assert!(!is_ts_js(p), "should NOT be claimed: {p}");
+        // .pyi (stub, like .d.ts), and languages without a symbols op yet (go/c) or unrouted (rs)
+        for p in ["k.pyi", "l.go", "m.c", "n.rs", "Makefile", "noext"] {
+            assert!(!ast_supported(p), "should NOT be supported: {p}");
         }
     }
 
