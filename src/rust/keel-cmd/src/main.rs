@@ -46,6 +46,7 @@ fn main() {
         Some("learn") => run(cmd_learn(&args[1..])),
         Some("review") => run(cmd_review(&args[1..])),
         Some("reviews") => run(cmd_reviews(&args[1..])),
+        Some("show") => run(cmd_show(&args[1..])),
         Some("walkthrough") => run(cmd_walkthrough(&args[1..])),
         Some("vfs") => run(cmd_vfs(&args[1..])),
         Some("why") => run(cmd_why(&args[1..])),
@@ -144,6 +145,7 @@ fn print_usage() {
          \x20 keel review --target <change> --semantic   auto-review: record the change's anomalies as findings\n\
          \x20 keel reviews [--target <id>] [--label <l>] [--mentions <t>] [--no-human] [--disagreements] [--json]\n\
          \x20 keel walkthrough <change> [--full] [--semantic] [--json]   block-by-block (or operation-level) review\n\
+         \x20 keel show <object-id> [--json]     inspect any object: blob / change / session / review / tree\n\
          \x20 keel vfs <change> <ls|stat|cat> <path> [--json]   read a change's tree lazily, no checkout\n\
          \x20 keel repack [--json]                delta-compress history + GC (like `git gc`)\n\
          \x20 keel size   [--json]                logical bytes / object counts\n\
@@ -1933,6 +1935,172 @@ fn cmd_reviews(args: &[String]) -> io::Result<()> {
         }
     }
     Ok(())
+}
+
+/// `keel show <object-id> [--json]` — inspect any stored object by id: a blob's bytes, a change's
+/// intent + provenance, a session's task/model/verification, a review's verdict/findings, or a
+/// tree's entries. Accepts a full 64-hex id or a change-id prefix. This is how you read what other
+/// commands only *reference* — e.g. the finding write-ups that `keel review --semantic` records.
+fn cmd_show(args: &[String]) -> io::Result<()> {
+    let raw = first_positional(args)
+        .ok_or_else(|| io::Error::other("usage: keel show <object-id> [--json]"))?;
+    let (_, store) = root_store(args)?;
+    let repo = Repo::open(&store).map_err(to_io)?;
+    let id = resolve_object(&repo, raw)?;
+    let obj = repo.store().get(&id).map_err(to_io)?.ok_or_else(|| io::Error::other("no such object"))?;
+    let json = has(args, "--json");
+    let hex = id.to_hex();
+
+    match &obj {
+        Object::Blob(b) => {
+            let binary = b.contains(&0);
+            if json {
+                let mut o = json!({ "id": hex, "kind": "blob", "size": b.len(), "binary": binary });
+                if !binary {
+                    o["text"] = json!(String::from_utf8_lossy(b));
+                }
+                println!("{}", render_json(&o));
+            } else if binary {
+                println!("blob {} · {} bytes (binary)", short(&hex), b.len());
+            } else {
+                io::stdout().write_all(b)?;
+            }
+        }
+        Object::Tree(t) => {
+            if json {
+                let entries: Vec<Value> = t
+                    .entries
+                    .iter()
+                    .map(|e| json!({ "name": e.name, "mode": format!("{:o}", e.mode), "id": e.id.to_hex() }))
+                    .collect();
+                println!("{}", render_json(&json!({ "id": hex, "kind": "tree", "entries": entries })));
+            } else {
+                println!("tree {} · {} entr{}", short(&hex), t.entries.len(), if t.entries.len() == 1 { "y" } else { "ies" });
+                for e in &t.entries {
+                    println!("  {:o} {} {}", e.mode, short(&e.id.to_hex()), e.name);
+                }
+            }
+        }
+        Object::Change(c) => {
+            let verif = verif_str(repo.store().verification(&id).map_err(to_io)?);
+            if json {
+                println!(
+                    "{}",
+                    render_json(&json!({
+                        "id": hex, "kind": "change", "intent": c.intent, "author": c.author,
+                        "timestamp": c.timestamp, "verified": verif, "tree": c.tree.to_hex(),
+                        "parents": c.parents.iter().map(|p| p.to_hex()).collect::<Vec<_>>(),
+                        "session": c.session.map(|s| s.to_hex()),
+                    }))
+                );
+            } else {
+                println!("change {} · {}", short(&hex), c.intent);
+                println!("  by {} · {} · verified {verif}", c.author, rel_time(c.timestamp));
+                if !c.parents.is_empty() {
+                    let ps: Vec<String> = c.parents.iter().map(|p| short(&p.to_hex()).to_string()).collect();
+                    println!("  parent(s): {}", ps.join(", "));
+                }
+                println!("  tree:    {}", short(&c.tree.to_hex()));
+                if let Some(s) = c.session {
+                    println!("  session: {}  (keel show {})", short(&s.to_hex()), s.to_hex());
+                }
+            }
+        }
+        Object::Session(s) => {
+            if json {
+                println!(
+                    "{}",
+                    render_json(&json!({
+                        "id": hex, "kind": "session", "task": s.task, "model": s.model,
+                        "lesson": s.lesson, "verified": verif_str(s.verification),
+                        "tokens_in": s.tokens_in, "tokens_out": s.tokens_out,
+                        "tool_calls": s.tool_calls.len(), "tool_results": s.tool_results.len(),
+                    }))
+                );
+            } else {
+                println!("session {}", short(&hex));
+                println!("  task:   {}", s.task);
+                println!("  model:  {}", s.model);
+                if !s.lesson.is_empty() {
+                    println!("  lesson: {}", s.lesson);
+                }
+                println!("  verified: {}", verif_str(s.verification));
+                println!("  tokens: in {} / out {}", s.tokens_in, s.tokens_out);
+                println!("  tool_calls: {} · tool_results: {}", s.tool_calls.len(), s.tool_results.len());
+            }
+        }
+        Object::Review(r) => {
+            if json {
+                println!(
+                    "{}",
+                    render_json(&json!({
+                        "id": hex, "kind": "review", "target": r.target.to_hex(), "reviewer": r.reviewer,
+                        "by_human": r.by_human, "verdict": r.verdict.name(), "summary": r.summary,
+                        "labels": r.labels, "findings": r.findings.iter().map(|f| f.to_hex()).collect::<Vec<_>>(),
+                    }))
+                );
+            } else {
+                println!("review {} of {}", short(&hex), short(&r.target.to_hex()));
+                let h = if r.by_human { " (human)" } else { "" };
+                println!("  {} by {}{h}", r.verdict.name(), r.reviewer);
+                if !r.summary.is_empty() {
+                    println!("  {}", r.summary);
+                }
+                if !r.labels.is_empty() {
+                    println!("  labels: {}", r.labels.join(", "));
+                }
+                if !r.findings.is_empty() {
+                    println!("  findings ({}):", r.findings.len());
+                    for f in &r.findings {
+                        println!("    keel show {}", f.to_hex());
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn verif_str(v: Verification) -> &'static str {
+    match v {
+        Verification::Green => "green",
+        Verification::Red => "red",
+        Verification::Unverified => "unverified",
+    }
+}
+
+/// Resolve an object id for `keel show`: a full 64-hex id of ANY stored object (blob / tree / change /
+/// session / review), or a unique hex prefix of one. Unlike [`resolve_change`] this searches every
+/// object kind — so the short ids printed in headers and finding hints actually resolve — and it
+/// distinguishes "no match", "ambiguous prefix", and an empty/invalid argument rather than silently
+/// treating `""` as a match-all.
+fn resolve_object(repo: &Repo, raw: &str) -> io::Result<ObjectId> {
+    if raw.is_empty() {
+        return Err(fail_fix("empty object id", "pass a 64-hex id or a unique id prefix"));
+    }
+    // Exact full id first (cheap, and unambiguous).
+    if let Some(id) = ObjectId::from_hex(raw) {
+        if repo.store().has(&id).map_err(to_io)? {
+            return Ok(id);
+        }
+    }
+    let lower = raw.to_lowercase();
+    if !lower.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(fail_fix(format!("no object matches {raw:?}"), "an id is hex"));
+    }
+    // Prefix scan across every stored object kind (interactive command, not a hot path).
+    let hits: Vec<ObjectId> = repo
+        .store()
+        .content_ids()
+        .map_err(to_io)?
+        .into_iter()
+        .filter(|id| id.to_hex().starts_with(&lower))
+        .collect();
+    match hits.len() {
+        1 => Ok(hits[0]),
+        0 => Err(io::Error::other(format!("no object matches {raw:?}"))),
+        n => Err(fail_fix(format!("ambiguous id prefix {raw:?} — {n} objects match"), "use more characters")),
+    }
 }
 
 /// `keel walkthrough <change> [--json] [--full]`
