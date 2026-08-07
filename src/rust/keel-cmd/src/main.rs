@@ -47,6 +47,7 @@ fn main() {
         Some("review") => run(cmd_review(&args[1..])),
         Some("reviews") => run(cmd_reviews(&args[1..])),
         Some("show") => run(cmd_show(&args[1..])),
+        Some("anomalies") => run(cmd_anomalies(&args[1..])),
         Some("walkthrough") => run(cmd_walkthrough(&args[1..])),
         Some("vfs") => run(cmd_vfs(&args[1..])),
         Some("why") => run(cmd_why(&args[1..])),
@@ -146,6 +147,7 @@ fn print_usage() {
          \x20 keel reviews [--target <id>] [--label <l>] [--mentions <t>] [--no-human] [--disagreements] [--json]\n\
          \x20 keel walkthrough <change> [--full] [--semantic] [--json]   block-by-block (or operation-level) review\n\
          \x20 keel show <object-id> [--json]     inspect any object: blob / change / session / review / tree\n\
+         \x20 keel anomalies [--limit N] [--json]   scan recent history for changes that smuggled a literal\n\
          \x20 keel vfs <change> <ls|stat|cat> <path> [--json]   read a change's tree lazily, no checkout\n\
          \x20 keel repack [--json]                delta-compress history + GC (like `git gc`)\n\
          \x20 keel size   [--json]                logical bytes / object counts\n\
@@ -2075,6 +2077,76 @@ fn verif_str(v: Verification) -> &'static str {
         Verification::Red => "red",
         Verification::Unverified => "unverified",
     }
+}
+
+/// `keel anomalies [--limit N] [--json]` — scan recent history for changes carrying a literal anomaly
+/// (a smuggled `* 3` among `* 2`, a `"v3"` among `"v2"`) and report each with the file · symbol it
+/// hides in. A repo-level audit — "which of the last N changes smuggled a constant" — that git can't
+/// answer because it has no notion of an operation, only a diff. Runs the same deterministic engine
+/// as `keel native diff --semantic`, over each change's added lines.
+fn cmd_anomalies(args: &[String]) -> io::Result<()> {
+    let limit: usize = flag(args, "--limit").and_then(|s| s.parse().ok()).unwrap_or(20);
+    let (_, store) = root_store(args)?;
+    let repo = Repo::open(&store).map_err(to_io)?;
+    let json = has(args, "--json");
+
+    let mut flagged: Vec<Value> = Vec::new();
+    let (mut scanned, mut total) = (0usize, 0usize);
+    for id in repo.log().map_err(to_io)?.into_iter().take(limit) {
+        let Some(c) = repo.change(id).map_err(to_io)? else { continue };
+        scanned += 1;
+        let (added, _n, _b) = change_added_lines(&repo, id)?;
+        let s = semantic_summarize(&added);
+        if s.anomaly_count == 0 {
+            continue;
+        }
+        total += s.anomaly_count;
+        let sites: Vec<Value> = s
+            .groups
+            .iter()
+            .flat_map(|g| g.anomalies.iter())
+            .map(|a| json!({ "file": a.file, "symbol": a.symbol, "text": a.text, "reason": a.reason }))
+            .collect();
+        flagged.push(json!({ "change": id.to_hex(), "intent": c.intent, "anomalies": s.anomaly_count, "sites": sites }));
+    }
+
+    if json {
+        println!(
+            "{}",
+            render_json(&json!({
+                "ok": true, "scanned": scanned, "changes_flagged": flagged.len(),
+                "anomalies": total, "flagged": flagged,
+            }))
+        );
+        return Ok(());
+    }
+    if flagged.is_empty() {
+        println!("scanned {scanned} change(s) — no anomalies");
+        return Ok(());
+    }
+    println!("{} change(s) with anomalies (of {scanned} scanned):", flagged.len());
+    for f in &flagged {
+        println!(
+            "\n{} · {}  ({} anomaly(ies))",
+            short(f["change"].as_str().unwrap_or("")),
+            f["intent"].as_str().unwrap_or(""),
+            f["anomalies"]
+        );
+        for site in f["sites"].as_array().into_iter().flatten() {
+            let file = site["file"].as_str().unwrap_or("");
+            let loc = match site["symbol"].as_str() {
+                Some(sym) => format!("{file} · {sym}"),
+                None => file.to_string(),
+            };
+            println!(
+                "  ⚠ {loc}: {}  — {}",
+                site["text"].as_str().unwrap_or(""),
+                site["reason"].as_str().unwrap_or("")
+            );
+        }
+    }
+    println!("\n  record one as a review: keel review --target <change> --semantic");
+    Ok(())
 }
 
 /// Resolve an object id for `keel show`: a full 64-hex id of ANY stored object (blob / tree / change /
