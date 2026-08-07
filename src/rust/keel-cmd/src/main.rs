@@ -3096,6 +3096,37 @@ impl Drop for ScratchDir {
     }
 }
 
+/// Create an owner-only scratch dir with an UNPREDICTABLE name via EXCLUSIVE create, so a local
+/// attacker can't pre-create a predictable path under a world-writable `/tmp` to read the source under
+/// review or swap its content (a TOCTOU the fixed old name allowed). `None` if it can't be made
+/// (caller falls back to the no-temp heuristic).
+fn make_scratch_dir() -> Option<ScratchDir> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let base = std::env::temp_dir();
+    for _ in 0..8 {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let p = base.join(format!(
+            "keel-ast-{}-{nanos}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        // create_dir (not create_dir_all) fails rather than adopting a pre-existing dir.
+        if std::fs::create_dir(&p).is_ok() {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o700));
+            }
+            return Some(ScratchDir(p));
+        }
+    }
+    None
+}
+
 /// The added lines of a committed change (vs its first parent), skipping binary files. Returns
 /// `(added_lines, non_binary_files, binary_files)`. Shared by the semantic walkthrough, review, and
 /// history audit. With `ast_script` set (`--ast`), each `.ts`/`.tsx` file's NEW content is written to
@@ -3113,12 +3144,7 @@ fn change_added_lines(
     // `--ast`: only bother spawning node if the change touches a non-deleted `.ts`/`.tsx` file.
     let want_ast = ast_script.is_some()
         && files.iter().any(|f| f.kind != ChangeKind::Deleted && is_ts(&f.path));
-    let scratch = if want_ast {
-        let p = std::env::temp_dir().join(format!("keel-ast-{}-{}", std::process::id(), short(&id.to_hex())));
-        std::fs::create_dir_all(&p).ok().map(|_| ScratchDir(p))
-    } else {
-        None
-    };
+    let scratch = if want_ast { make_scratch_dir() } else { None };
     let mut sidecar = match (&scratch, &ast_script) {
         (Some(_), Some(s)) => Sidecar::spawn(s).ok(),
         _ => None,
@@ -3148,7 +3174,9 @@ fn change_added_lines(
         // `sN.<ext>`, so a crafted tree path can never escape the scratch dir) and query the sidecar.
         let syms = match (scratch.as_ref(), sidecar.as_mut()) {
             (Some(dir), Some(sc)) if is_ts(&f.path) && !new.is_empty() => {
-                let ext = f.path.rsplit('.').next().unwrap_or("ts");
+                // Preserve a `.d.ts` suffix so the sidecar excludes declaration files exactly as the
+                // working-tree path does (consistency), instead of AST-parsing them as `.ts`.
+                let ext = if f.path.ends_with(".d.ts") { "d.ts" } else { f.path.rsplit('.').next().unwrap_or("ts") };
                 let name = format!("s{nfiles}.{ext}");
                 std::fs::write(dir.0.join(&name), &new).ok().and_then(|_| sc.symbols(&dir.0, &name).ok())
             }
