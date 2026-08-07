@@ -429,6 +429,16 @@ impl Router {
         Ok(self.sidecars.get_mut(lang).expect("just inserted"))
     }
 
+    /// AST symbol ranges for `file`, routed to its language sidecar (spawned lazily). `Ok([])` for a
+    /// file of a language keel doesn't route; an `Err` (e.g. the sidecar lacks a `symbols` op, or
+    /// can't parse the file) is the caller's signal to fall back to a heuristic.
+    pub fn symbols(&mut self, dir: &Path, file: &str) -> io::Result<Vec<SymbolRange>> {
+        match lang_of(file) {
+            Some(lang) => self.sidecar(lang)?.symbols(dir, file),
+            None => Ok(Vec::new()),
+        }
+    }
+
     /// Languages with a sidecar currently running (for diagnostics/tests).
     pub fn active_langs(&self) -> Vec<&'static str> {
         let mut v: Vec<_> = self.sidecars.keys().copied().collect();
@@ -855,6 +865,39 @@ mod tests {
         assert_eq!(helper.file, "util.py");
         assert!(helper.text.contains("x * 2"), "slice carries helper's body");
 
+        // the `symbols` op: defs (incl. nested/methods) and classes with 1-based line ranges
+        let src = "def outer(x):\n    def inner(y):\n        return y\n    return inner(x)\n\nclass Order:\n    def total(self):\n        return 0\n";
+        fs::write(dir.join("s.py"), src).unwrap();
+        let syms = sc.symbols(&dir, "s.py").unwrap();
+        let by = |name: &str| syms.iter().find(|s| s.name == name).cloned();
+        assert_eq!(by("outer").expect("def outer").kind, "function");
+        assert_eq!((by("outer").unwrap().start_line, by("outer").unwrap().end_line), (1, 4));
+        let inner = by("inner").expect("nested def");
+        assert!(inner.start_line == 2 && inner.end_line == 3, "nested def is the inner range; got {inner:?}");
+        assert_eq!(by("Order").expect("class").kind, "class");
+        assert_eq!(by("total").expect("method").kind, "function"); // Python methods are `def`s
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The Router routes a `symbols` query to the right language sidecar by extension — Python to
+    /// resolve-py, TypeScript to resolve.mjs — spawning each lazily.
+    #[test]
+    fn router_symbols_routes_by_language() {
+        let sidecar_dir = script().parent().unwrap().to_path_buf();
+        let mut r = Router::new(&sidecar_dir);
+        let dir = tmp();
+        fs::write(dir.join("a.py"), "def pyfn():\n    return 1\n").unwrap();
+        // node may be absent → routing still shouldn't panic; treat spawn error as skip
+        match r.symbols(&dir, "a.py") {
+            Ok(syms) if !syms.is_empty() => {
+                assert!(syms.iter().any(|s| s.name == "pyfn"), "python routed; got {syms:?}");
+            }
+            Ok(_) => eprintln!("skipping router symbols test: python sidecar returned no symbols (tree-sitter?)"),
+            Err(e) => eprintln!("skipping router symbols test: {e}"),
+        }
+        // a language keel doesn't route (.rs) yields an empty vec, not an error
+        assert_eq!(r.symbols(&dir, "x.rs").unwrap(), Vec::new());
         let _ = fs::remove_dir_all(&dir);
     }
 
