@@ -144,11 +144,11 @@ fn print_usage() {
          \x20 keel learn --lesson <text> [--task <text>]   record what a change taught (flywheel)\n\
          \x20 keel sessions [--file <path>]       ·   keel session <change>\n\
          \x20 keel review --target <id> --verdict <approve|request-changes|reject|comment> [--label <l>]\n\
-         \x20 keel review --target <change> --semantic   auto-review: record the change's anomalies as findings\n\
+         \x20 keel review --target <change> --semantic [--ast]   auto-review: record the change's anomalies as findings\n\
          \x20 keel reviews [--target <id>] [--label <l>] [--mentions <t>] [--no-human] [--disagreements] [--json]\n\
-         \x20 keel walkthrough <change> [--full] [--semantic] [--json]   block-by-block (or operation-level) review\n\
+         \x20 keel walkthrough <change> [--full] [--semantic [--ast]] [--json]   block-by-block or operation-level review\n\
          \x20 keel show <object-id> [--json]     inspect any object: blob / change / session / review / tree\n\
-         \x20 keel anomalies [--limit N] [--json]   scan recent history for changes that smuggled a literal\n\
+         \x20 keel anomalies [--limit N] [--ast] [--json]   scan recent history for changes that smuggled a literal\n\
          \x20 keel vfs <change> <ls|stat|cat> <path> [--json]   read a change's tree lazily, no checkout\n\
          \x20 keel repack [--json]                delta-compress history + GC (like `git gc`)\n\
          \x20 keel size   [--json]                logical bytes / object counts\n\
@@ -1807,7 +1807,8 @@ fn review_semantic(args: &[String]) -> io::Result<()> {
     let (_, store) = root_store(args)?;
     let repo = Repo::open(&store).map_err(to_io)?;
     let id = resolve_change(&repo, raw)?;
-    let (added, nfiles, binary) = change_added_lines(&repo, id)?;
+    let ast_script = has(args, "--ast").then(|| sidecar_dir(args).join("resolve.mjs"));
+    let (added, nfiles, binary) = change_added_lines(&repo, id, ast_script)?;
     let s = semantic_summarize(&added);
 
     // Each anomaly becomes a finding blob (the write-up), referenced by the Review.
@@ -2097,7 +2098,8 @@ fn cmd_anomalies(args: &[String]) -> io::Result<()> {
     for id in repo.log().map_err(to_io)?.into_iter().take(limit) {
         let Some(c) = repo.change(id).map_err(to_io)? else { continue };
         scanned += 1;
-        let (added, _n, _b) = change_added_lines(&repo, id)?;
+        let ast_script = has(args, "--ast").then(|| sidecar_dir(args).join("resolve.mjs"));
+        let (added, _n, _b) = change_added_lines(&repo, id, ast_script)?;
         let s = semantic_summarize(&added);
         if s.anomaly_count == 0 {
             continue;
@@ -2247,9 +2249,10 @@ fn cmd_walkthrough(args: &[String]) -> io::Result<()> {
     // `--semantic`: the operation view of this change under the session header — bulk edits collapsed,
     // unique changes and smuggled-constant anomalies surfaced — instead of block-by-block hunks.
     if has(args, "--semantic") {
+        let ast_script = has(args, "--ast").then(|| sidecar_dir(args).join("resolve.mjs"));
         return walkthrough_semantic(
             &repo, id, &c.intent, &c.author, c.timestamp, verif,
-            task.as_deref(), model.as_deref(), lesson.as_deref(), has(args, "--json"),
+            task.as_deref(), model.as_deref(), lesson.as_deref(), has(args, "--json"), ast_script,
         );
     }
 
@@ -3084,13 +3087,72 @@ fn added_lines_from(path: &str, old: &[u8], new: &[u8], symbols: Option<&[Symbol
     out
 }
 
+/// A self-deleting temp directory (best-effort cleanup on drop). Used to materialize a committed
+/// change's new blobs so the resolver sidecar can parse them for AST symbols.
+struct ScratchDir(PathBuf);
+impl Drop for ScratchDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// Create an owner-only scratch dir with an UNPREDICTABLE name via EXCLUSIVE create, so a local
+/// attacker can't pre-create a predictable path under a world-writable `/tmp` to read the source under
+/// review or swap its content (a TOCTOU the fixed old name allowed). `None` if it can't be made
+/// (caller falls back to the no-temp heuristic).
+fn make_scratch_dir() -> Option<ScratchDir> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let base = std::env::temp_dir();
+    for _ in 0..8 {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let p = base.join(format!(
+            "keel-ast-{}-{nanos}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        // create_dir (not create_dir_all) fails rather than adopting a pre-existing dir.
+        if std::fs::create_dir(&p).is_ok() {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o700));
+            }
+            return Some(ScratchDir(p));
+        }
+    }
+    None
+}
+
 /// The added lines of a committed change (vs its first parent), skipping binary files. Returns
-/// `(added_lines, non_binary_files, binary_files)`. Shared by the semantic walkthrough and the
-/// semantic review — both want "what did this change add", masked and grouped downstream.
-fn change_added_lines(repo: &Repo, id: ObjectId) -> io::Result<(Vec<AddedLine>, usize, usize)> {
+/// `(added_lines, non_binary_files, binary_files)`. Shared by the semantic walkthrough, review, and
+/// history audit. With `ast_script` set (`--ast`), each `.ts`/`.tsx` file's NEW content is written to
+/// a flat, safe-named temp file and parsed by the sidecar for AST-accurate symbol ranges; everything
+/// else falls back to the parser-free indentation heuristic.
+fn change_added_lines(
+    repo: &Repo,
+    id: ObjectId,
+    ast_script: Option<PathBuf>,
+) -> io::Result<(Vec<AddedLine>, usize, usize)> {
     let c = repo.change(id).map_err(to_io)?.ok_or_else(|| io::Error::other("no such change"))?;
     let files = repo.change_files(id).map_err(to_io)?;
     let parent = c.parents.first().copied();
+
+    // `--ast`: only bother spawning node if the change touches a non-deleted `.ts`/`.tsx` file.
+    let want_ast = ast_script.is_some()
+        && files.iter().any(|f| f.kind != ChangeKind::Deleted && is_ts(&f.path));
+    let scratch = if want_ast { make_scratch_dir() } else { None };
+    let mut sidecar = match (&scratch, &ast_script) {
+        (Some(_), Some(s)) => Sidecar::spawn(s).ok(),
+        _ => None,
+    };
+    if want_ast && (scratch.is_none() || sidecar.is_none()) {
+        eprintln!("keel: --ast: resolver sidecar unavailable — using the heuristic");
+    }
+
     let mut added: Vec<AddedLine> = Vec::new();
     let (mut nfiles, mut binary) = (0usize, 0usize);
     for f in &files {
@@ -3108,7 +3170,19 @@ fn change_added_lines(repo: &Repo, id: ObjectId) -> io::Result<(Vec<AddedLine>, 
             continue;
         }
         nfiles += 1;
-        added.extend(added_lines_from(&f.path, &old, &new, None));
+        // AST symbols for a committed `.ts`/`.tsx` blob: write it to a FLAT temp file (a generated
+        // `sN.<ext>`, so a crafted tree path can never escape the scratch dir) and query the sidecar.
+        let syms = match (scratch.as_ref(), sidecar.as_mut()) {
+            (Some(dir), Some(sc)) if is_ts(&f.path) && !new.is_empty() => {
+                // Preserve a `.d.ts` suffix so the sidecar excludes declaration files exactly as the
+                // working-tree path does (consistency), instead of AST-parsing them as `.ts`.
+                let ext = if f.path.ends_with(".d.ts") { "d.ts" } else { f.path.rsplit('.').next().unwrap_or("ts") };
+                let name = format!("s{nfiles}.{ext}");
+                std::fs::write(dir.0.join(&name), &new).ok().and_then(|_| sc.symbols(&dir.0, &name).ok())
+            }
+            _ => None,
+        };
+        added.extend(added_lines_from(&f.path, &old, &new, syms.as_deref()));
     }
     Ok((added, nfiles, binary))
 }
@@ -3129,8 +3203,9 @@ fn walkthrough_semantic(
     model: Option<&str>,
     lesson: Option<&str>,
     json: bool,
+    ast_script: Option<PathBuf>,
 ) -> io::Result<()> {
-    let (added, nfiles, binary) = change_added_lines(repo, id)?;
+    let (added, nfiles, binary) = change_added_lines(repo, id, ast_script)?;
     let s = semantic_summarize(&added);
 
     if json {
