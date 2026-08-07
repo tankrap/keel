@@ -1,0 +1,4 @@
+# keel's local object store — like .git, it's regenerable working state, not source.
+# keel creates .keel/store in any repo where its commands run (dogfooding, CI, review runs),
+# so ignore it anywhere in the tree to keep stray stores out of commits.
+.keel/
