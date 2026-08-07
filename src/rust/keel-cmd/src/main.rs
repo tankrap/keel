@@ -1760,9 +1760,8 @@ fn cmd_review(args: &[String]) -> io::Result<()> {
     if has(args, "--semantic") {
         return review_semantic(args);
     }
-    let target = flag(args, "--target").and_then(ObjectId::from_hex).ok_or_else(|| {
-        fail_fix("missing or invalid --target", "pass the session/change id as 64 hex chars")
-    })?;
+    let raw_target = flag(args, "--target")
+        .ok_or_else(|| fail_fix("missing --target", "pass the session/change id (full hex or a unique prefix)"))?;
     let verdict = Verdict::from_name(flag(args, "--verdict").unwrap_or("comment"))
         .ok_or_else(|| fail_fix("invalid --verdict", "one of: approve, request-changes, reject, comment"))?;
     let reviewer = flag(args, "--reviewer").unwrap_or("agent").to_string();
@@ -1774,6 +1773,7 @@ fn cmd_review(args: &[String]) -> io::Result<()> {
 
     let (_, store) = root_store(args)?;
     let repo = Repo::open(&store).map_err(to_io)?;
+    let target = resolve_target(&repo, raw_target)?;
     let target_known = repo.store().has(&target).map_err(to_io)?;
     let review = Review { target, reviewer, by_human, verdict, summary, labels, findings };
     let id = repo.store().record_review(&review).map_err(to_io)?;
@@ -1884,7 +1884,8 @@ fn cmd_reviews(args: &[String]) -> io::Result<()> {
     let repo = Repo::open(&store).map_err(to_io)?;
     let mut reviews = repo.store().reviews().map_err(to_io)?;
 
-    if let Some(t) = flag(args, "--target").and_then(ObjectId::from_hex) {
+    if let Some(raw_t) = flag(args, "--target") {
+        let t = resolve_target(&repo, raw_t)?;
         reviews.retain(|(_, r)| r.target == t);
     }
     if let Some(l) = flag(args, "--label") {
@@ -2181,6 +2182,17 @@ fn resolve_object(repo: &Repo, raw: &str) -> io::Result<ObjectId> {
         0 => Err(io::Error::other(format!("no object matches {raw:?}"))),
         n => Err(fail_fix(format!("ambiguous id prefix {raw:?} — {n} objects match"), "use more characters")),
     }
+}
+
+/// Resolve a review `--target` id: a full 64-hex id is taken verbatim (a review may reference a
+/// target not yet present in this store — a forward reference, or one later pruned), while a shorter
+/// value is treated as a prefix that must resolve to an existing object. So `keel review`/`keel
+/// reviews --target <prefix>` work like `keel show`, without breaking the record-an-unknown-target case.
+fn resolve_target(repo: &Repo, raw: &str) -> io::Result<ObjectId> {
+    if let Some(id) = ObjectId::from_hex(raw) {
+        return Ok(id);
+    }
+    resolve_object(repo, raw)
 }
 
 /// `keel walkthrough <change> [--json] [--full]`
