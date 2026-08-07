@@ -131,7 +131,7 @@ An agent's change is often the same operation repeated across many files, and th
 keel walkthrough <change>
 
 # the operation view — bulk edits collapsed, unique changes and anomalies surfaced,
-# each naming the file · function it lives in
+# each naming the file (and the function, when keel can determine one)
 keel walkthrough <change> --semantic
 keel native diff --semantic                 # same, for your uncommitted work
 
@@ -147,7 +147,7 @@ keel show <finding>                         # read any object: finding, session,
 
 The "smuggled constant" case is concrete: a rename `render → scale` across fifteen call sites, one of which quietly changes `* 2` to `* 3`. A line diff buries it among fifteen near-identical additions; keel collapses the fourteen mechanical renames and surfaces the fifteenth as `literal 3 where 14/15 use 2`, naming the function it hides in. The same split works for string constants (a `"v3"` among `"v2"`). This is Level 0–1 of a [depth ladder](src/docs/semantic-depth-and-decentralization.md) that climbs toward AST- and dataflow-aware review.
 
-Because a review is itself a first-class object, questions git keeps in a spreadsheet become queries: every change approved without a human (`keel reviews --no-human`), every target two models disagreed on (`keel reviews --disagreements`), every change that smuggled a constant (`keel reviews --label anomaly`).
+Because a review is itself a first-class object, questions git keeps in a spreadsheet become queries: every change reviewed without a human in the loop (`keel reviews --no-human`), every target its reviewers disagreed on (`keel reviews --disagreements`), every change that smuggled a constant (`keel reviews --label anomaly`).
 
 ## Benchmark your own repo
 
