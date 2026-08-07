@@ -3017,13 +3017,14 @@ fn def_symbol(trimmed: &str) -> Option<String> {
 }
 
 /// Whether a language sidecar has a `symbols` op for this extension (so `--ast` can attribute it):
-/// TypeScript + JavaScript (resolve.mjs, allowJs) and Python (resolve-py.mjs). Go/C route through the
-/// [`Router`] but have no `symbols` op yet, so they're excluded here to avoid a doomed spawn (add them
-/// as those ops land). `.pyi` (a stub, like `.d.ts`) is excluded so it falls back to the heuristic.
+/// TypeScript + JavaScript (resolve.mjs, allowJs), Python (resolve-py.mjs), and Go (resolve-go.mjs).
+/// C routes through the [`Router`] but has no `symbols` op yet, so it's excluded here to avoid a doomed
+/// spawn (add it as that op lands). `.pyi` (a stub, like `.d.ts`) is excluded so it falls back to the
+/// heuristic.
 fn ast_supported(path: &str) -> bool {
     matches!(
         path.rsplit('.').next().map(str::to_ascii_lowercase).as_deref(),
-        Some("ts" | "tsx" | "mts" | "cts" | "js" | "jsx" | "mjs" | "cjs" | "py")
+        Some("ts" | "tsx" | "mts" | "cts" | "js" | "jsx" | "mjs" | "cjs" | "py" | "go")
     )
 }
 
@@ -3909,12 +3910,13 @@ mod tests {
 
     #[test]
     fn ast_supported_covers_languages_with_a_symbols_op() {
-        // TS + JS + Python (the languages whose sidecar has a `symbols` op)
-        for p in ["a.ts", "b.TSX", "src/c.ts", "d.mts", "e.cts", "f.js", "g.jsx", "h.mjs", "i.cjs", "j.py"] {
+        // TS + JS + Python + Go (the languages whose sidecar has a `symbols` op)
+        let ok = ["a.ts", "b.TSX", "src/c.ts", "d.mts", "e.cts", "f.js", "g.jsx", "h.mjs", "i.cjs", "j.py", "l.go", "srv.GO"];
+        for p in ok {
             assert!(ast_supported(p), "should be supported: {p}");
         }
-        // .pyi (stub, like .d.ts), and languages without a symbols op yet (go/c) or unrouted (rs)
-        for p in ["k.pyi", "l.go", "m.c", "n.rs", "Makefile", "noext"] {
+        // .pyi (stub, like .d.ts), languages without a symbols op yet (c) or unrouted (rs)
+        for p in ["k.pyi", "m.c", "n.rs", "Makefile", "noext"] {
             assert!(!ast_supported(p), "should NOT be supported: {p}");
         }
     }

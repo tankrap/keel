@@ -38,7 +38,7 @@ rl.on("line", (line) => {
   const id = req.id;
   try {
     if (req.op === "health") {
-      respond({ id, ok: true, result: { lang: "go", version: "0.1", treeSitter: !TS_ERR } });
+      respond({ id, ok: true, result: { lang: "go", version: "0.2", treeSitter: !TS_ERR } });
       return;
     }
     if (req.op === "imports") {
@@ -50,6 +50,8 @@ rl.on("line", (line) => {
       respond({ id, ok: true, result: { defs: doSlice(req.dir, req.file, req.symbol, req.depth ?? 2) } });
     } else if (req.op === "targets") {
       respond({ id, ok: true, result: { targets: discoverTargets(req.dir, req.limit ?? 20) } });
+    } else if (req.op === "symbols") {
+      respond({ id, ok: true, result: { symbols: collectSymbols(req.dir, req.file) } });
     } else {
       respond({ id, ok: false, error: `unknown op: ${req.op}` });
     }
@@ -306,4 +308,26 @@ function safeRead(p) {
   } catch {
     return null;
   }
+}
+
+// The top-level funcs, methods, and named types in `file` with 1-based inclusive line ranges —
+// AST-accurate symbol boundaries the semantic diff uses to name which symbol an added line lives in.
+// A method's name field is a `field_identifier` and a type's is a `type_identifier` (not the plain
+// `identifier` that `defName` insists on), so read the "name" field's text directly here. tree-sitter
+// positions are 0-based rows, so +1.
+function collectSymbols(dir, file) {
+  const src = safeRead(path.resolve(dir, file));
+  if (src == null) throw new Error(`file not found: ${file}`);
+  const tree = parser.parse(src);
+  const out = [];
+  const push = (n, kind) => {
+    const id = n.childForFieldName("name");
+    if (id && id.text) out.push({ name: id.text, kind, startLine: n.startPosition.row + 1, endLine: n.endPosition.row + 1 });
+  };
+  walk(tree.rootNode, (n) => {
+    if (n.type === "function_declaration") push(n, "function");
+    else if (n.type === "method_declaration") push(n, "method");
+    else if (n.type === "type_spec") push(n, "type"); // `type Foo struct/interface/... {…}`
+  });
+  return out;
 }

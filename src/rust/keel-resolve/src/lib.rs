@@ -888,6 +888,40 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    #[test]
+    fn go_sidecar_symbols_reports_funcs_methods_and_types() {
+        let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("sidecar/resolve-go.mjs");
+        let mut sc = match Sidecar::spawn(&script) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("skipping Go sidecar test: node not available ({e})");
+                return;
+            }
+        };
+        if sc.health().unwrap().get("treeSitter").and_then(|v| v.as_bool()) != Some(true) {
+            eprintln!("skipping Go sidecar test: tree-sitter-go not installed");
+            return;
+        }
+        let dir = tmp();
+        // a top-level func, a named type, and a method (whose name is a `field_identifier`, not the
+        // plain `identifier` — the case that would come back unnamed if read via the func's name filter)
+        let src = "package calc\n\ntype Ledger struct {\n\ttotal int\n}\n\nfunc Add(a int, b int) int {\n\treturn a + b\n}\n\nfunc (l *Ledger) Record(n int) {\n\tl.total += n\n}\n";
+        fs::write(dir.join("calc.go"), src).unwrap();
+        let syms = sc.symbols(&dir, "calc.go").unwrap();
+        let by = |name: &str| syms.iter().find(|s| s.name == name).cloned();
+        let ledger = by("Ledger").expect("named type");
+        assert_eq!(ledger.kind, "type");
+        assert_eq!((ledger.start_line, ledger.end_line), (3, 5));
+        let add = by("Add").expect("func");
+        assert_eq!(add.kind, "function");
+        assert_eq!((add.start_line, add.end_line), (7, 9));
+        let record = by("Record").expect("method name is a field_identifier, must still resolve");
+        assert_eq!(record.kind, "method");
+        assert_eq!((record.start_line, record.end_line), (11, 13));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     /// The Router routes a `symbols` query to the right language sidecar by extension — Python to
     /// resolve-py, TypeScript to resolve.mjs — spawning each lazily.
     #[test]
