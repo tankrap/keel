@@ -2292,6 +2292,20 @@ fn cmd_walkthrough(args: &[String]) -> io::Result<()> {
         out["lesson"] = json!(l);
     }
 
+    // Surface literal anomalies (smuggled constants) in the DEFAULT review too — a signal shown only
+    // behind `--semantic` is one most reviewers never see. Reuse the engine over the added lines.
+    let (added, _, _) = change_added_lines(&repo, id)?;
+    let sem = semantic_summarize(&added);
+    if sem.anomaly_count > 0 {
+        let anoms: Vec<Value> = sem
+            .groups
+            .iter()
+            .flat_map(|g| g.anomalies.iter())
+            .map(|a| json!({ "file": a.file, "symbol": a.symbol, "text": a.text, "reason": a.reason }))
+            .collect();
+        out["anomalies"] = json!(anoms);
+    }
+
     if has(args, "--json") {
         println!("{}", render_json(&out));
     } else {
@@ -2460,6 +2474,19 @@ fn render_walkthrough_human(v: &Value) -> String {
         "  proof: {} covered · {} untested · {} test file(s) changed",
         ps["covered"], ps["untested"], ps["tests_changed"]
     );
+    // Anomaly banner: the smuggled-constant signal, surfaced up front so it isn't missed in the
+    // block-by-block scroll. `keel walkthrough --semantic` shows the full operation view.
+    if let Some(anoms) = v["anomalies"].as_array().filter(|a| !a.is_empty()) {
+        let _ = writeln!(s, "  ⚠ {} literal anomaly(ies) — a value one site breaks from the rest:", anoms.len());
+        for a in anoms {
+            let file = a["file"].as_str().unwrap_or("");
+            let loc = match a["symbol"].as_str() {
+                Some(sym) => format!("{file} · {sym}"),
+                None => file.to_string(),
+            };
+            let _ = writeln!(s, "      {loc}: {}  — {}", a["text"].as_str().unwrap_or("").trim(), a["reason"].as_str().unwrap_or(""));
+        }
+    }
     let _ = writeln!(s);
     if let Some(blocks) = v["blocks"].as_array() {
         for (i, b) in blocks.iter().enumerate() {
@@ -3885,6 +3912,22 @@ mod tests {
     }
 
     #[test]
+    fn walkthrough_human_render_shows_the_anomaly_banner() {
+        let v = json!({
+            "change": "abc", "intent": "x", "author": "a", "timestamp": 0u64,
+            "verification": "green", "files": 1, "added_lines": 6, "deleted_lines": 0,
+            "proof_summary": {"verified": true, "covered": 0, "untested": 0, "tests_changed": 0},
+            "blocks": [],
+            "anomalies": [
+                {"file": "b.rs", "symbol": "fn compute", "text": "  y6 = new(i6, 7);", "reason": "literal 7 where 5/6 use 2"},
+            ],
+        });
+        let h = render_walkthrough_human(&v);
+        assert!(h.contains("⚠ 1 literal anomaly(ies)"), "banner header: {h}");
+        assert!(h.contains("b.rs · fn compute: y6 = new(i6, 7);  — literal 7 where 5/6 use 2"), "banner line: {h}");
+    }
+
+    #[test]
     fn full_render_interleaves_each_hunk_header_with_its_own_body() {
         // Two hunks: in --full the human render must pair header→body, not dump all headers then all
         // bodies (review finding — the latter is unreadable for multi-hunk files).
@@ -3954,6 +3997,8 @@ mod tests {
             }],
         });
         let h = render_walkthrough_human(&v);
+        // no "anomalies" key → no banner (default clean case)
+        assert!(!h.contains("literal anomaly"), "no banner when key absent: {h}");
         assert!(h.contains("walkthrough · ✓"), "verdict mark in header: {h}");
         assert!(h.contains("task:  make the client retry"));
         assert!(h.contains("proof: exercised by src/client_test.rs"), "proof link before diff: {h}");
