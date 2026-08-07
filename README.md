@@ -126,16 +126,18 @@ An agent's change is often the same operation repeated across many files, and th
 ```bash
 # a guided review of a committed change: block by block, each citing its proof
 # (a test file is its own evidence; a source file links to the tests changed with it;
-#  an untested block that never went green is flagged), with an up-front warning if a
-# constant was smuggled into an otherwise-mechanical edit
+#  an untested block that never went green is flagged), with an up-front warning when a
+# value or operator one site breaks from the rest — a smuggled constant, a flipped
+# `<=`→`<`, or a guard dropped at just one site
 keel walkthrough <change>
 
-# the operation view — bulk edits collapsed, unique changes and anomalies surfaced,
-# each naming the file (and the function, when keel can determine one)
+# the operation view — bulk edits collapsed, unique changes and anomalies surfaced
+# (added AND removed lines), each naming the file (and the function, when keel can tell)
 keel walkthrough <change> --semantic
 keel native diff --semantic                 # same, for your uncommitted work
 
-# audit history: which of the last N changes smuggled a constant?
+# audit history: which of the last N changes smuggled a constant, flipped an
+# operator, or dropped a guard?
 keel anomalies
 
 # record an automated review whose findings ARE the anomalies — a first-class,
@@ -145,9 +147,11 @@ keel reviews --label anomaly                # query across every recorded review
 keel show <finding>                         # read any object: finding, session, change, review
 ```
 
-The "smuggled constant" case is concrete: a rename `render → scale` across fifteen call sites, one of which quietly changes `* 2` to `* 3`. A line diff buries it among fifteen near-identical additions; keel collapses the fourteen mechanical renames and surfaces the fifteenth as `literal 3 where 14/15 use 2`, naming the function it hides in. The same split works for string constants (a `"v3"` among `"v2"`). This is Level 0–1 of a [depth ladder](src/docs/semantic-depth-and-decentralization.md) that climbs toward AST- and dataflow-aware review.
+The "smuggled constant" case is concrete: a rename `render → scale` across fifteen call sites, one of which quietly changes `* 2` to `* 3`. A line diff buries it among fifteen near-identical additions; keel collapses the fourteen mechanical renames and surfaces the fifteenth as `literal 3 where 14/15 use 2`, naming the function it hides in. The same machinery catches a **flipped operator** — one bound check that uses `<` where its siblings use `<=`, surfaced as `operator < where 15/16 use <=` — and string constants (a `"v3"` among `"v2"`). These are the one-character slips that invert meaning and that a reviewer skims past.
 
-Which function a change lives in is named by a fast, parser-free heuristic by default. Add `--ast` (to `keel walkthrough --semantic`, `keel native diff --semantic`, `keel review --semantic`, or `keel anomalies`) to attribute TypeScript changes by the TypeScript compiler's exact definition boundaries instead — so an arrow-const method or a nested function the heuristic can't name is named precisely. `--ast` needs the Node resolver sidecar; it degrades to the heuristic per file when that's unavailable, so the default path stays pure-Rust and dependency-free.
+And it runs on **both sides** of a change: keel masks *removed* lines too, so a guard **deleted** at one site among a bulk of similar deletions surfaces as a dropped-guard anomaly. The scariest, easiest-to-miss agent edit is a silently removed check — a line diff shows it as just another `-`. All of this appears up front in the default `keel walkthrough`, not only behind `--semantic`. This is Levels 0–1b of a [depth ladder](src/docs/semantic-depth-and-decentralization.md) whose AST rung (below) has since shipped and which climbs toward dataflow-aware review.
+
+Which function a change lives in is named by a fast, parser-free heuristic by default. Add `--ast` (to `keel walkthrough --semantic`, `keel native diff --semantic`, `keel review --semantic`, or `keel anomalies`) to attribute changes in **TypeScript, JavaScript, Python, and Go** by each language's real parser instead of indentation — the TypeScript compiler for TS/JS, tree-sitter for Python and Go — so an arrow-const method, a decorated `def`, or a nested function the heuristic can't name is named precisely. `--ast` needs the Node resolver sidecar; it degrades to the heuristic per file when that's unavailable, so the default path stays pure-Rust and dependency-free.
 
 Because a review is itself a first-class object, questions git keeps in a spreadsheet become queries: every change reviewed without a human in the loop (`keel reviews --no-human`), every target its reviewers disagreed on (`keel reviews --disagreements`), every change that smuggled a constant (`keel reviews --label anomaly`).
 
