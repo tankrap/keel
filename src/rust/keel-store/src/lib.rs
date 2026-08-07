@@ -37,7 +37,7 @@ pub use object::{
 pub use repo::{ChangeKind, PathChange, Repo};
 pub use shred::SecretState;
 pub use textdiff::{diff_lines, DiffLine, Hunk, Tag};
-pub use semdiff::{summarize as semantic_summarize, AddedLine, ChangeGroup, GroupKind, SemanticSummary};
+pub use semdiff::{summarize as semantic_summarize, AddedLine, Anomaly, ChangeGroup, GroupKind, SemanticSummary};
 pub use store::{Store, StoreError};
 pub use vfs::{Attr, DirEntry, NodeKind, Stats as VfsStats, Vfs};
 
