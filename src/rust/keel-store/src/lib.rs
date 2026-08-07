@@ -22,6 +22,7 @@ pub mod ignorerules;
 pub mod livestatus;
 pub mod object;
 pub mod repo;
+pub mod semdiff;
 pub mod sessiontag;
 pub mod shred;
 pub mod snapshot;
@@ -36,6 +37,7 @@ pub use object::{
 pub use repo::{ChangeKind, PathChange, Repo};
 pub use shred::SecretState;
 pub use textdiff::{diff_lines, DiffLine, Hunk, Tag};
+pub use semdiff::{summarize as semantic_summarize, ChangeGroup, GroupKind, SemanticSummary};
 pub use store::{Store, StoreError};
 pub use vfs::{Attr, DirEntry, NodeKind, Stats as VfsStats, Vfs};
 

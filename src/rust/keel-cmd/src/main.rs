@@ -8,8 +8,8 @@
 
 use keel_brief::BriefService;
 use keel_store::{
-    diff_lines, ChangeKind, NodeKind, Object, ObjectId, Repo, Review, Session, StoreError, Tag,
-    Verdict, Verification, Vfs,
+    diff_lines, semantic_summarize, ChangeGroup, ChangeKind, GroupKind, NodeKind, Object, ObjectId,
+    Repo, Review, Session, StoreError, Tag, Verdict, Verification, Vfs,
 };
 use serde_json::{json, Value};
 use std::io::{self, BufRead, Write};
@@ -148,7 +148,8 @@ fn print_usage() {
          \x20 keel size   [--json]                logical bytes / object counts\n\
          \x20 keel mirror-in <git-repo>  ·  keel mirror-out <dir>  ·  keel import/export\n\
          \x20 keel verify <change> --green|--red\n\
-         \x20 keel native <commit|status|log|diff>   keel's own store-backed operations\n\n\
+         \x20 keel native <commit|status|log|diff>   keel's own store-backed operations\n\
+         \x20 keel native diff --semantic            operation view: collapse bulk edits, surface anomalies\n\n\
          A running `keeld` for the repo answers briefs warm; otherwise runs in-process."
     );
 }
@@ -2448,6 +2449,11 @@ fn cmd_diff(args: &[String]) -> io::Result<()> {
         return Ok(());
     }
 
+    // `--semantic`: instead of raw hunks, collapse the mechanical bulk and surface what needs eyes.
+    if has(args, "--semantic") {
+        return semantic_diff(&repo, &root, head, &changes, has(args, "--json"));
+    }
+
     for c in &changes {
         // old = the file as of HEAD (absent → empty, e.g. an added file or no commits yet)
         let old = match head {
@@ -2460,6 +2466,102 @@ fn cmd_diff(args: &[String]) -> io::Result<()> {
             _ => std::fs::read(root.join(&c.path)).unwrap_or_default(),
         };
         print_file_diff(&c.path, c.kind, &old, &new);
+    }
+    Ok(())
+}
+
+/// `keel native diff --semantic [--file <p>] [--json]` — the operation view of a change: every added
+/// line is masked to a shape, same-shaped lines are collapsed as one mechanical edit, and a numeric
+/// literal that a bulk group overwhelmingly agrees on but one site breaks is surfaced as an anomaly
+/// (the class of bug a line diff buries). Deterministic, no model. See [`keel_store::semdiff`].
+fn semantic_diff(
+    repo: &Repo,
+    root: &Path,
+    head: Option<ObjectId>,
+    changes: &[keel_store::PathChange],
+    json: bool,
+) -> io::Result<()> {
+    let mut added: Vec<String> = Vec::new();
+    let (mut files, mut binary) = (0usize, 0usize);
+    for c in changes {
+        let old = match head {
+            Some(h) => repo.file_bytes_at(h, &c.path).map_err(to_io)?.unwrap_or_default(),
+            None => Vec::new(),
+        };
+        let new = match c.kind {
+            ChangeKind::Deleted => Vec::new(),
+            _ => std::fs::read(root.join(&c.path)).unwrap_or_default(),
+        };
+        if old.contains(&0) || new.contains(&0) {
+            binary += 1;
+            continue; // binary file — nothing to mask
+        }
+        files += 1;
+        let (o, n) = (String::from_utf8_lossy(&old), String::from_utf8_lossy(&new));
+        for h in diff_lines(&o, &n) {
+            for line in h.lines {
+                if line.tag == Tag::Add {
+                    added.push(line.text);
+                }
+            }
+        }
+    }
+    let s = semantic_summarize(&added);
+
+    if json {
+        let groups: Vec<Value> = s
+            .groups
+            .iter()
+            .map(|g| {
+                json!({
+                    "kind": if g.kind == GroupKind::Mechanical { "mechanical" } else { "substantive" },
+                    "shape": g.shape,
+                    "count": g.count(),
+                    "representative": g.representative(),
+                    "members": g.members,
+                    "anomalies": g.anomalies.iter().map(|a| json!({"text": a.text, "reason": a.reason})).collect::<Vec<_>>(),
+                })
+            })
+            .collect();
+        println!(
+            "{}",
+            render_json(&json!({
+                "ok": true, "files": files, "binary_files": binary,
+                "added_lines": s.added_lines, "substantive_lines": s.substantive_lines,
+                "mechanical_lines": s.mechanical_lines, "anomalies": s.anomaly_count,
+                "groups": groups,
+            }))
+        );
+        return Ok(());
+    }
+
+    let bin = if binary > 0 { format!(" ({binary} binary skipped)") } else { String::new() };
+    println!(
+        "semantic diff · {files} file(s){bin} · {} added line(s)",
+        s.added_lines
+    );
+    println!(
+        "  {} substantive · {} mechanical · {} anomaly(ies)",
+        s.substantive_lines, s.mechanical_lines, s.anomaly_count
+    );
+    let subst: Vec<&ChangeGroup> = s.groups.iter().filter(|g| g.kind == GroupKind::Substantive).collect();
+    let mech: Vec<&ChangeGroup> = s.groups.iter().filter(|g| g.kind == GroupKind::Mechanical).collect();
+    if !subst.is_empty() {
+        println!("\nsubstantive — unique changes to read:");
+        for g in subst {
+            for m in &g.members {
+                println!("  + {m}");
+            }
+        }
+    }
+    if !mech.is_empty() {
+        println!("\nmechanical — bulk edits, collapsed:");
+        for g in mech {
+            println!("  {}× `{}`   e.g. {}", g.count(), g.shape, g.representative());
+            for a in &g.anomalies {
+                println!("     ⚠ anomaly: {}  — {}", a.text, a.reason);
+            }
+        }
     }
     Ok(())
 }
