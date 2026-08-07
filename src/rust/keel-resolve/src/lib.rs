@@ -307,8 +307,10 @@ impl Sidecar {
 
     /// The definitions in `file` with their 1-based inclusive line ranges (AST-accurate, via the TS
     /// compiler). Nested defs are included, so the caller can pick the innermost range containing a
-    /// line. Errors if the sidecar has no TypeScript or the file isn't in its program — callers that
-    /// want a graceful fallback should treat an `Err` as "no symbol info for this file".
+    /// line — the intended lookup. Names are NOT unique (overload signatures repeat a name, each with
+    /// its own range), so resolve by range, not by a name-keyed map. Errors if the sidecar has no
+    /// TypeScript or the file isn't in its program — callers that want a graceful fallback should
+    /// treat an `Err` as "no symbol info for this file".
     pub fn symbols(&mut self, dir: &Path, file: &str) -> io::Result<Vec<SymbolRange>> {
         let r = self.call(json!({ "op": "symbols", "dir": dir.to_string_lossy(), "file": file }))?;
         if r.get("ok").and_then(Value::as_bool) == Some(true) {
@@ -724,6 +726,16 @@ mod tests {
 
         assert_eq!(by("Order").expect("class found").kind, "class");
         assert_eq!(by("total").expect("method found").kind, "method");
+
+        // broadened coverage (review): anonymous default, class expression, constructor
+        let src2 = "export default function () {\n  return 1;\n}\nconst Widget = class {\n  constructor() {}\n  render() {}\n};\n";
+        fs::write(dir.join("n.ts"), src2).unwrap();
+        let syms2 = sc.symbols(&dir, "n.ts").unwrap();
+        let by2 = |name: &str, kind: &str| syms2.iter().any(|s| s.name == name && s.kind == kind);
+        assert!(by2("default", "function"), "anonymous default export named 'default'; got {syms2:?}");
+        assert!(by2("Widget", "class"), "class expression assigned to const captured; got {syms2:?}");
+        assert!(by2("constructor", "constructor"), "constructor captured; got {syms2:?}");
+        assert!(by2("render", "method"), "method inside the class-expression captured; got {syms2:?}");
         let _ = fs::remove_dir_all(&dir);
     }
 

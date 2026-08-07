@@ -326,25 +326,31 @@ async function collectSymbols(dir, file) {
 
   const out = [];
   const nameOf = (n) => (n.name && ts.isIdentifier(n.name) ? n.name.text : null);
-  const push = (n, kind) => {
-    const name = nameOf(n);
+  // An anonymous `export default function/class` still needs a name for attribution — "default".
+  const isDefault = (n) => (n.modifiers || []).some((m) => m.kind === ts.SyntaxKind.DefaultKeyword);
+  const defName = (n) => nameOf(n) || (isDefault(n) ? "default" : null);
+  const push = (n, kind, name) => {
     if (!name) return;
     const start = sf.getLineAndCharacterOfPosition(n.getStart(sf)).line + 1;
     const end = sf.getLineAndCharacterOfPosition(n.getEnd()).line + 1;
     out.push({ name, kind, startLine: start, endLine: end });
   };
   const visit = (n) => {
-    if (ts.isFunctionDeclaration(n)) push(n, "function");
-    else if (ts.isMethodDeclaration(n)) push(n, "method");
-    else if (ts.isClassDeclaration(n)) push(n, "class");
-    else if (ts.isInterfaceDeclaration(n)) push(n, "interface");
-    else if (ts.isEnumDeclaration(n)) push(n, "enum");
-    else if (
-      (ts.isVariableDeclaration(n) || ts.isPropertyDeclaration(n)) &&
-      n.initializer &&
-      (ts.isArrowFunction(n.initializer) || ts.isFunctionExpression(n.initializer))
-    )
-      push(n, "function"); // `const f = () => {…}` / `const f = function () {…}`
+    if (ts.isFunctionDeclaration(n)) push(n, "function", defName(n));
+    else if (ts.isClassDeclaration(n)) push(n, "class", defName(n));
+    else if (ts.isMethodDeclaration(n)) push(n, "method", nameOf(n));
+    else if (ts.isConstructorDeclaration(n)) push(n, "constructor", "constructor");
+    else if (ts.isGetAccessorDeclaration(n)) push(n, "getter", nameOf(n));
+    else if (ts.isSetAccessorDeclaration(n)) push(n, "setter", nameOf(n));
+    else if (ts.isInterfaceDeclaration(n)) push(n, "interface", nameOf(n));
+    else if (ts.isEnumDeclaration(n)) push(n, "enum", nameOf(n));
+    else if (ts.isModuleDeclaration(n)) push(n, "namespace", nameOf(n));
+    else if ((ts.isVariableDeclaration(n) || ts.isPropertyDeclaration(n)) && n.initializer) {
+      const init = n.initializer;
+      if (ts.isArrowFunction(init) || ts.isFunctionExpression(init))
+        push(n, "function", nameOf(n)); // `const f = () => {…}` / `const f = function () {…}`
+      else if (ts.isClassExpression(init)) push(n, "class", nameOf(n)); // `const C = class {…}`
+    }
     ts.forEachChild(n, visit);
   };
   visit(sf);
