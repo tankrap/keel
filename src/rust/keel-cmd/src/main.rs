@@ -2870,10 +2870,17 @@ fn semantic_diff(
     json: bool,
     ast_script: Option<PathBuf>,
 ) -> io::Result<()> {
-    // `--ast`: spawn the TS resolver sidecar once; per TS/JS file we ask it for AST-accurate symbol
-    // ranges (falling back to the indentation heuristic per file if it's unavailable or errors).
-    let mut sidecar = ast_script.as_ref().and_then(|s| Sidecar::spawn(s).ok());
-    if ast_script.is_some() && sidecar.is_none() {
+    // `--ast`: spawn the TS resolver sidecar once — but only if the change actually touches a
+    // `.ts`/`.tsx` file (no point paying for node on a markdown-only diff). Per file we ask it for
+    // AST-accurate symbol ranges, falling back to the heuristic if it's unavailable or errors.
+    let want_ast = ast_script.is_some()
+        && changes.iter().any(|c| c.kind != ChangeKind::Deleted && is_ts(&c.path));
+    let mut sidecar = if want_ast {
+        ast_script.as_ref().and_then(|s| Sidecar::spawn(s).ok())
+    } else {
+        None
+    };
+    if want_ast && sidecar.is_none() {
         eprintln!("keel: --ast: resolver sidecar unavailable (node?) — using the heuristic");
     }
     let mut added: Vec<AddedLine> = Vec::new();
@@ -2892,7 +2899,8 @@ fn semantic_diff(
             continue; // binary file — nothing to mask
         }
         files += 1;
-        let syms = ast_symbols(sidecar.as_mut(), root, &c.path);
+        // Skip the sidecar round-trip when there's nothing to attribute (a deleted file → empty new).
+        let syms = if new.is_empty() { None } else { ast_symbols(sidecar.as_mut(), root, &c.path) };
         added.extend(added_lines_from(&c.path, &old, &new, syms.as_deref()));
     }
     let s = semantic_summarize(&added);
@@ -3014,20 +3022,20 @@ fn def_symbol(trimmed: &str) -> Option<String> {
     None
 }
 
-/// Whether the resolver sidecar (`resolve.mjs`, TypeScript) can parse this file for symbols.
-fn is_ts_js(path: &str) -> bool {
-    matches!(
-        path.rsplit('.').next().map(str::to_ascii_lowercase).as_deref(),
-        Some("ts" | "tsx" | "js" | "jsx" | "mjs" | "cjs" | "mts" | "cts")
-    )
+/// Whether the resolver sidecar (`resolve.mjs`) puts this file in its TypeScript program and can
+/// therefore report symbols for it. Only `.ts`/`.tsx` — the sidecar's file discovery collects exactly
+/// those, so claiming `.js`/`.mjs`/… here would just force a doomed round-trip that errors and falls
+/// back to the heuristic anyway. (Widening the sidecar to `allowJs` is a follow-up.)
+fn is_ts(path: &str) -> bool {
+    matches!(path.rsplit('.').next().map(str::to_ascii_lowercase).as_deref(), Some("ts" | "tsx"))
 }
 
 /// AST symbol ranges for `path` from the (already-spawned) sidecar — `Some` (possibly empty, meaning
-/// "parsed, no enclosing defs") for a TS/JS file the sidecar could read, `None` to signal "fall back
-/// to the heuristic" (no sidecar, non-TS file, or a sidecar error).
+/// "parsed, no enclosing defs") for a `.ts`/`.tsx` file the sidecar could read, `None` to signal "fall
+/// back to the heuristic" (no sidecar, non-TS file, or a sidecar error).
 fn ast_symbols(sidecar: Option<&mut Sidecar>, root: &Path, path: &str) -> Option<Vec<SymbolRange>> {
     let sc = sidecar?;
-    if !is_ts_js(path) {
+    if !is_ts(path) {
         return None;
     }
     sc.symbols(root, path).ok()
@@ -3830,12 +3838,13 @@ mod tests {
     }
 
     #[test]
-    fn is_ts_js_matches_the_supported_extensions() {
-        for p in ["a.ts", "b.TSX", "c/d.mjs", "e.jsx", "f.cts"] {
-            assert!(is_ts_js(p), "should be TS/JS: {p}");
+    fn is_ts_matches_only_what_the_sidecar_parses() {
+        for p in ["a.ts", "b.TSX", "src/c.ts"] {
+            assert!(is_ts(p), "should be TS: {p}");
         }
-        for p in ["a.rs", "b.py", "c.go", "Makefile", "noext"] {
-            assert!(!is_ts_js(p), "should NOT be TS/JS: {p}");
+        // .js/.mjs/.mts etc. are NOT parsed by the sidecar's file discovery → not claimed here
+        for p in ["a.js", "b.mjs", "c.cts", "d.jsx", "e.rs", "f.py", "noext"] {
+            assert!(!is_ts(p), "should NOT be claimed (sidecar can't attribute): {p}");
         }
     }
 
