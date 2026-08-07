@@ -9,8 +9,9 @@
 use keel_brief::BriefService;
 use keel_resolve::{Router, SymbolRange};
 use keel_store::{
-    diff_lines, semantic_summarize, AddedLine, ChangeGroup, ChangeKind, GroupKind, NodeKind, Object,
-    ObjectId, Repo, Review, SemanticSummary, Session, StoreError, Tag, Verdict, Verification, Vfs,
+    diff_lines, semantic_summarize, AddedLine, Anomaly, ChangeGroup, ChangeKind, GroupKind, NodeKind,
+    Object, ObjectId, Repo, Review, SemanticSummary, Session, StoreError, Tag, Verdict, Verification,
+    Vfs,
 };
 use serde_json::{json, Value};
 use std::io::{self, BufRead, Write};
@@ -1811,18 +1812,25 @@ fn review_semantic(args: &[String]) -> io::Result<()> {
     let (added, nfiles, binary) = change_added_lines(&repo, id, ast_script)?;
     let s = semantic_summarize(&added);
 
-    // Each anomaly becomes a finding blob (the write-up), referenced by the Review.
+    // Each anomaly becomes a finding blob (the write-up), referenced by the Review. Literal anomalies
+    // are tagged with their bulk group's shape; operator anomalies (which span shape groups) with
+    // `[operator]`.
     let mut findings: Vec<ObjectId> = Vec::new();
+    let anomaly_finding = |repo: &Repo, tag: &str, a: &Anomaly| -> io::Result<ObjectId> {
+        let loc = match &a.symbol {
+            Some(s) => format!("{} · {s}", a.file),
+            None => a.file.clone(),
+        };
+        let text = format!("semantic anomaly [{tag}]\n  where:  {loc}\n  site:   {}\n  reason: {}\n", a.text, a.reason);
+        repo.store().put(&Object::Blob(text.into_bytes())).map_err(to_io)
+    };
     for g in &s.groups {
         for a in &g.anomalies {
-            let loc = match &a.symbol {
-                Some(s) => format!("{} · {s}", a.file),
-                None => a.file.clone(),
-            };
-            let text = format!("semantic anomaly [{}]\n  where:  {}\n  site:   {}\n  reason: {}\n", g.shape, loc, a.text, a.reason);
-            let fid = repo.store().put(&Object::Blob(text.into_bytes())).map_err(to_io)?;
-            findings.push(fid);
+            findings.push(anomaly_finding(&repo, &g.shape, a)?);
         }
+    }
+    for a in &s.operator_anomalies {
+        findings.push(anomaly_finding(&repo, "operator", a)?);
     }
     let mut labels = flag_all(args, "--label");
     if !labels.iter().any(|l| l == "semantic") {
@@ -1858,14 +1866,12 @@ fn review_semantic(args: &[String]) -> io::Result<()> {
     } else {
         println!("recorded semantic review {} of {}", short(&rid.to_hex()), short(&id.to_hex()));
         println!("  {summary}");
-        for g in &s.groups {
-            for a in &g.anomalies {
-                let loc = match &a.symbol {
-                    Some(s) => format!("{} · {s}", a.file),
-                    None => a.file.clone(),
-                };
-                println!("  ⚠ {loc}: {}  — {}", a.text, a.reason);
-            }
+        for a in s.all_anomalies() {
+            let loc = match &a.symbol {
+                Some(s) => format!("{} · {s}", a.file),
+                None => a.file.clone(),
+            };
+            println!("  ⚠ {loc}: {}  — {}", a.text, a.reason);
         }
         if binary > 0 {
             println!("  ({binary} binary file(s) skipped)");
@@ -2106,9 +2112,7 @@ fn cmd_anomalies(args: &[String]) -> io::Result<()> {
         }
         total += s.anomaly_count;
         let sites: Vec<Value> = s
-            .groups
-            .iter()
-            .flat_map(|g| g.anomalies.iter())
+            .all_anomalies()
             .map(|a| json!({ "file": a.file, "symbol": a.symbol, "text": a.text, "reason": a.reason }))
             .collect();
         flagged.push(json!({ "change": id.to_hex(), "intent": c.intent, "anomalies": s.anomaly_count, "sites": sites }));
@@ -2312,15 +2316,13 @@ fn cmd_walkthrough(args: &[String]) -> io::Result<()> {
         out["lesson"] = json!(l);
     }
 
-    // Surface literal anomalies (smuggled constants) in the DEFAULT review too — a signal shown only
-    // behind `--semantic` is one most reviewers never see. Runs over the lines gathered above (no
-    // extra file reads).
+    // Surface anomalies (smuggled constants AND flipped operators) in the DEFAULT review too — a signal
+    // shown only behind `--semantic` is one most reviewers never see. Runs over the lines gathered above
+    // (no extra file reads).
     let sem = semantic_summarize(&wt_added);
     if sem.anomaly_count > 0 {
         let anoms: Vec<Value> = sem
-            .groups
-            .iter()
-            .flat_map(|g| g.anomalies.iter())
+            .all_anomalies()
             .map(|a| json!({ "file": a.file, "symbol": a.symbol, "text": a.text, "reason": a.reason }))
             .collect();
         out["anomalies"] = json!(anoms);
@@ -2497,7 +2499,7 @@ fn render_walkthrough_human(v: &Value) -> String {
     // Anomaly banner: the smuggled-constant signal, surfaced up front so it isn't missed in the
     // block-by-block scroll. `keel walkthrough --semantic` shows the full operation view.
     if let Some(anoms) = v["anomalies"].as_array().filter(|a| !a.is_empty()) {
-        let _ = writeln!(s, "  ⚠ {} literal anomaly(ies) — a value one site breaks from the rest:", anoms.len());
+        let _ = writeln!(s, "  ⚠ {} anomaly(ies) — a value or operator one site breaks from the rest:", anoms.len());
         for a in anoms {
             let file = a["file"].as_str().unwrap_or("");
             let loc = match a["symbol"].as_str() {
@@ -2907,6 +2909,9 @@ fn semantic_diff(
                 "added_lines": s.added_lines, "substantive_lines": s.substantive_lines,
                 "mechanical_lines": s.mechanical_lines, "anomalies": s.anomaly_count,
                 "groups": semantic_groups_json(&s),
+                "operator_anomalies": s.operator_anomalies.iter()
+                    .map(|a| json!({"file": a.file, "symbol": a.symbol, "text": a.text, "reason": a.reason}))
+                    .collect::<Vec<_>>(),
             }))
         );
         return Ok(());
@@ -3280,6 +3285,14 @@ fn print_semantic_body(s: &SemanticSummary) {
             for a in &g.anomalies {
                 println!("     ⚠ anomaly in {}: {}  — {}", loc(&a.file, &a.symbol), a.text, a.reason);
             }
+        }
+    }
+    // Operator anomalies cut across the shape groups above (the flipped line is its own tiny shape), so
+    // they get their own section — a `<=`→`<`, `&&`→`||` one site broke from an overwhelming majority.
+    if !s.operator_anomalies.is_empty() {
+        println!("\noperator anomalies — a flipped operator one site breaks from the rest:");
+        for a in &s.operator_anomalies {
+            println!("  ⚠ {}: {}  — {}", loc(&a.file, &a.symbol), a.text, a.reason);
         }
     }
 }
@@ -4087,7 +4100,7 @@ mod tests {
             ],
         });
         let h = render_walkthrough_human(&v);
-        assert!(h.contains("⚠ 1 literal anomaly(ies)"), "banner header: {h}");
+        assert!(h.contains("⚠ 1 anomaly(ies)"), "banner header: {h}");
         assert!(h.contains("b.rs · fn compute: y6 = new(i6, 7);  — literal 7 where 5/6 use 2"), "banner line: {h}");
     }
 

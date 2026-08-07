@@ -13,6 +13,14 @@
 //!   concrete numeric literals and surface a *minority* value at a position an overwhelming majority
 //!   agrees on — so the smuggled constant goes from HIDDEN to SURFACED, while a uniformly-varying
 //!   position (`i = 0`, `1`, … `19` across 20 sites) stays compressed with no false anomaly.
+//! - **Level 1b — operator-anomaly split.** The Level-0 mask keeps operators *verbatim*, so a flipped
+//!   comparison lands in a different shape group and hides in plain sight (9 sites `if (i <= n)`, one
+//!   `if (i < n)`). A second, *operator-agnostic* mask collapses the flip-prone operators (comparison,
+//!   logical, arithmetic, bitwise, compound-assign) to a placeholder so those lines regroup; within a
+//!   group we recover each site's operator vector and surface a *minority* operator the same 80%-
+//!   supermajority way — the `<=`→`<`, `&&`→`||`, `+`→`-` smuggled into a bulk edit. Structural tokens
+//!   (a bare `=`, a `=>`/`->`/`<-` digraph, brackets) stay verbatim, so assignments never regroup with
+//!   comparisons and genuinely-varied operators (no 80% agreement) never fire.
 //!
 //! The unit is the **added line** (the new state a reviewer scrutinizes). Deeper levels (AST,
 //! dataflow, cross-file) are roadmapped and need the hosted, memoized graph.
@@ -97,10 +105,25 @@ static EMPTY_LINE: AddedLine = AddedLine { file: String::new(), text: String::ne
 #[derive(Clone, PartialEq, Eq, Debug, Default)]
 pub struct SemanticSummary {
     pub groups: Vec<ChangeGroup>,
+    /// Operator-anomaly sites (Level 1b) — a minority flipped operator (`<=`→`<`, `&&`→`||`) within an
+    /// operator-agnostic group. Kept separate from the per-group literal anomalies because such a group
+    /// spans several Level-0 shape groups (the flipped line is its own tiny shape), so it has no single
+    /// home group.
+    pub operator_anomalies: Vec<Anomaly>,
     pub added_lines: usize,
     pub mechanical_lines: usize,
     pub substantive_lines: usize,
+    /// Total anomalies surfaced: per-group literal anomalies plus [`Self::operator_anomalies`].
     pub anomaly_count: usize,
+}
+
+impl SemanticSummary {
+    /// Every anomaly surfaced by the diff — the per-group literal anomalies followed by the
+    /// operator anomalies — for callers that render or record them uniformly (all four fields of an
+    /// [`Anomaly`] stand alone; only the review-finding write-up distinguishes the two by label).
+    pub fn all_anomalies(&self) -> impl Iterator<Item = &Anomaly> {
+        self.groups.iter().flat_map(|g| g.anomalies.iter()).chain(self.operator_anomalies.iter())
+    }
 }
 
 /// Mask a line to its structural shape: identifiers → `_`, numbers → `#`, string literals → `""`,
@@ -134,48 +157,72 @@ pub fn numeric_literals(line: &str) -> Vec<String> {
     mask_and_literals(line).1.into_iter().filter(|l| !l.is_string).map(|l| l.value).collect()
 }
 
-/// Single pass producing both the shape and the literal vector (numbers and string bodies, in order).
-fn mask_and_literals(line: &str) -> (String, Vec<Lit>) {
+/// One lexical token of a line. The single source of truth for how a line is split — both masks
+/// ([`mask_and_literals`] and [`mask_and_operators`]) fold this same stream, so identifier / number /
+/// string / operator boundaries can never drift between the two.
+enum Tok {
+    Ident,       // identifier or keyword run
+    Num(String), // numeric literal (int / float / hex-ish), value carried
+    Str(String), // balanced double-quoted string, body carried
+    Op(String),  // maximal run of operator chars (`<=`, `&&`, `=>`, `+`, `->`, …)
+    Punct(char), // any other single non-space char (`(`, `,`, `;`, `.`, `:`, …)
+    Space,       // a run of whitespace (collapsed at fold time)
+}
+
+/// Characters that combine into a single operator token (a maximal run). `=` is included so `==` /
+/// `<=` / `+=` tokenize as one unit — but a bare `=` (assignment) is *structural*, not a flip (see
+/// [`is_flip_op`]). `.` is excluded (member access / the point in a float, handled by the number scan),
+/// as are `? : @ #` and brackets, so they stay verbatim and keep their shape-distinguishing role.
+fn is_op_char(c: char) -> bool {
+    matches!(c, '<' | '>' | '=' | '!' | '&' | '|' | '^' | '~' | '+' | '-' | '*' | '/' | '%')
+}
+
+/// Whether an operator token is *flip-prone* — the comparison / logical / arithmetic / bitwise /
+/// compound-assignment operators a one-character slip silently inverts. A run that isn't one of these
+/// (a bare `=`, a `=>` / `->` / `<-` digraph, a spaceship `<=>`) is structural: kept verbatim in the
+/// operator mask so it still distinguishes shapes but is never grouped-across or flagged.
+fn is_flip_op(s: &str) -> bool {
+    matches!(
+        s,
+        "==" | "!=" | "<" | "<=" | ">" | ">=" | "&&" | "||" | "!"
+            | "+" | "-" | "*" | "/" | "%"
+            | "&" | "|" | "^" | "~" | "<<" | ">>"
+            | "+=" | "-=" | "*=" | "/=" | "%=" | "&=" | "|=" | "^=" | "<<=" | ">>="
+    )
+}
+
+/// Split a line into [`Tok`]s. Mirrors the original single-pass masker exactly for identifiers,
+/// numbers (incl. leading-dot floats), and *balanced* double-quoted strings; additionally coalesces
+/// runs of operator chars into one [`Tok::Op`] (so `<=` is one token, not `<` then `=`).
+fn scan(line: &str) -> Vec<Tok> {
     let chars: Vec<char> = line.chars().collect();
     let mut i = 0;
-    let mut out = String::new();
-    let mut lits = Vec::new();
-    let mut pending_space = false; // collapse whitespace, emit lazily so we never leave a trailing one
+    let mut out = Vec::new();
     while i < chars.len() {
         let c = chars[i];
         if c.is_whitespace() {
-            pending_space = !out.is_empty();
-            i += 1;
-            continue;
-        }
-        if pending_space {
-            out.push(' ');
-            pending_space = false;
-        }
-        if c == '_' || c.is_alphabetic() {
-            // identifier / keyword → `_`
+            while i < chars.len() && chars[i].is_whitespace() {
+                i += 1;
+            }
+            out.push(Tok::Space);
+        } else if c == '_' || c.is_alphabetic() {
             while i < chars.len() && (chars[i] == '_' || chars[i].is_alphanumeric()) {
                 i += 1;
             }
-            out.push('_');
+            out.push(Tok::Ident);
         } else if c.is_ascii_digit() || (c == '.' && chars.get(i + 1).is_some_and(char::is_ascii_digit)) {
-            // numeric literal (int / float / hex-ish) → `#`, value recorded
             let start = i;
-            while i < chars.len()
-                && (chars[i].is_alphanumeric() || chars[i] == '.' || chars[i] == '_')
-            {
+            while i < chars.len() && (chars[i].is_alphanumeric() || chars[i] == '.' || chars[i] == '_') {
                 i += 1;
             }
-            lits.push(Lit { is_string: false, value: chars[start..i].iter().collect() });
-            out.push('#');
+            out.push(Tok::Num(chars[start..i].iter().collect()));
         } else if c == '"' && chars[i + 1..].contains(&'"') {
-            // A *balanced* double-quoted string → `""`, body skipped (honoring `\` escapes). The
-            // balance check matters: an UNbalanced `"` (a quote inside a comment, a mismatched
-            // delimiter) must NOT be treated as a string, or it would swallow the rest of the line and
-            // drop the numeric literals Level 1 depends on. Single quotes are never string delimiters
-            // here — in the languages keel targets a lone `'` is far more often a Rust lifetime
-            // (`&'a`), an apostrophe (`// don't`), or a char literal than the start of a string — so
-            // treating it as a plain char keeps `... = f(2)` vs `... = f(3)` literals intact.
+            // A *balanced* double-quoted string → body carried (honoring `\` escapes). The balance
+            // check matters: an UNbalanced `"` (a quote inside a comment, a mismatched delimiter) must
+            // NOT be treated as a string, or it would swallow the rest of the line and drop the literals
+            // Level 1 depends on. Single quotes are never string delimiters here — in the languages keel
+            // targets a lone `'` is far more often a Rust lifetime (`&'a`), an apostrophe (`// don't`),
+            // or a char literal than the start of a string, so it stays a plain char.
             i += 1;
             let start = i;
             while i < chars.len() && chars[i] != '"' {
@@ -184,18 +231,78 @@ fn mask_and_literals(line: &str) -> (String, Vec<Lit>) {
                 }
                 i += 1;
             }
-            // Capture the body (escapes verbatim, so comparison is exact) — a smuggled string constant
-            // is as much an anomaly as a smuggled number.
-            lits.push(Lit { is_string: true, value: chars[start..i.min(chars.len())].iter().collect() });
+            out.push(Tok::Str(chars[start..i.min(chars.len())].iter().collect()));
             i += 1; // closing quote
-            out.push('"');
-            out.push('"');
+        } else if is_op_char(c) {
+            let start = i;
+            while i < chars.len() && is_op_char(chars[i]) {
+                i += 1;
+            }
+            out.push(Tok::Op(chars[start..i].iter().collect()));
         } else {
-            out.push(c);
+            out.push(Tok::Punct(c));
             i += 1;
         }
     }
-    (out, lits)
+    out
+}
+
+/// Fold a token stream into a masked shape, optionally masking flip-operators. With `mask_ops = false`
+/// operators are kept verbatim — the Level-0 shape (identifiers → `_`, numbers → `#`, strings → `""`,
+/// whitespace collapsed). With `mask_ops = true` each *flip* operator becomes `∘` and is recorded in
+/// order (the Level-1b operator vector); structural operators still render verbatim. Returns the shape,
+/// the literal vector, and the operator vector (the latter empty unless `mask_ops`).
+fn render(toks: &[Tok], mask_ops: bool) -> (String, Vec<Lit>, Vec<String>) {
+    let mut out = String::new();
+    let mut lits = Vec::new();
+    let mut ops = Vec::new();
+    let mut pending_space = false; // collapse whitespace, emit lazily so we never leave a trailing one
+    for t in toks {
+        if matches!(t, Tok::Space) {
+            pending_space = !out.is_empty();
+            continue;
+        }
+        if pending_space {
+            out.push(' ');
+            pending_space = false;
+        }
+        match t {
+            Tok::Ident => out.push('_'),
+            Tok::Num(v) => {
+                lits.push(Lit { is_string: false, value: v.clone() });
+                out.push('#');
+            }
+            Tok::Str(v) => {
+                lits.push(Lit { is_string: true, value: v.clone() });
+                out.push_str("\"\"");
+            }
+            Tok::Op(s) => {
+                if mask_ops && is_flip_op(s) {
+                    ops.push(s.clone());
+                    out.push('∘');
+                } else {
+                    out.push_str(s);
+                }
+            }
+            Tok::Punct(c) => out.push(*c),
+            Tok::Space => unreachable!("handled above"),
+        }
+    }
+    (out, lits, ops)
+}
+
+/// Single pass producing both the Level-0 shape and the literal vector (numbers and string bodies).
+fn mask_and_literals(line: &str) -> (String, Vec<Lit>) {
+    let (shape, lits, _) = render(&scan(line), false);
+    (shape, lits)
+}
+
+/// The operator-agnostic shape (flip-operators → `∘`) and the operator vector recovered from it, in
+/// order. Two lines with the same op-shape have `∘`s at the same positions ⇒ equal-length, positionally
+/// aligned operator vectors — what [`detect_operator_anomalies`] compares.
+fn mask_and_operators(line: &str) -> (String, Vec<String>) {
+    let (shape, _, ops) = render(&scan(line), true);
+    (shape, ops)
 }
 
 /// Group the added lines of a diff into a [`SemanticSummary`].
@@ -238,8 +345,14 @@ pub fn summarize(added: &[AddedLine]) -> SemanticSummary {
         (GroupKind::Substantive, GroupKind::Substantive) => std::cmp::Ordering::Equal,
     });
 
+    // Level 1b runs over the whole added-line set on its own (operator-agnostic) grouping, which cuts
+    // across the Level-0 shape groups above.
+    let operator_anomalies = detect_operator_anomalies(added);
+    anomaly_count += operator_anomalies.len();
+
     SemanticSummary {
         groups,
+        operator_anomalies,
         added_lines: added.len(),
         mechanical_lines: mech_lines,
         substantive_lines: subst_lines,
@@ -310,6 +423,73 @@ fn detect_anomalies(sites: &[(AddedLine, Vec<Lit>)]) -> Vec<Anomaly> {
                 text: site.text.clone(),
                 reason: rs.join("; "),
             });
+        }
+    }
+    out
+}
+
+/// Level 1b: group added lines by *operator-agnostic* shape (flip-operators masked), then within each
+/// group of ≥ [`MECHANICAL_MIN`] flag a site whose operator at some position differs from one an
+/// overwhelming supermajority (≥ 80%, [`ANOMALY_SUPERMAJORITY_NUM`]) shares — the flipped `<`/`||`/`-`
+/// smuggled into a bulk edit. Lines with no flip-operators are ignored (nothing to compare); a group
+/// whose operators genuinely vary has no dominant value at any position and flags nothing. The 80%
+/// gate means a group needs ≥ 5 sites before any minority can be called anomalous, exactly as Level 1.
+fn detect_operator_anomalies(added: &[AddedLine]) -> Vec<Anomaly> {
+    // Group by op-shape, first-seen order preserved for stable output.
+    let mut order: Vec<String> = Vec::new();
+    let mut by_shape: BTreeMap<String, Vec<(&AddedLine, Vec<String>)>> = BTreeMap::new();
+    for line in added {
+        let (shape, ops) = mask_and_operators(&line.text);
+        if ops.is_empty() {
+            continue; // no flip-operators on this line ⇒ it can't carry an operator anomaly
+        }
+        if !by_shape.contains_key(&shape) {
+            order.push(shape.clone());
+        }
+        by_shape.entry(shape).or_default().push((line, ops));
+    }
+
+    let mut out = Vec::new();
+    for shape in &order {
+        let sites = &by_shape[shape];
+        let n = sites.len();
+        if n < MECHANICAL_MIN {
+            continue; // a one-off flip is a substantive line, not a bulk-edit outlier
+        }
+        // Same op-shape ⇒ same `∘` count ⇒ equal-length, positionally-aligned operator vectors.
+        let width = sites[0].1.len();
+        let mut reasons: Vec<Vec<String>> = vec![Vec::new(); n];
+        for p in 0..width {
+            let mut counts: BTreeMap<&str, usize> = BTreeMap::new();
+            for (_, ops) in sites {
+                *counts.entry(ops[p].as_str()).or_default() += 1;
+            }
+            let Some((mode, mode_count)) =
+                counts.iter().max_by_key(|(_, &c)| c).map(|(m, c)| (*m, *c))
+            else {
+                continue;
+            };
+            // Only an overwhelming supermajority makes a minority operator "anomalous"; genuinely
+            // varied operators (no dominant value) or a near-even split are expected, not smuggled.
+            if mode_count * ANOMALY_SUPERMAJORITY_DEN < n * ANOMALY_SUPERMAJORITY_NUM {
+                continue;
+            }
+            for (idx, (_, ops)) in sites.iter().enumerate() {
+                if ops[p] != mode {
+                    reasons[idx].push(format!("operator {} where {mode_count}/{n} use {mode}", ops[p]));
+                }
+            }
+        }
+        for (idx, rs) in reasons.into_iter().enumerate() {
+            if !rs.is_empty() {
+                let site = sites[idx].0;
+                out.push(Anomaly {
+                    file: site.file.clone(),
+                    symbol: site.symbol.clone(),
+                    text: site.text.clone(),
+                    reason: rs.join("; "),
+                });
+            }
         }
     }
     out
@@ -487,5 +667,118 @@ mod tests {
         let s = summarize(&al(added));
         assert_eq!(s.groups[0].kind, GroupKind::Mechanical);
         assert_eq!(s.groups[0].anomalies.len(), 0);
+    }
+
+    #[test]
+    fn operator_mask_records_flip_operators_and_keeps_structural_ones() {
+        // flip operators (comparison here) → `∘`, recorded in order; identifiers/numbers masked as usual
+        assert_eq!(mask_and_operators("if (i <= n) {"), ("_ (_ ∘ _) {".to_string(), vec!["<=".to_string()]));
+        assert_eq!(
+            mask_and_operators("x = a + b * c"),
+            // bare `=` is structural (kept), `+` and `*` are flips
+            ("_ = _ ∘ _ ∘ _".to_string(), vec!["+".to_string(), "*".to_string()])
+        );
+        // structural digraphs stay verbatim and record NO operator (so they never regroup/flag)
+        assert_eq!(mask_and_operators("a => b").1, Vec::<String>::new());
+        assert_eq!(mask_and_operators("f() -> T").1, Vec::<String>::new());
+        assert_eq!(mask_and_operators("ch <- v").1, Vec::<String>::new());
+        assert_eq!(mask_and_operators("x = y").1, Vec::<String>::new());
+        // `==` is a flip (comparison), a bare `=` is not — so they mask to DIFFERENT shapes and an
+        // assignment can never regroup with a comparison
+        assert_ne!(mask_and_operators("a == b").0, mask_and_operators("a = b").0);
+    }
+
+    #[test]
+    fn level0_mask_is_unchanged_by_the_tokenizer_refactor() {
+        // the operator mask is opt-in; mask_shape (ops verbatim) must be byte-identical to before
+        assert_eq!(mask_shape("x >= 0 && y != 1.5"), "_ >= # && _ != #");
+        assert_eq!(mask_shape("a => b -> c"), "_ => _ -> _");
+        assert_eq!(mask_shape("p += q <<= r"), "_ += _ <<= _");
+    }
+
+    #[test]
+    fn operator_anomaly_surfaces_a_flipped_comparison() {
+        // 9 bound checks use `<=`, one smuggles a `<` — a different Level-0 shape, so it hides as a
+        // lone substantive line; the operator pass regroups them and surfaces it.
+        let mut added: Vec<String> = (0..9).map(|i| format!("if (i{i} <= n) break;")).collect();
+        added.push("if (iX < n) break;".to_string());
+        let s = summarize(&al(added));
+        assert_eq!(s.operator_anomalies.len(), 1, "exactly the flipped site");
+        assert_eq!(s.operator_anomalies[0].text, "if (iX < n) break;");
+        assert!(
+            s.operator_anomalies[0].reason.contains("operator < where 9/10 use <="),
+            "{}",
+            s.operator_anomalies[0].reason
+        );
+        assert_eq!(s.anomaly_count, 1, "operator anomaly counts toward the total");
+        // and it's reachable through the unified iterator the CLI uses
+        assert!(s.all_anomalies().any(|a| a.text == "if (iX < n) break;"));
+    }
+
+    #[test]
+    fn logical_operator_flip_is_surfaced() {
+        // a guard codemod: most sites AND two conditions, one botched to OR
+        let mut added: Vec<String> = (0..7).map(|i| format!("ok{i} = a{i} && b{i}")).collect();
+        added.push("okX = aX || bX".to_string());
+        let s = summarize(&al(added));
+        assert_eq!(s.operator_anomalies.len(), 1);
+        assert_eq!(s.operator_anomalies[0].text, "okX = aX || bX");
+        assert!(s.operator_anomalies[0].reason.contains("operator || where 7/8 use &&"));
+    }
+
+    #[test]
+    fn genuinely_varied_operators_are_not_flagged() {
+        // a comparison ladder where each site legitimately uses a different operator — no dominant
+        // value at the position, so nothing fires (the key false-positive guard)
+        let added = vec![
+            "r0 = a0 < b0".to_string(),
+            "r1 = a1 > b1".to_string(),
+            "r2 = a2 <= b2".to_string(),
+            "r3 = a3 >= b3".to_string(),
+            "r4 = a4 == b4".to_string(),
+            "r5 = a5 != b5".to_string(),
+        ];
+        let s = summarize(&al(added));
+        assert_eq!(s.operator_anomalies.len(), 0, "no 80% majority ⇒ no anomaly");
+        assert_eq!(s.anomaly_count, 0);
+    }
+
+    #[test]
+    fn near_even_operator_split_is_not_flagged() {
+        // 3-vs-2 at N=5 (60%) is ordinary variation, not a smuggled flip
+        let mut added: Vec<String> = (0..3).map(|i| format!("g{i} = x{i} + y{i}")).collect();
+        added.extend((0..2).map(|i| format!("h{i} = p{i} - q{i}")));
+        let s = summarize(&al(added));
+        assert_eq!(s.operator_anomalies.len(), 0, "60% is not an overwhelming majority");
+    }
+
+    #[test]
+    fn assignments_do_not_masquerade_as_operator_anomalies() {
+        // a block of plain assignments (bare `=`, structural) carries no flip-operator, so the pass
+        // ignores it entirely — an `=` is never mistaken for a flipped `==`
+        let added: Vec<String> = (0..6).map(|i| format!("field{i} = init{i}")).collect();
+        let s = summarize(&al(added));
+        assert_eq!(s.operator_anomalies.len(), 0);
+    }
+
+    #[test]
+    fn operator_anomaly_carries_file_and_symbol() {
+        // the flipped site lives in payments/tax.rs inside `fn compute` — the anomaly must say so
+        let mut added: Vec<AddedLine> = (0..8)
+            .map(|i| AddedLine {
+                file: "ui/row.rs".into(),
+                text: format!("keep{i} = lo{i} <= hi{i}"),
+                symbol: Some("fn render".into()),
+            })
+            .collect();
+        added.push(AddedLine {
+            file: "payments/tax.rs".into(),
+            text: "keepX = loX < hiX".into(),
+            symbol: Some("fn compute".into()),
+        });
+        let s = summarize(&added);
+        assert_eq!(s.operator_anomalies.len(), 1);
+        assert_eq!(s.operator_anomalies[0].file, "payments/tax.rs");
+        assert_eq!(s.operator_anomalies[0].symbol.as_deref(), Some("fn compute"));
     }
 }
