@@ -1809,12 +1809,16 @@ fn review_semantic(args: &[String]) -> io::Result<()> {
     let repo = Repo::open(&store).map_err(to_io)?;
     let id = resolve_change(&repo, raw)?;
     let ast_script = has(args, "--ast").then(|| sidecar_dir(args));
-    let (added, nfiles, binary) = change_added_lines(&repo, id, ast_script)?;
-    let s = semantic_summarize(&added);
+    let cl = change_semantic_lines(&repo, id, ast_script)?;
+    let (nfiles, binary) = (cl.files, cl.binary);
+    let s = semantic_summarize(&cl.added);
+    let rs = semantic_summarize(&cl.removed);
+    let total_anomalies = s.anomaly_count + rs.anomaly_count;
 
     // Each anomaly becomes a finding blob (the write-up), referenced by the Review. Literal anomalies
     // are tagged with their bulk group's shape; operator anomalies (which span shape groups) with
-    // `[operator]`.
+    // `[operator]`; anomalies on the deleted side get a `removed:` prefix so a dropped-guard finding
+    // reads distinctly from an added one.
     let mut findings: Vec<ObjectId> = Vec::new();
     let anomaly_finding = |repo: &Repo, tag: &str, a: &Anomaly| -> io::Result<ObjectId> {
         let loc = match &a.symbol {
@@ -1824,24 +1828,26 @@ fn review_semantic(args: &[String]) -> io::Result<()> {
         let text = format!("semantic anomaly [{tag}]\n  where:  {loc}\n  site:   {}\n  reason: {}\n", a.text, a.reason);
         repo.store().put(&Object::Blob(text.into_bytes())).map_err(to_io)
     };
-    for g in &s.groups {
-        for a in &g.anomalies {
-            findings.push(anomaly_finding(&repo, &g.shape, a)?);
+    for (sum, side) in [(&s, ""), (&rs, "removed:")] {
+        for g in &sum.groups {
+            for a in &g.anomalies {
+                findings.push(anomaly_finding(&repo, &format!("{side}{}", g.shape), a)?);
+            }
         }
-    }
-    for a in &s.operator_anomalies {
-        findings.push(anomaly_finding(&repo, "operator", a)?);
+        for a in &sum.operator_anomalies {
+            findings.push(anomaly_finding(&repo, &format!("{side}operator"), a)?);
+        }
     }
     let mut labels = flag_all(args, "--label");
     if !labels.iter().any(|l| l == "semantic") {
         labels.push("semantic".to_string());
     }
-    if s.anomaly_count > 0 && !labels.iter().any(|l| l == "anomaly") {
+    if total_anomalies > 0 && !labels.iter().any(|l| l == "anomaly") {
         labels.push("anomaly".to_string());
     }
     let summary = format!(
-        "semantic review: {} anomaly(ies), {} mechanical / {} substantive added line(s) across {} file(s)",
-        s.anomaly_count, s.mechanical_lines, s.substantive_lines, nfiles
+        "semantic review: {total_anomalies} anomaly(ies) ({} added / {} removed), {} mechanical / {} substantive added line(s) across {} file(s)",
+        s.anomaly_count, rs.anomaly_count, s.mechanical_lines, s.substantive_lines, nfiles
     );
     let review = Review {
         target: id,
@@ -1859,19 +1865,22 @@ fn review_semantic(args: &[String]) -> io::Result<()> {
             "{}",
             render_json(&json!({
                 "ok": true, "review": rid.to_hex(), "target": id.to_hex(), "verdict": verdict.name(),
-                "anomalies": s.anomaly_count, "findings": findings.iter().map(|f| f.to_hex()).collect::<Vec<_>>(),
+                "anomalies": total_anomalies, "added_anomalies": s.anomaly_count, "removed_anomalies": rs.anomaly_count,
+                "findings": findings.iter().map(|f| f.to_hex()).collect::<Vec<_>>(),
                 "labels": labels, "binary_files": binary, "summary": summary,
             }))
         );
     } else {
         println!("recorded semantic review {} of {}", short(&rid.to_hex()), short(&id.to_hex()));
         println!("  {summary}");
-        for a in s.all_anomalies() {
-            let loc = match &a.symbol {
-                Some(s) => format!("{} · {s}", a.file),
-                None => a.file.clone(),
-            };
-            println!("  ⚠ {loc}: {}  — {}", a.text, a.reason);
+        for (sum, mark) in [(&s, '+'), (&rs, '-')] {
+            for a in sum.all_anomalies() {
+                let loc = match &a.symbol {
+                    Some(s) => format!("{} · {s}", a.file),
+                    None => a.file.clone(),
+                };
+                println!("  ⚠ {mark} {loc}: {}  — {}", a.text, a.reason);
+            }
         }
         if binary > 0 {
             println!("  ({binary} binary file(s) skipped)");
@@ -2105,17 +2114,23 @@ fn cmd_anomalies(args: &[String]) -> io::Result<()> {
         let Some(c) = repo.change(id).map_err(to_io)? else { continue };
         scanned += 1;
         let ast_script = has(args, "--ast").then(|| sidecar_dir(args));
-        let (added, _n, _b) = change_added_lines(&repo, id, ast_script)?;
-        let s = semantic_summarize(&added);
-        if s.anomaly_count == 0 {
+        let cl = change_semantic_lines(&repo, id, ast_script)?;
+        let s = semantic_summarize(&cl.added);
+        let rs = semantic_summarize(&cl.removed);
+        let count = s.anomaly_count + rs.anomaly_count;
+        if count == 0 {
             continue;
         }
-        total += s.anomaly_count;
+        total += count;
+        // `side` distinguishes an added anomaly (`+`) from a dropped-guard one (`-`) in the audit.
         let sites: Vec<Value> = s
             .all_anomalies()
-            .map(|a| json!({ "file": a.file, "symbol": a.symbol, "text": a.text, "reason": a.reason }))
+            .map(|a| json!({ "side": "+", "file": a.file, "symbol": a.symbol, "text": a.text, "reason": a.reason }))
+            .chain(rs.all_anomalies().map(
+                |a| json!({ "side": "-", "file": a.file, "symbol": a.symbol, "text": a.text, "reason": a.reason }),
+            ))
             .collect();
-        flagged.push(json!({ "change": id.to_hex(), "intent": c.intent, "anomalies": s.anomaly_count, "sites": sites }));
+        flagged.push(json!({ "change": id.to_hex(), "intent": c.intent, "anomalies": count, "sites": sites }));
     }
 
     if json {
@@ -2880,6 +2895,7 @@ fn semantic_diff(
     // the indentation heuristic for unsupported languages or any sidecar error.
     let mut router = ast_dir.as_deref().map(Router::new);
     let mut added: Vec<AddedLine> = Vec::new();
+    let mut removed: Vec<AddedLine> = Vec::new();
     let (mut files, mut binary) = (0usize, 0usize);
     for c in changes {
         let old = match head {
@@ -2898,32 +2914,49 @@ fn semantic_diff(
         // Skip the sidecar round-trip when there's nothing to attribute (a deleted file → empty new).
         let syms = if new.is_empty() { None } else { ast_symbols(router.as_mut(), root, &c.path) };
         added.extend(added_lines_from(&c.path, &old, &new, syms.as_deref()));
+        removed.extend(removed_lines_from(&c.path, &old, &new, None));
     }
     let s = semantic_summarize(&added);
+    let rs = semantic_summarize(&removed);
 
     if json {
-        println!(
-            "{}",
-            render_json(&json!({
-                "ok": true, "files": files, "binary_files": binary,
-                "added_lines": s.added_lines, "substantive_lines": s.substantive_lines,
-                "mechanical_lines": s.mechanical_lines, "anomalies": s.anomaly_count,
-                "groups": semantic_groups_json(&s),
-                "operator_anomalies": s.operator_anomalies.iter()
+        let side = |sum: &SemanticSummary| {
+            json!({
+                "substantive_lines": sum.substantive_lines, "mechanical_lines": sum.mechanical_lines,
+                "anomalies": sum.anomaly_count, "groups": semantic_groups_json(sum),
+                "operator_anomalies": sum.operator_anomalies.iter()
                     .map(|a| json!({"file": a.file, "symbol": a.symbol, "text": a.text, "reason": a.reason}))
                     .collect::<Vec<_>>(),
-            }))
-        );
+            })
+        };
+        let mut top = side(&s);
+        top["ok"] = json!(true);
+        top["files"] = json!(files);
+        top["binary_files"] = json!(binary);
+        top["added_lines"] = json!(s.added_lines);
+        top["removed_lines"] = json!(rs.added_lines);
+        top["removed"] = side(&rs);
+        println!("{}", render_json(&top));
         return Ok(());
     }
 
     let bin = if binary > 0 { format!(" ({binary} binary skipped)") } else { String::new() };
-    println!("semantic diff · {files} file(s){bin} · {} added line(s)", s.added_lines);
     println!(
-        "  {} substantive · {} mechanical · {} anomaly(ies)",
+        "semantic diff · {files} file(s){bin} · {} added · {} removed line(s)",
+        s.added_lines, rs.added_lines
+    );
+    println!(
+        "  added:   {} substantive · {} mechanical · {} anomaly(ies)",
         s.substantive_lines, s.mechanical_lines, s.anomaly_count
     );
-    print_semantic_body(&s);
+    if rs.added_lines > 0 {
+        println!(
+            "  removed: {} substantive · {} mechanical · {} anomaly(ies)",
+            rs.substantive_lines, rs.mechanical_lines, rs.anomaly_count
+        );
+    }
+    print_semantic_body(&s, false);
+    print_semantic_body(&rs, true);
     Ok(())
 }
 
@@ -3087,6 +3120,38 @@ fn added_lines_from(path: &str, old: &[u8], new: &[u8], symbols: Option<&[Symbol
     out
 }
 
+/// The *removed* lines of one file's `old`→`new` diff, each tagged with the file and its enclosing
+/// symbol in the OLD file — symmetric to [`added_lines_from`]. The added side answers "what's the new
+/// state"; this answers "what did the change delete", which is where a silently-dropped guard, null
+/// check, or bounds check hides. `symbols` are the OLD file's ranges when available, else the
+/// indentation heuristic over the old text. Empty for a binary file.
+fn removed_lines_from(path: &str, old: &[u8], new: &[u8], symbols: Option<&[SymbolRange]>) -> Vec<AddedLine> {
+    if old.contains(&0) || new.contains(&0) {
+        return Vec::new();
+    }
+    let (o, n) = (String::from_utf8_lossy(old), String::from_utf8_lossy(new));
+    let old_lines: Vec<&str> = o.lines().collect();
+    let mut out = Vec::new();
+    for h in diff_lines(&o, &n) {
+        let mut oldpos = h.old_start; // 1-based old-file line of the next Context/Del line
+        for line in h.lines {
+            match line.tag {
+                Tag::Del => {
+                    let symbol = match symbols {
+                        Some(syms) => symbol_at_line(syms, oldpos as u32),
+                        None => enclosing_symbol(&old_lines, oldpos.saturating_sub(1)),
+                    };
+                    out.push(AddedLine { file: path.to_string(), text: line.text, symbol });
+                    oldpos += 1;
+                }
+                Tag::Context => oldpos += 1,
+                Tag::Add => {} // added line — the old file doesn't advance
+            }
+        }
+    }
+    out
+}
+
 /// A self-deleting temp directory (best-effort cleanup on drop). Used to materialize a committed
 /// change's new blobs so the resolver sidecar can parse them for AST symbols.
 struct ScratchDir(PathBuf);
@@ -3127,16 +3192,25 @@ fn make_scratch_dir() -> Option<ScratchDir> {
     None
 }
 
-/// The added lines of a committed change (vs its first parent), skipping binary files. Returns
-/// `(added_lines, non_binary_files, binary_files)`. Shared by the semantic walkthrough, review, and
-/// history audit. With `ast_dir` set (`--ast`), each supported file's NEW content is written to a
-/// flat, safe-named temp file and parsed by the language sidecar (via the [`Router`]) for AST-accurate
-/// symbol ranges; everything else falls back to the parser-free indentation heuristic.
-fn change_added_lines(
+/// The masked lines of a committed change, both sides: what it added and what it removed.
+struct ChangeLines {
+    added: Vec<AddedLine>,
+    removed: Vec<AddedLine>,
+    files: usize,
+    binary: usize,
+}
+
+/// The added and removed lines of a committed change (vs its first parent), skipping binary files.
+/// Shared by the semantic walkthrough, review, and history audit. With `ast_dir` set (`--ast`), each
+/// supported file's NEW content is written to a flat, safe-named temp file and parsed by the language
+/// sidecar (via the [`Router`]) for AST-accurate symbol ranges on the *added* side; everything else
+/// (and the whole *removed* side, whose symbols would need the old blob) falls back to the parser-free
+/// indentation heuristic.
+fn change_semantic_lines(
     repo: &Repo,
     id: ObjectId,
     ast_dir: Option<PathBuf>,
-) -> io::Result<(Vec<AddedLine>, usize, usize)> {
+) -> io::Result<ChangeLines> {
     let c = repo.change(id).map_err(to_io)?.ok_or_else(|| io::Error::other("no such change"))?;
     let files = repo.change_files(id).map_err(to_io)?;
     let parent = c.parents.first().copied();
@@ -3151,6 +3225,7 @@ fn change_added_lines(
     };
 
     let mut added: Vec<AddedLine> = Vec::new();
+    let mut removed: Vec<AddedLine> = Vec::new();
     let (mut nfiles, mut binary) = (0usize, 0usize);
     for f in &files {
         let old = match (parent, f.kind) {
@@ -3184,8 +3259,11 @@ fn change_added_lines(
             _ => None,
         };
         added.extend(added_lines_from(&f.path, &old, &new, syms.as_deref()));
+        // Removed side uses the heuristic (old-blob AST is a follow-up), so a deleted guard still names
+        // its enclosing symbol best-effort.
+        removed.extend(removed_lines_from(&f.path, &old, &new, None));
     }
-    Ok((added, nfiles, binary))
+    Ok(ChangeLines { added, removed, files: nfiles, binary })
 }
 
 /// `keel walkthrough <change> --semantic` — the operation view of a *committed* change (vs its
@@ -3206,16 +3284,26 @@ fn walkthrough_semantic(
     json: bool,
     ast_script: Option<PathBuf>,
 ) -> io::Result<()> {
-    let (added, nfiles, binary) = change_added_lines(repo, id, ast_script)?;
-    let s = semantic_summarize(&added);
+    let cl = change_semantic_lines(repo, id, ast_script)?;
+    let (nfiles, binary) = (cl.files, cl.binary);
+    let s = semantic_summarize(&cl.added);
+    let rs = semantic_summarize(&cl.removed);
 
     if json {
         let mut out = json!({
             "ok": true, "view": "semantic", "change": id.to_hex(), "intent": intent,
             "author": author, "timestamp": timestamp, "verification": verif,
             "files": nfiles, "binary_files": binary, "added_lines": s.added_lines,
+            "removed_lines": rs.added_lines,
             "substantive_lines": s.substantive_lines, "mechanical_lines": s.mechanical_lines,
             "anomalies": s.anomaly_count, "groups": semantic_groups_json(&s),
+            "removed": json!({
+                "substantive_lines": rs.substantive_lines, "mechanical_lines": rs.mechanical_lines,
+                "anomalies": rs.anomaly_count, "groups": semantic_groups_json(&rs),
+                "operator_anomalies": rs.operator_anomalies.iter()
+                    .map(|a| json!({"file": a.file, "symbol": a.symbol, "text": a.text, "reason": a.reason}))
+                    .collect::<Vec<_>>(),
+            }),
         });
         if let Some(t) = task {
             out["task"] = json!(t);
@@ -3248,10 +3336,11 @@ fn walkthrough_semantic(
     }
     let bin = if binary > 0 { format!(" ({binary} binary skipped)") } else { String::new() };
     println!(
-        "  scope: {nfiles} file(s){bin} · {} added · {} substantive · {} mechanical · {} anomaly(ies)",
-        s.added_lines, s.substantive_lines, s.mechanical_lines, s.anomaly_count
+        "  scope: {nfiles} file(s){bin} · {} added ({} anomaly) · {} removed ({} anomaly)",
+        s.added_lines, s.anomaly_count, rs.added_lines, rs.anomaly_count
     );
-    print_semantic_body(&s);
+    print_semantic_body(&s, false);
+    print_semantic_body(&rs, true);
     println!(
         "\n  → record a verdict: keel review --target {} --verdict <approve|request-changes|reject> [--human]",
         id.to_hex()
@@ -3260,25 +3349,31 @@ fn walkthrough_semantic(
 }
 
 /// Print the substantive/mechanical body of a semantic summary — unique lines to read, then bulk
-/// edits collapsed to a count + one representative, each anomaly flagged with its reason.
-fn print_semantic_body(s: &SemanticSummary) {
+/// edits collapsed to a count + one representative, each anomaly flagged with its reason. `removed`
+/// switches the wording and the `+`/`-` marker for the deleted side (same engine, mirror framing).
+fn print_semantic_body(s: &SemanticSummary, removed: bool) {
     let subst: Vec<&ChangeGroup> = s.groups.iter().filter(|g| g.kind == GroupKind::Substantive).collect();
     let mech: Vec<&ChangeGroup> = s.groups.iter().filter(|g| g.kind == GroupKind::Mechanical).collect();
+    let (mark, subst_head, mech_head) = if removed {
+        ('-', "\nremoved — unique lines deleted (check for a dropped guard or case):", "\nmechanical removals — bulk deletions, collapsed:")
+    } else {
+        ('+', "\nsubstantive — unique changes to read:", "\nmechanical — bulk edits, collapsed:")
+    };
     // "file" or "file · fn foo" when the enclosing symbol is known.
     let loc = |file: &str, symbol: &Option<String>| match symbol {
         Some(s) => format!("{file} · {s}"),
         None => file.to_string(),
     };
     if !subst.is_empty() {
-        println!("\nsubstantive — unique changes to read:");
+        println!("{subst_head}");
         for g in subst {
             for m in &g.members {
-                println!("  + {}: {}", loc(&m.file, &m.symbol), m.text);
+                println!("  {mark} {}: {}", loc(&m.file, &m.symbol), m.text);
             }
         }
     }
     if !mech.is_empty() {
-        println!("\nmechanical — bulk edits, collapsed:");
+        println!("{mech_head}");
         for g in mech {
             let rep = g.representative();
             println!("  {}× `{}`   e.g. {} ({})", g.count(), g.shape, rep.text, loc(&rep.file, &rep.symbol));
@@ -3907,6 +4002,28 @@ fn render_human(v: &Value) -> String {
 mod tests {
     use super::*;
     use keel_brief::{Brief, ContextDef, CoordConflict, Provenance, RelevantSession};
+
+    #[test]
+    fn removed_lines_from_captures_deletions_attributed_to_the_old_file() {
+        // a guard is deleted from inside a function: the removed side must surface that line, and (via
+        // AST symbols here) attribute it to the enclosing symbol so a dropped-guard finding names it.
+        let old = b"function check(x) {\n  if (x < 0) return false;\n  return run(x);\n}\n";
+        let new = b"function check(x) {\n  return run(x);\n}\n";
+        let syms = [SymbolRange { name: "check".into(), kind: "function".into(), start_line: 1, end_line: 4 }];
+        let removed = removed_lines_from("g.ts", old, new, Some(&syms));
+        assert_eq!(removed.len(), 1, "exactly the deleted guard");
+        assert_eq!(removed[0].text.trim(), "if (x < 0) return false;");
+        assert_eq!(removed[0].symbol.as_deref(), Some("function check"), "attributed to the old-file symbol");
+        assert_eq!(removed[0].file, "g.ts");
+
+        // a pure addition (nothing deleted) yields no removed lines; the added side is unaffected
+        let removed2 = removed_lines_from("g.ts", new, old, Some(&syms));
+        assert!(removed2.is_empty(), "an insertion has no removed lines");
+        assert_eq!(added_lines_from("g.ts", new, old, Some(&syms)).len(), 1, "…but one added line");
+
+        // binary content (NUL) is skipped on the removed side too
+        assert!(removed_lines_from("b.bin", b"a\x00b", b"c", None).is_empty());
+    }
 
     #[test]
     fn symbol_at_line_picks_the_innermost_range() {
