@@ -877,6 +877,14 @@ mod tests {
         assert_eq!(by("Order").expect("class").kind, "class");
         assert_eq!(by("total").expect("method").kind, "function"); // Python methods are `def`s
 
+        // a `@decorator` line above a def attributes to that def (the wider decorated range)
+        fs::write(dir.join("d.py"), "@app.route(\"/x\")\ndef handler():\n    return 1\n").unwrap();
+        let ds = sc.symbols(&dir, "d.py").unwrap();
+        assert!(
+            ds.iter().any(|s| s.name == "handler" && s.start_line == 1),
+            "decorator line 1 attributes to handler; got {ds:?}"
+        );
+
         let _ = fs::remove_dir_all(&dir);
     }
 

@@ -313,6 +313,19 @@ function collectSymbols(dir, file) {
   walk(tree.rootNode, (n) => {
     if (n.type === "function_definition") push(n, "function");
     else if (n.type === "class_definition") push(n, "class");
+    else if (n.type === "decorated_definition") {
+      // Also emit the decorated node's WIDER range (name/kind from the inner def) so a change to a
+      // `@decorator` line above a def attributes to that def, not just its enclosing scope. The inner
+      // def is still emitted above with its tighter range, so a body line resolves to it (innermost).
+      const inner = n.namedChildren.find(
+        (c) => c.type === "function_definition" || c.type === "class_definition"
+      );
+      if (inner) {
+        const name = defName(inner);
+        const kind = inner.type === "class_definition" ? "class" : "function";
+        if (name) out.push({ name, kind, startLine: n.startPosition.row + 1, endLine: n.endPosition.row + 1 });
+      }
+    }
   });
   return out;
 }
