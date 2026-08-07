@@ -1811,7 +1811,11 @@ fn review_semantic(args: &[String]) -> io::Result<()> {
     let mut findings: Vec<ObjectId> = Vec::new();
     for g in &s.groups {
         for a in &g.anomalies {
-            let text = format!("semantic anomaly [{}]\n  file:   {}\n  site:   {}\n  reason: {}\n", g.shape, a.file, a.text, a.reason);
+            let loc = match &a.symbol {
+                Some(s) => format!("{} · {s}", a.file),
+                None => a.file.clone(),
+            };
+            let text = format!("semantic anomaly [{}]\n  where:  {}\n  site:   {}\n  reason: {}\n", g.shape, loc, a.text, a.reason);
             let fid = repo.store().put(&Object::Blob(text.into_bytes())).map_err(to_io)?;
             findings.push(fid);
         }
@@ -1852,7 +1856,11 @@ fn review_semantic(args: &[String]) -> io::Result<()> {
         println!("  {summary}");
         for g in &s.groups {
             for a in &g.anomalies {
-                println!("  ⚠ {}: {}  — {}", a.file, a.text, a.reason);
+                let loc = match &a.symbol {
+                    Some(s) => format!("{} · {s}", a.file),
+                    None => a.file.clone(),
+                };
+                println!("  ⚠ {loc}: {}  — {}", a.text, a.reason);
             }
         }
         if binary > 0 {
@@ -2760,10 +2768,18 @@ fn semantic_diff(
         }
         files += 1;
         let (o, n) = (String::from_utf8_lossy(&old), String::from_utf8_lossy(&new));
+        let new_lines: Vec<&str> = n.lines().collect();
         for h in diff_lines(&o, &n) {
+            let mut newpos = h.new_start;
             for line in h.lines {
-                if line.tag == Tag::Add {
-                    added.push(AddedLine::new(c.path.clone(), line.text));
+                match line.tag {
+                    Tag::Add => {
+                        let symbol = enclosing_symbol(&new_lines, newpos.saturating_sub(1));
+                        added.push(AddedLine { file: c.path.clone(), text: line.text, symbol });
+                        newpos += 1;
+                    }
+                    Tag::Context => newpos += 1,
+                    Tag::Del => {}
                 }
             }
         }
@@ -2796,7 +2812,7 @@ fn semantic_diff(
 /// The JSON form of a semantic summary's groups (shared by `keel native diff --semantic` and
 /// `keel walkthrough --semantic`).
 fn semantic_groups_json(s: &SemanticSummary) -> Vec<Value> {
-    let line = |l: &AddedLine| json!({ "file": l.file, "text": l.text });
+    let line = |l: &AddedLine| json!({ "file": l.file, "symbol": l.symbol, "text": l.text });
     s.groups
         .iter()
         .map(|g| {
@@ -2806,10 +2822,85 @@ fn semantic_groups_json(s: &SemanticSummary) -> Vec<Value> {
                 "count": g.count(),
                 "representative": line(g.representative()),
                 "members": g.members.iter().map(line).collect::<Vec<_>>(),
-                "anomalies": g.anomalies.iter().map(|a| json!({"file": a.file, "text": a.text, "reason": a.reason})).collect::<Vec<_>>(),
+                "anomalies": g.anomalies.iter().map(|a| json!({"file": a.file, "symbol": a.symbol, "text": a.text, "reason": a.reason})).collect::<Vec<_>>(),
             })
         })
         .collect()
+}
+
+/// Best-effort enclosing definition for the added line at `idx` in the new file's `lines`: scan
+/// upward for the nearest def header indented *less* than the line — a container, not a sibling.
+/// Conservative — returns `None` when nothing clearly qualifies, so attribution is a hint, never a
+/// wrong guess. Language-agnostic and parser-free.
+fn enclosing_symbol(lines: &[&str], idx: usize) -> Option<String> {
+    let indent = |s: &str| s.len() - s.trim_start().len();
+    // The container boundary: the indent below which a line encloses the target. It descends as we
+    // ascend through control blocks, so we walk out to the def that actually holds the target.
+    let mut boundary = indent(lines.get(idx)?);
+    for j in (0..idx).rev() {
+        let line = lines[j];
+        let li = indent(line);
+        if li >= boundary {
+            continue; // a sibling or its body — not a container of the target
+        }
+        let t = line.trim_start();
+        if let Some(sym) = def_symbol(t) {
+            return Some(sym); // the enclosing definition
+        }
+        if is_control_opener(t) {
+            boundary = li; // a control block a def can hold — keep ascending toward that def
+            continue;
+        }
+        // A container we don't recognize as a def or control block (a top-level `static`/`const`
+        // array, a JS/config object literal, a multi-line call): the line is inside THAT, not the
+        // function above it — so return None rather than emit a confident wrong attribution.
+        return None;
+    }
+    None
+}
+
+/// Does this trimmed line open a control-flow / block construct that a definition can enclose? Such a
+/// block is transparent to symbol attribution (we ascend past it to the containing def); a leading
+/// keyword is matched as a whole word, and a leading `}` covers `} else {` / block continuations.
+fn is_control_opener(trimmed: &str) -> bool {
+    if trimmed.starts_with('}') {
+        return true;
+    }
+    const KW: &[&str] = &[
+        "if", "else", "elif", "for", "while", "loop", "match", "switch", "case", "do", "try",
+        "catch", "finally", "when", "unless", "begin", "with", "foreach",
+    ];
+    let first: String = trimmed.chars().take_while(|c| c.is_alphanumeric() || *c == '_').collect();
+    KW.contains(&first.as_str())
+}
+
+/// If `trimmed` (leading whitespace stripped) opens a definition, return `<keyword> <name>` (e.g.
+/// `fn compute_tax`, `class Order`), after stripping common leading modifiers. Keyword-driven on
+/// purpose: it won't match a bare `name(...) {` or `const f = () =>`, which would risk false
+/// positives — those fall back to file-only attribution.
+fn def_symbol(trimmed: &str) -> Option<String> {
+    const MODS: &[&str] = &[
+        "pub(crate) ", "pub ", "async ", "export ", "default ", "static ", "public ", "private ",
+        "protected ", "final ", "unsafe ", "const ", "abstract ",
+    ];
+    let mut s = trimmed;
+    while let Some(rest) = MODS.iter().find_map(|m| s.strip_prefix(m)) {
+        s = rest.trim_start();
+    }
+    const KWS: &[&str] = &[
+        "fn ", "function ", "def ", "func ", "class ", "struct ", "trait ", "impl ", "interface ",
+        "enum ", "mod ", "type ",
+    ];
+    for kw in KWS {
+        if let Some(rest) = s.strip_prefix(kw) {
+            let name: String =
+                rest.trim_start().chars().take_while(|c| c.is_alphanumeric() || *c == '_').collect();
+            if !name.is_empty() {
+                return Some(format!("{kw}{name}"));
+            }
+        }
+    }
+    None
 }
 
 /// The added lines of a committed change (vs its first parent), skipping binary files. Returns
@@ -2837,10 +2928,18 @@ fn change_added_lines(repo: &Repo, id: ObjectId) -> io::Result<(Vec<AddedLine>, 
         }
         nfiles += 1;
         let (o, n) = (String::from_utf8_lossy(&old), String::from_utf8_lossy(&new));
+        let new_lines: Vec<&str> = n.lines().collect();
         for h in diff_lines(&o, &n) {
+            let mut newpos = h.new_start; // 1-based new-file line of the next Context/Add line
             for line in h.lines {
-                if line.tag == Tag::Add {
-                    added.push(AddedLine::new(f.path.clone(), line.text));
+                match line.tag {
+                    Tag::Add => {
+                        let symbol = enclosing_symbol(&new_lines, newpos.saturating_sub(1));
+                        added.push(AddedLine { file: f.path.clone(), text: line.text, symbol });
+                        newpos += 1;
+                    }
+                    Tag::Context => newpos += 1,
+                    Tag::Del => {} // removed line — the new file doesn't advance
                 }
             }
         }
@@ -2923,11 +3022,16 @@ fn walkthrough_semantic(
 fn print_semantic_body(s: &SemanticSummary) {
     let subst: Vec<&ChangeGroup> = s.groups.iter().filter(|g| g.kind == GroupKind::Substantive).collect();
     let mech: Vec<&ChangeGroup> = s.groups.iter().filter(|g| g.kind == GroupKind::Mechanical).collect();
+    // "file" or "file · fn foo" when the enclosing symbol is known.
+    let loc = |file: &str, symbol: &Option<String>| match symbol {
+        Some(s) => format!("{file} · {s}"),
+        None => file.to_string(),
+    };
     if !subst.is_empty() {
         println!("\nsubstantive — unique changes to read:");
         for g in subst {
             for m in &g.members {
-                println!("  + {}: {}", m.file, m.text);
+                println!("  + {}: {}", loc(&m.file, &m.symbol), m.text);
             }
         }
     }
@@ -2935,9 +3039,9 @@ fn print_semantic_body(s: &SemanticSummary) {
         println!("\nmechanical — bulk edits, collapsed:");
         for g in mech {
             let rep = g.representative();
-            println!("  {}× `{}`   e.g. {} ({})", g.count(), g.shape, rep.text, rep.file);
+            println!("  {}× `{}`   e.g. {} ({})", g.count(), g.shape, rep.text, loc(&rep.file, &rep.symbol));
             for a in &g.anomalies {
-                println!("     ⚠ anomaly in {}: {}  — {}", a.file, a.text, a.reason);
+                println!("     ⚠ anomaly in {}: {}  — {}", loc(&a.file, &a.symbol), a.text, a.reason);
             }
         }
     }
@@ -3553,6 +3657,49 @@ fn render_human(v: &Value) -> String {
 mod tests {
     use super::*;
     use keel_brief::{Brief, ContextDef, CoordConflict, Provenance, RelevantSession};
+
+    #[test]
+    fn def_symbol_detects_defs_and_ignores_the_rest() {
+        assert_eq!(def_symbol("pub async fn compute_tax(x: u32) -> u32 {").as_deref(), Some("fn compute_tax"));
+        assert_eq!(def_symbol("def views(request):").as_deref(), Some("def views"));
+        assert_eq!(def_symbol("export class Order extends Base {").as_deref(), Some("class Order"));
+        assert_eq!(def_symbol("func (s *Server) Handle() {").as_deref(), None); // no name after `func ` (method receiver)
+        assert_eq!(def_symbol("if condition {"), None);
+        assert_eq!(def_symbol("const total = compute();"), None); // const stripped as modifier, no keyword follows
+        assert_eq!(def_symbol("x = scale(item, 2)"), None);
+    }
+
+    #[test]
+    fn enclosing_symbol_finds_the_container_not_a_sibling() {
+        let lines = vec![
+            "fn outer() {",       // 0
+            "    let a = 1;",     // 1
+            "    if a > 0 {",     // 2
+            "        b = f(3);",  // 3  ← target, indent 8
+            "    }",              // 4
+            "}",                  // 5
+            "fn other() {",       // 6
+            "    c = 2;",         // 7  ← target, indent 4
+        ];
+        assert_eq!(enclosing_symbol(&lines, 3).as_deref(), Some("fn outer")); // ascends THROUGH the `if`
+        assert_eq!(enclosing_symbol(&lines, 7).as_deref(), Some("fn other"));
+        assert_eq!(enclosing_symbol(&lines, 0), None); // a top-level def line has no enclosing symbol
+    }
+
+    #[test]
+    fn enclosing_symbol_bails_on_a_non_def_container_instead_of_guessing() {
+        // a line added inside a top-level data literal must NOT be blamed on the function above it
+        // (the review-found "confident wrong attribution" — now returns None, honoring the contract)
+        let lines = vec![
+            "fn beta() {",       // 0
+            "    x = 1;",        // 1
+            "}",                 // 2
+            "static TABLE = &[", // 3
+            "    100,",          // 4  ← target, inside the array, not fn beta
+            "];",                // 5
+        ];
+        assert_eq!(enclosing_symbol(&lines, 4), None);
+    }
 
     fn sample() -> Value {
         Brief {

@@ -29,17 +29,22 @@ pub enum GroupKind {
     Substantive,
 }
 
-/// One added line, tagged with the file it came from — the unit the engine works on, so an anomaly
-/// or a substantive change can name where it lives (essential once a change spans many files).
+/// One added line, tagged with where it came from — the file, and (best-effort) the enclosing symbol
+/// (`fn compute_tax`, `class Foo`). The unit the engine works on, so an anomaly or substantive change
+/// can name its location (essential once a change spans many files or long functions).
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct AddedLine {
     pub file: String,
     pub text: String,
+    /// The enclosing definition, if the caller could determine one (e.g. `fn compute_tax`). `None`
+    /// when top-level or undeterminable — never guessed, so it's a hint, never misleading.
+    pub symbol: Option<String>,
 }
 
 impl AddedLine {
+    /// A line with no symbol attribution (the caller sets `.symbol` directly when it has file context).
     pub fn new(file: impl Into<String>, text: impl Into<String>) -> Self {
-        AddedLine { file: file.into(), text: text.into() }
+        AddedLine { file: file.into(), text: text.into(), symbol: None }
     }
 }
 
@@ -48,6 +53,8 @@ impl AddedLine {
 pub struct Anomaly {
     /// The file the anomalous line is in.
     pub file: String,
+    /// The enclosing symbol, if known (carried from the anomalous line).
+    pub symbol: Option<String>,
     /// The added line text.
     pub text: String,
     /// Why it was flagged, e.g. `literal 3 where 15/16 use 2`.
@@ -83,7 +90,7 @@ impl ChangeGroup {
 }
 
 /// Fallback for `representative()` on the impossible empty-group case (a group always has ≥1 member).
-static EMPTY_LINE: AddedLine = AddedLine { file: String::new(), text: String::new() };
+static EMPTY_LINE: AddedLine = AddedLine { file: String::new(), text: String::new(), symbol: None };
 
 /// The whole added-line side of a diff, grouped. Substantive groups come first (they need review),
 /// then mechanical groups by descending size (the biggest bulk edits).
@@ -297,7 +304,12 @@ fn detect_anomalies(sites: &[(AddedLine, Vec<Lit>)]) -> Vec<Anomaly> {
     for (idx, rs) in reasons.into_iter().enumerate() {
         if !rs.is_empty() {
             let site = &sites[idx].0;
-            out.push(Anomaly { file: site.file.clone(), text: site.text.clone(), reason: rs.join("; ") });
+            out.push(Anomaly {
+                file: site.file.clone(),
+                symbol: site.symbol.clone(),
+                text: site.text.clone(),
+                reason: rs.join("; "),
+            });
         }
     }
     out
@@ -453,6 +465,18 @@ mod tests {
         // the representative (a normal site) carries its file too
         assert_eq!(g.representative().file, "ui/row.rs");
         assert!(g.members.iter().any(|m| m.file == "payments/tax.rs"));
+    }
+
+    #[test]
+    fn anomaly_carries_the_enclosing_symbol() {
+        // the smuggled site is inside `fn compute_tax`; the anomaly must carry that symbol
+        let mut added: Vec<AddedLine> = (0..8)
+            .map(|i| AddedLine { file: "t.rs".into(), text: format!("r{i} = scale(i{i}, 2)"), symbol: Some("fn render".into()) })
+            .collect();
+        added.push(AddedLine { file: "t.rs".into(), text: "rX = scale(iX, 3)".into(), symbol: Some("fn compute_tax".into()) });
+        let a = &summarize(&added).groups[0].anomalies[0];
+        assert_eq!(a.symbol.as_deref(), Some("fn compute_tax"));
+        assert_eq!(a.text, "rX = scale(iX, 3)");
     }
 
     #[test]
