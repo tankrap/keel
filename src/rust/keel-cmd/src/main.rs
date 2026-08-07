@@ -2834,16 +2834,44 @@ fn semantic_groups_json(s: &SemanticSummary) -> Vec<Value> {
 /// wrong guess. Language-agnostic and parser-free.
 fn enclosing_symbol(lines: &[&str], idx: usize) -> Option<String> {
     let indent = |s: &str| s.len() - s.trim_start().len();
-    let target_indent = indent(lines.get(idx)?);
+    // The container boundary: the indent below which a line encloses the target. It descends as we
+    // ascend through control blocks, so we walk out to the def that actually holds the target.
+    let mut boundary = indent(lines.get(idx)?);
     for j in (0..idx).rev() {
         let line = lines[j];
-        if indent(line) < target_indent {
-            if let Some(sym) = def_symbol(line.trim_start()) {
-                return Some(sym);
-            }
+        let li = indent(line);
+        if li >= boundary {
+            continue; // a sibling or its body — not a container of the target
         }
+        let t = line.trim_start();
+        if let Some(sym) = def_symbol(t) {
+            return Some(sym); // the enclosing definition
+        }
+        if is_control_opener(t) {
+            boundary = li; // a control block a def can hold — keep ascending toward that def
+            continue;
+        }
+        // A container we don't recognize as a def or control block (a top-level `static`/`const`
+        // array, a JS/config object literal, a multi-line call): the line is inside THAT, not the
+        // function above it — so return None rather than emit a confident wrong attribution.
+        return None;
     }
     None
+}
+
+/// Does this trimmed line open a control-flow / block construct that a definition can enclose? Such a
+/// block is transparent to symbol attribution (we ascend past it to the containing def); a leading
+/// keyword is matched as a whole word, and a leading `}` covers `} else {` / block continuations.
+fn is_control_opener(trimmed: &str) -> bool {
+    if trimmed.starts_with('}') {
+        return true;
+    }
+    const KW: &[&str] = &[
+        "if", "else", "elif", "for", "while", "loop", "match", "switch", "case", "do", "try",
+        "catch", "finally", "when", "unless", "begin", "with", "foreach",
+    ];
+    let first: String = trimmed.chars().take_while(|c| c.is_alphanumeric() || *c == '_').collect();
+    KW.contains(&first.as_str())
 }
 
 /// If `trimmed` (leading whitespace stripped) opens a definition, return `<keyword> <name>` (e.g.
@@ -3653,9 +3681,24 @@ mod tests {
             "fn other() {",       // 6
             "    c = 2;",         // 7  ← target, indent 4
         ];
-        assert_eq!(enclosing_symbol(&lines, 3).as_deref(), Some("fn outer")); // skips the `if`, not `other`
+        assert_eq!(enclosing_symbol(&lines, 3).as_deref(), Some("fn outer")); // ascends THROUGH the `if`
         assert_eq!(enclosing_symbol(&lines, 7).as_deref(), Some("fn other"));
         assert_eq!(enclosing_symbol(&lines, 0), None); // a top-level def line has no enclosing symbol
+    }
+
+    #[test]
+    fn enclosing_symbol_bails_on_a_non_def_container_instead_of_guessing() {
+        // a line added inside a top-level data literal must NOT be blamed on the function above it
+        // (the review-found "confident wrong attribution" — now returns None, honoring the contract)
+        let lines = vec![
+            "fn beta() {",       // 0
+            "    x = 1;",        // 1
+            "}",                 // 2
+            "static TABLE = &[", // 3
+            "    100,",          // 4  ← target, inside the array, not fn beta
+            "];",                // 5
+        ];
+        assert_eq!(enclosing_symbol(&lines, 4), None);
     }
 
     fn sample() -> Value {
