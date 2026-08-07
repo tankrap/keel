@@ -119,6 +119,36 @@ keel is new, and git is not going anywhere for a lot of work.
 - git has twenty years of tooling and near-universal support.
 - For human-only work, where no agent ever reads the history, git is simpler, and you need none of the above.
 
+## Reviewing agent-written code
+
+An agent's change is often the same operation repeated across many files, and the one line that matters is easy to miss in a 3,000-line diff. keel reviews the *operation*, not the text, entirely deterministically — no second model in the loop.
+
+```bash
+# a guided review of a committed change: block by block, each citing its proof
+# (a test file is its own evidence; a source file links to the tests changed with it;
+#  an untested block that never went green is flagged), with an up-front warning if a
+# constant was smuggled into an otherwise-mechanical edit
+keel walkthrough <change>
+
+# the operation view — bulk edits collapsed, unique changes and anomalies surfaced,
+# each naming the file · function it lives in
+keel walkthrough <change> --semantic
+keel native diff --semantic                 # same, for your uncommitted work
+
+# audit history: which of the last N changes smuggled a constant?
+keel anomalies
+
+# record an automated review whose findings ARE the anomalies — a first-class,
+# queryable object, so a different model or a human can act on it later
+keel review --target <change> --semantic
+keel reviews --label anomaly                # query across every recorded review
+keel show <finding>                         # read any object: finding, session, change, review
+```
+
+The "smuggled constant" case is concrete: a rename `render → scale` across fifteen call sites, one of which quietly changes `* 2` to `* 3`. A line diff buries it among fifteen near-identical additions; keel collapses the fourteen mechanical renames and surfaces the fifteenth as `literal 3 where 14/15 use 2`, naming the function it hides in. The same split works for string constants (a `"v3"` among `"v2"`). This is Level 0–1 of a [depth ladder](src/docs/semantic-depth-and-decentralization.md) that climbs toward AST- and dataflow-aware review.
+
+Because a review is itself a first-class object, questions git keeps in a spreadsheet become queries: every change approved without a human (`keel reviews --no-human`), every target two models disagreed on (`keel reviews --disagreements`), every change that smuggled a constant (`keel reviews --label anomaly`).
+
 ## Benchmark your own repo
 
 The idea is to take rules your repo enforces, record each one, and measure whether retrieval makes an agent follow it.
