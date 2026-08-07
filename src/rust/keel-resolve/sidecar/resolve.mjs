@@ -32,7 +32,7 @@ rl.on("line", async (line) => {
   try {
     if (req.op === "health") {
       const ts = await ensureTs().catch(() => null);
-      respond({ id, ok: true, result: { lang: "ts", version: "0.2", ts: ts ? ts.version : null } });
+      respond({ id, ok: true, result: { lang: "ts", version: "0.3", ts: ts ? ts.version : null } });
     } else if (req.op === "imports") {
       respond({ id, ok: true, result: { targets: await resolveImports(req.dir, req.file) } });
     } else if (req.op === "slice") {
@@ -40,6 +40,8 @@ rl.on("line", async (line) => {
       respond({ id, ok: true, result: { defs } });
     } else if (req.op === "targets") {
       respond({ id, ok: true, result: { targets: await discoverTargets(req.dir, req.limit ?? 20) } });
+    } else if (req.op === "symbols") {
+      respond({ id, ok: true, result: { symbols: await collectSymbols(req.dir, req.file) } });
     } else {
       respond({ id, ok: false, error: `unknown op: ${req.op}` });
     }
@@ -308,6 +310,45 @@ function helpers(ts, checker, inRepo) {
     return [...out.values()];
   };
   return { isFuncLike, declName, declText, declFile, calleeDecls };
+}
+
+// The definitions in `file` with their 1-based line ranges — the AST-accurate symbol boundaries the
+// semantic diff uses to say which function an added line lives in. Nested defs are included, so a
+// caller can pick the innermost (smallest) range that contains a line. Function-like, class,
+// interface, enum, and method declarations with a name.
+async function collectSymbols(dir, file) {
+  const { ts, program } = await getProgram(dir);
+  const abs = path.resolve(dir, file);
+  const sf =
+    program.getSourceFile(abs) ||
+    program.getSourceFiles().find((s) => s.fileName === abs || s.fileName.endsWith("/" + file));
+  if (!sf) throw new Error(`file not in program: ${file}`);
+
+  const out = [];
+  const nameOf = (n) => (n.name && ts.isIdentifier(n.name) ? n.name.text : null);
+  const push = (n, kind) => {
+    const name = nameOf(n);
+    if (!name) return;
+    const start = sf.getLineAndCharacterOfPosition(n.getStart(sf)).line + 1;
+    const end = sf.getLineAndCharacterOfPosition(n.getEnd()).line + 1;
+    out.push({ name, kind, startLine: start, endLine: end });
+  };
+  const visit = (n) => {
+    if (ts.isFunctionDeclaration(n)) push(n, "function");
+    else if (ts.isMethodDeclaration(n)) push(n, "method");
+    else if (ts.isClassDeclaration(n)) push(n, "class");
+    else if (ts.isInterfaceDeclaration(n)) push(n, "interface");
+    else if (ts.isEnumDeclaration(n)) push(n, "enum");
+    else if (
+      (ts.isVariableDeclaration(n) || ts.isPropertyDeclaration(n)) &&
+      n.initializer &&
+      (ts.isArrowFunction(n.initializer) || ts.isFunctionExpression(n.initializer))
+    )
+      push(n, "function"); // `const f = () => {…}` / `const f = function () {…}`
+    ts.forEachChild(n, visit);
+  };
+  visit(sf);
+  return out;
 }
 
 async function doSlice(dir, file, symbol, depth, max = 40) {
