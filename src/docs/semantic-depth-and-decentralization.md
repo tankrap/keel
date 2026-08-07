@@ -18,7 +18,7 @@ function-definition symbols. That's ~60 lines — powerful, but shallow, and
 |---|---|---|---|
 | **0 — shipped** | lexical mask + frequency grouping | pure mechanical bulk (renames, scale edits, formatting) | — |
 | **1 — shipped** | literal-anomaly split + representative instance + richer symbols | mixed mechanical+substantive PRs; codemods with a smuggled constant | hidden-constant bugs (numbers were masked away); benign over-flagging; class/method/arrow/const symbols |
-| **1b — shipped** | operator-agnostic mask over the same groups | a flipped comparison/logical operator (`<=`→`<`, `&&`→`||`, dropped `!`) smuggled into a bulk edit — precision-tuned (arithmetic/bitwise excluded) | the inverted-condition / off-by-one *operator* slip |
+| **1b — shipped** | operator-agnostic mask over the same groups | a flipped comparison/logical operator (`<=`→`<`, `&&`→`||`) one site substitutes where its siblings agree — precision-tuned (arithmetic/bitwise excluded) | the inverted-condition / off-by-one *operator* slip |
 | **2 — shipped** | AST via language resolver sidecars (TS compiler; tree-sitter Python/Go) | accurate symbol/hunk boundaries the indentation heuristic misses (arrow-const methods, decorated defs, Go methods); multi-language | lexical mis-attribution; opt-in `--ast`, degrades to the heuristic |
 | **3** | dataflow / type-aware | logic bugs where *what flows where* changed: tax-on-wrong-base, swapped args, inverted conditions, bounds off-by-one | the "substantive but subtle" class, structurally |
 | **4** | cross-file symbol + dependency graph, fleet-memoized | ripple/impact ("sig change breaks N callers"), stale-cache/invalidation, cross-module TOCTOU | whole-repo context |
