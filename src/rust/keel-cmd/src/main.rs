@@ -8,8 +8,8 @@
 
 use keel_brief::BriefService;
 use keel_store::{
-    diff_lines, semantic_summarize, ChangeGroup, ChangeKind, GroupKind, NodeKind, Object, ObjectId,
-    Repo, Review, SemanticSummary, Session, StoreError, Tag, Verdict, Verification, Vfs,
+    diff_lines, semantic_summarize, AddedLine, ChangeGroup, ChangeKind, GroupKind, NodeKind, Object,
+    ObjectId, Repo, Review, SemanticSummary, Session, StoreError, Tag, Verdict, Verification, Vfs,
 };
 use serde_json::{json, Value};
 use std::io::{self, BufRead, Write};
@@ -1809,7 +1809,7 @@ fn review_semantic(args: &[String]) -> io::Result<()> {
     let mut findings: Vec<ObjectId> = Vec::new();
     for g in &s.groups {
         for a in &g.anomalies {
-            let text = format!("semantic anomaly [{}]\n  site:   {}\n  reason: {}\n", g.shape, a.text, a.reason);
+            let text = format!("semantic anomaly [{}]\n  file:   {}\n  site:   {}\n  reason: {}\n", g.shape, a.file, a.text, a.reason);
             let fid = repo.store().put(&Object::Blob(text.into_bytes())).map_err(to_io)?;
             findings.push(fid);
         }
@@ -1850,7 +1850,7 @@ fn review_semantic(args: &[String]) -> io::Result<()> {
         println!("  {summary}");
         for g in &s.groups {
             for a in &g.anomalies {
-                println!("  ⚠ {}  — {}", a.text, a.reason);
+                println!("  ⚠ {}: {}  — {}", a.file, a.text, a.reason);
             }
         }
         if binary > 0 {
@@ -2575,7 +2575,7 @@ fn semantic_diff(
     changes: &[keel_store::PathChange],
     json: bool,
 ) -> io::Result<()> {
-    let mut added: Vec<String> = Vec::new();
+    let mut added: Vec<AddedLine> = Vec::new();
     let (mut files, mut binary) = (0usize, 0usize);
     for c in changes {
         let old = match head {
@@ -2595,7 +2595,7 @@ fn semantic_diff(
         for h in diff_lines(&o, &n) {
             for line in h.lines {
                 if line.tag == Tag::Add {
-                    added.push(line.text);
+                    added.push(AddedLine::new(c.path.clone(), line.text));
                 }
             }
         }
@@ -2628,6 +2628,7 @@ fn semantic_diff(
 /// The JSON form of a semantic summary's groups (shared by `keel native diff --semantic` and
 /// `keel walkthrough --semantic`).
 fn semantic_groups_json(s: &SemanticSummary) -> Vec<Value> {
+    let line = |l: &AddedLine| json!({ "file": l.file, "text": l.text });
     s.groups
         .iter()
         .map(|g| {
@@ -2635,9 +2636,9 @@ fn semantic_groups_json(s: &SemanticSummary) -> Vec<Value> {
                 "kind": if g.kind == GroupKind::Mechanical { "mechanical" } else { "substantive" },
                 "shape": g.shape,
                 "count": g.count(),
-                "representative": g.representative(),
-                "members": g.members,
-                "anomalies": g.anomalies.iter().map(|a| json!({"text": a.text, "reason": a.reason})).collect::<Vec<_>>(),
+                "representative": line(g.representative()),
+                "members": g.members.iter().map(line).collect::<Vec<_>>(),
+                "anomalies": g.anomalies.iter().map(|a| json!({"file": a.file, "text": a.text, "reason": a.reason})).collect::<Vec<_>>(),
             })
         })
         .collect()
@@ -2646,11 +2647,11 @@ fn semantic_groups_json(s: &SemanticSummary) -> Vec<Value> {
 /// The added lines of a committed change (vs its first parent), skipping binary files. Returns
 /// `(added_lines, non_binary_files, binary_files)`. Shared by the semantic walkthrough and the
 /// semantic review — both want "what did this change add", masked and grouped downstream.
-fn change_added_lines(repo: &Repo, id: ObjectId) -> io::Result<(Vec<String>, usize, usize)> {
+fn change_added_lines(repo: &Repo, id: ObjectId) -> io::Result<(Vec<AddedLine>, usize, usize)> {
     let c = repo.change(id).map_err(to_io)?.ok_or_else(|| io::Error::other("no such change"))?;
     let files = repo.change_files(id).map_err(to_io)?;
     let parent = c.parents.first().copied();
-    let mut added: Vec<String> = Vec::new();
+    let mut added: Vec<AddedLine> = Vec::new();
     let (mut nfiles, mut binary) = (0usize, 0usize);
     for f in &files {
         let old = match (parent, f.kind) {
@@ -2671,7 +2672,7 @@ fn change_added_lines(repo: &Repo, id: ObjectId) -> io::Result<(Vec<String>, usi
         for h in diff_lines(&o, &n) {
             for line in h.lines {
                 if line.tag == Tag::Add {
-                    added.push(line.text);
+                    added.push(AddedLine::new(f.path.clone(), line.text));
                 }
             }
         }
@@ -2758,16 +2759,17 @@ fn print_semantic_body(s: &SemanticSummary) {
         println!("\nsubstantive — unique changes to read:");
         for g in subst {
             for m in &g.members {
-                println!("  + {m}");
+                println!("  + {}: {}", m.file, m.text);
             }
         }
     }
     if !mech.is_empty() {
         println!("\nmechanical — bulk edits, collapsed:");
         for g in mech {
-            println!("  {}× `{}`   e.g. {}", g.count(), g.shape, g.representative());
+            let rep = g.representative();
+            println!("  {}× `{}`   e.g. {} ({})", g.count(), g.shape, rep.text, rep.file);
             for a in &g.anomalies {
-                println!("     ⚠ anomaly: {}  — {}", a.text, a.reason);
+                println!("     ⚠ anomaly in {}: {}  — {}", a.file, a.text, a.reason);
             }
         }
     }

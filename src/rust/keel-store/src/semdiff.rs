@@ -29,9 +29,25 @@ pub enum GroupKind {
     Substantive,
 }
 
+/// One added line, tagged with the file it came from — the unit the engine works on, so an anomaly
+/// or a substantive change can name where it lives (essential once a change spans many files).
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct AddedLine {
+    pub file: String,
+    pub text: String,
+}
+
+impl AddedLine {
+    pub fn new(file: impl Into<String>, text: impl Into<String>) -> Self {
+        AddedLine { file: file.into(), text: text.into() }
+    }
+}
+
 /// One site whose literal vector is an outlier within its mechanical group.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Anomaly {
+    /// The file the anomalous line is in.
+    pub file: String,
     /// The added line text.
     pub text: String,
     /// Why it was flagged, e.g. `literal 3 where 15/16 use 2`.
@@ -43,8 +59,8 @@ pub struct Anomaly {
 pub struct ChangeGroup {
     pub shape: String,
     pub kind: GroupKind,
-    /// Every added-line text in this group, in first-seen order.
-    pub members: Vec<String>,
+    /// Every added line in this group (file + text), in first-seen order.
+    pub members: Vec<AddedLine>,
     /// Literal-anomaly sites (mechanical groups only).
     pub anomalies: Vec<Anomaly>,
 }
@@ -55,17 +71,19 @@ impl ChangeGroup {
     }
     /// A concrete example to show for a collapsed group — the first non-anomalous member if any
     /// (so the example reads as the "normal" case), else the first member.
-    pub fn representative(&self) -> &str {
-        let anomalous: std::collections::HashSet<&str> =
-            self.anomalies.iter().map(|a| a.text.as_str()).collect();
+    pub fn representative(&self) -> &AddedLine {
+        let anomalous: std::collections::HashSet<(&str, &str)> =
+            self.anomalies.iter().map(|a| (a.file.as_str(), a.text.as_str())).collect();
         self.members
             .iter()
-            .find(|m| !anomalous.contains(m.as_str()))
+            .find(|m| !anomalous.contains(&(m.file.as_str(), m.text.as_str())))
             .or_else(|| self.members.first())
-            .map(String::as_str)
-            .unwrap_or("")
+            .unwrap_or(&EMPTY_LINE)
     }
 }
+
+/// Fallback for `representative()` on the impossible empty-group case (a group always has ≥1 member).
+static EMPTY_LINE: AddedLine = AddedLine { file: String::new(), text: String::new() };
 
 /// The whole added-line side of a diff, grouped. Substantive groups come first (they need review),
 /// then mechanical groups by descending size (the biggest bulk edits).
@@ -174,12 +192,12 @@ fn mask_and_literals(line: &str) -> (String, Vec<Lit>) {
 }
 
 /// Group the added lines of a diff into a [`SemanticSummary`].
-pub fn summarize(added: &[String]) -> SemanticSummary {
+pub fn summarize(added: &[AddedLine]) -> SemanticSummary {
     // Preserve first-seen order of shapes for stable output.
     let mut order: Vec<String> = Vec::new();
-    let mut by_shape: BTreeMap<String, Vec<(String, Vec<Lit>)>> = BTreeMap::new();
+    let mut by_shape: BTreeMap<String, Vec<(AddedLine, Vec<Lit>)>> = BTreeMap::new();
     for line in added {
-        let (shape, lits) = mask_and_literals(line);
+        let (shape, lits) = mask_and_literals(&line.text);
         if !by_shape.contains_key(&shape) {
             order.push(shape.clone());
         }
@@ -191,7 +209,7 @@ pub fn summarize(added: &[String]) -> SemanticSummary {
     for shape in &order {
         let sites = &by_shape[shape];
         let kind = if sites.len() >= MECHANICAL_MIN { GroupKind::Mechanical } else { GroupKind::Substantive };
-        let members: Vec<String> = sites.iter().map(|(t, _)| t.clone()).collect();
+        let members: Vec<AddedLine> = sites.iter().map(|(l, _)| l.clone()).collect();
         let anomalies = if kind == GroupKind::Mechanical {
             detect_anomalies(sites)
         } else {
@@ -234,7 +252,7 @@ const ANOMALY_SUPERMAJORITY_DEN: usize = 5;
 /// [`ANOMALY_SUPERMAJORITY_NUM`]) of sites share. A position where values are spread out (uniform
 /// variation like `i = 0..19`) has no such dominant value and flags nothing, and neither does a
 /// near-even split.
-fn detect_anomalies(sites: &[(String, Vec<Lit>)]) -> Vec<Anomaly> {
+fn detect_anomalies(sites: &[(AddedLine, Vec<Lit>)]) -> Vec<Anomaly> {
     let n = sites.len();
     // All sites share a shape ⇒ the same sequence of `#`/`""` placeholders ⇒ equal-length literal
     // vectors with the same kind at each position.
@@ -278,7 +296,8 @@ fn detect_anomalies(sites: &[(String, Vec<Lit>)]) -> Vec<Anomaly> {
     let mut out = Vec::new();
     for (idx, rs) in reasons.into_iter().enumerate() {
         if !rs.is_empty() {
-            out.push(Anomaly { text: sites[idx].0.clone(), reason: rs.join("; ") });
+            let site = &sites[idx].0;
+            out.push(Anomaly { file: site.file.clone(), text: site.text.clone(), reason: rs.join("; ") });
         }
     }
     out
@@ -287,6 +306,11 @@ fn detect_anomalies(sites: &[(String, Vec<Lit>)]) -> Vec<Anomaly> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Wrap plain text lines as [`AddedLine`]s from a single dummy file (most tests don't care which).
+    fn al(texts: Vec<String>) -> Vec<AddedLine> {
+        texts.into_iter().map(|t| AddedLine::new("f.rs", t)).collect()
+    }
 
     #[test]
     fn mask_normalizes_identifiers_numbers_strings_and_whitespace() {
@@ -313,7 +337,7 @@ mod tests {
             "renderRow(c, 0)".to_string(),
             "let total = subtotal * taxRate + shipping".to_string(),
         ];
-        let s = summarize(&added);
+        let s = summarize(&al(added));
         assert_eq!(s.mechanical_lines, 3);
         assert_eq!(s.substantive_lines, 1);
         // substantive sorts first
@@ -327,7 +351,7 @@ mod tests {
         // 15 sites multiply by 2, one smuggles in a 3 — same shape, minority literal ⇒ SURFACED
         let mut added: Vec<String> = (0..15).map(|i| format!("out{i} = in{i} * 2")).collect();
         added.push("outX = inX * 3".to_string());
-        let s = summarize(&added);
+        let s = summarize(&al(added));
         assert_eq!(s.groups.len(), 1, "all one shape");
         let g = &s.groups[0];
         assert_eq!(g.kind, GroupKind::Mechanical);
@@ -335,7 +359,7 @@ mod tests {
         assert_eq!(g.anomalies[0].text, "outX = inX * 3");
         assert!(g.anomalies[0].reason.contains("literal 3 where 15/16 use 2"), "{}", g.anomalies[0].reason);
         // the representative is a normal (non-anomalous) site
-        assert!(g.representative().ends_with("* 2"));
+        assert!(g.representative().text.ends_with("* 2"));
     }
 
     #[test]
@@ -343,7 +367,7 @@ mod tests {
         // 20 loop headers whose only literal counts 0..19 — no majority value, so nothing is flagged
         let added: Vec<String> =
             (0..20).map(|i| format!("for (k = {i}; k < n; k++)")).collect();
-        let s = summarize(&added);
+        let s = summarize(&al(added));
         assert_eq!(s.groups.len(), 1);
         assert_eq!(s.groups[0].kind, GroupKind::Mechanical);
         assert_eq!(s.groups[0].anomalies.len(), 0, "uniform variation must not flag");
@@ -355,7 +379,7 @@ mod tests {
         // position 0 varies uniformly (index), position 1 is constant 8 except one 9 ⇒ only the 9 flags
         let mut added: Vec<String> = (0..10).map(|i| format!("buf[{i}] = read(8)")).collect();
         added.push("buf[99] = read(9)".to_string());
-        let s = summarize(&added);
+        let s = summarize(&al(added));
         let g = &s.groups[0];
         assert_eq!(g.anomalies.len(), 1);
         assert_eq!(g.anomalies[0].text, "buf[99] = read(9)");
@@ -368,7 +392,7 @@ mod tests {
         // smuggled-constant bug this feature targets, in the Rust codebase keel itself is.
         let mut added: Vec<String> = (0..8).map(|i| format!("let r{i}: &'a T = scale(2)")).collect();
         added.push("let rX: &'a T = scale(3)".to_string());
-        let s = summarize(&added);
+        let s = summarize(&al(added));
         assert_eq!(s.groups.len(), 1, "one shape despite the lifetime");
         assert_eq!(s.groups[0].anomalies.len(), 1, "smuggled 3 still surfaced");
         assert!(s.groups[0].anomalies[0].text.ends_with("scale(3)"));
@@ -387,7 +411,7 @@ mod tests {
         // now caught because string bodies are recovered too
         let mut added: Vec<String> = (0..15).map(|i| format!("cfg{i}.set(\"v2\")")).collect();
         added.push("cfgX.set(\"v3\")".to_string());
-        let s = summarize(&added);
+        let s = summarize(&al(added));
         assert_eq!(s.groups.len(), 1);
         assert_eq!(s.groups[0].anomalies.len(), 1);
         assert_eq!(s.groups[0].anomalies[0].text, "cfgX.set(\"v3\")");
@@ -399,7 +423,7 @@ mod tests {
         );
         // uniform string variation (each site a distinct label) must NOT flag
         let labels: Vec<String> = (0..20).map(|i| format!("register(\"evt{i}\")")).collect();
-        assert_eq!(summarize(&labels).groups[0].anomalies.len(), 0);
+        assert_eq!(summarize(&al(labels)).groups[0].anomalies.len(), 0);
     }
 
     #[test]
@@ -407,20 +431,36 @@ mod tests {
         // 3-vs-2 at N=5 (60%) is ordinary variation, not a smuggled outlier
         let mut added: Vec<String> = (0..3).map(|i| format!("a{i} = f(2)")).collect();
         added.extend((0..2).map(|i| format!("b{i} = f(7)")));
-        let s = summarize(&added);
+        let s = summarize(&al(added));
         assert_eq!(s.groups[0].kind, GroupKind::Mechanical);
         assert_eq!(s.groups[0].anomalies.len(), 0, "60% is not an overwhelming majority");
         // 2-vs-1 at the MECHANICAL_MIN floor (N=3, 67%) must not flag either
         let added2 = vec!["p = g(4)".to_string(), "q = g(4)".to_string(), "r = g(9)".to_string()];
-        assert_eq!(summarize(&added2).groups[0].anomalies.len(), 0);
+        assert_eq!(summarize(&al(added2)).groups[0].anomalies.len(), 0);
+    }
+
+    #[test]
+    fn anomalies_and_members_carry_their_file() {
+        // same shape across two files; the smuggled 3 lives in payments/tax.rs — the summary must say so
+        let mut added: Vec<AddedLine> =
+            (0..8).map(|i| AddedLine::new("ui/row.rs", format!("r{i} = scale(item{i}, 2)"))).collect();
+        added.push(AddedLine::new("payments/tax.rs", "rX = scale(itemX, 3)".to_string()));
+        let s = summarize(&added);
+        let g = &s.groups[0];
+        assert_eq!(g.anomalies.len(), 1);
+        assert_eq!(g.anomalies[0].file, "payments/tax.rs", "anomaly names its file");
+        assert_eq!(g.anomalies[0].text, "rX = scale(itemX, 3)");
+        // the representative (a normal site) carries its file too
+        assert_eq!(g.representative().file, "ui/row.rs");
+        assert!(g.members.iter().any(|m| m.file == "payments/tax.rs"));
     }
 
     #[test]
     fn empty_and_no_literal_groups_are_safe() {
-        assert_eq!(summarize(&[]).groups.len(), 0);
+        assert_eq!(summarize(&Vec::<AddedLine>::new()).groups.len(), 0);
         // a mechanical group with no numeric literals → no anomalies, no panic
         let added = vec!["a.b()".to_string(), "c.d()".to_string(), "e.f()".to_string()];
-        let s = summarize(&added);
+        let s = summarize(&al(added));
         assert_eq!(s.groups[0].kind, GroupKind::Mechanical);
         assert_eq!(s.groups[0].anomalies.len(), 0);
     }
