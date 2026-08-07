@@ -143,7 +143,10 @@ const services = new Map();
 
 function tsCompilerOptions(ts, dir) {
   const opts = {
-    allowJs: false,
+    // Include JavaScript so `symbols`/`slice` work on .js/.jsx/.mjs/.cjs too, not just TypeScript.
+    // (node_modules/dist/build are excluded by walkFiles, so this doesn't pull in dependencies.)
+    allowJs: true,
+    checkJs: false,
     noEmit: true,
     skipLibCheck: true,
     target: ts.ScriptTarget.ES2022,
@@ -242,7 +245,7 @@ function walkFiles(dir) {
       continue;
     const p = path.join(dir, e.name);
     if (e.isDirectory()) out.push(...walkFiles(p));
-    else if (/\.(ts|tsx)$/.test(e.name) && !e.name.endsWith(".d.ts")) out.push(p);
+    else if (/\.(ts|tsx|mts|cts|js|jsx|mjs|cjs)$/.test(e.name) && !e.name.endsWith(".d.ts")) out.push(p);
   }
   return out;
 }

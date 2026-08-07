@@ -736,6 +736,13 @@ mod tests {
         assert!(by2("Widget", "class"), "class expression assigned to const captured; got {syms2:?}");
         assert!(by2("constructor", "constructor"), "constructor captured; got {syms2:?}");
         assert!(by2("render", "method"), "method inside the class-expression captured; got {syms2:?}");
+
+        // JavaScript too (allowJs): a plain .js file reports its functions/classes with ranges
+        let js = "function jsHelper(a) {\n  return a + 1;\n}\nclass Store {\n  put(k) {}\n}\n";
+        fs::write(dir.join("m.js"), js).unwrap();
+        let jsy = sc.symbols(&dir, "m.js").unwrap();
+        assert!(jsy.iter().any(|s| s.name == "jsHelper" && s.kind == "function"), "JS fn; got {jsy:?}");
+        assert!(jsy.iter().any(|s| s.name == "put" && s.kind == "method"), "JS class method; got {jsy:?}");
         let _ = fs::remove_dir_all(&dir);
     }
 
