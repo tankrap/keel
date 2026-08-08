@@ -3262,12 +3262,15 @@ fn change_semantic_lines(
         let (mut syms, mut old_syms) = (None, None);
         if let (Some(dir), Some(r), true) = (scratch.as_ref(), router.as_mut(), ast_supported(&f.path)) {
             // Preserve a declaration-file suffix so the sidecar excludes it exactly as the working-tree
-            // path does (consistency), instead of AST-parsing it as plain `.ts`.
+            // path does (consistency), instead of AST-parsing it as plain `.ts`. Lowercased so an
+            // uppercase source extension (`Comp.TS`) becomes a temp name the sidecar's own
+            // (case-sensitive) language detection accepts — else it would reject the file entirely.
             let ext = [".d.ts", ".d.mts", ".d.cts"]
                 .iter()
                 .find(|s| f.path.ends_with(**s))
                 .map(|s| s.trim_start_matches('.'))
-                .unwrap_or_else(|| f.path.rsplit('.').next().unwrap_or("ts"));
+                .unwrap_or_else(|| f.path.rsplit('.').next().unwrap_or("ts"))
+                .to_ascii_lowercase();
             let mut ast_of = |bytes: &[u8], side: &str| -> Option<Vec<SymbolRange>> {
                 if bytes.is_empty() {
                     return None; // an absent side (added/deleted file) has no symbols to parse

@@ -385,9 +385,12 @@ impl Resolve for Sidecar {
     }
 }
 
-/// The language keel routes a path to, by extension.
+/// The language keel routes a path to, by extension. Case-insensitive so an uppercase extension
+/// (`Component.TS` on a case-insensitive filesystem) routes just like `ast_supported` accepts it —
+/// otherwise a file `ast_supported` calls supported would route to nothing, return `Ok([])`, and the
+/// empty-symbol result would silently *suppress* attribution (worse than falling back to the heuristic).
 fn lang_of(file: &str) -> Option<&'static str> {
-    match file.rsplit('.').next().unwrap_or("") {
+    match file.rsplit('.').next().unwrap_or("").to_ascii_lowercase().as_str() {
         "ts" | "tsx" | "js" | "jsx" | "mjs" | "cjs" | "mts" | "cts" => Some("ts"),
         "c" | "h" | "cc" | "cpp" | "cxx" | "hh" | "hpp" | "hxx" => Some("c"),
         "py" | "pyi" => Some("py"),
@@ -958,6 +961,22 @@ mod tests {
         // a language keel doesn't route (.rs) yields an empty vec, not an error
         assert_eq!(r.symbols(&dir, "x.rs").unwrap(), Vec::new());
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Routing is case-insensitive: an uppercase extension (`Foo.TS`, `x.PY`, common on
+    /// case-insensitive filesystems) routes to the same language as its lowercase form. Otherwise a
+    /// file `ast_supported` (which lowercases) accepts would route to nothing and its `Ok([])` empty
+    /// result would silently suppress symbol attribution rather than fall back to the heuristic.
+    #[test]
+    fn lang_of_is_case_insensitive() {
+        for (f, lang) in [
+            ("Foo.TS", "ts"), ("x.Tsx", "ts"), ("m.MJS", "ts"),
+            ("svc.GO", "go"), ("a.PY", "py"), ("mod.PYI", "py"), ("n.C", "c"), ("k.Hpp", "c"),
+        ] {
+            assert_eq!(lang_of(f), Some(lang), "{f} should route to {lang}");
+        }
+        assert_eq!(lang_of("README.MD"), None);
+        assert_eq!(lang_of("Makefile"), None);
     }
 
     /// A sidecar that reads but never answers must NOT hang the caller: `call` returns a
