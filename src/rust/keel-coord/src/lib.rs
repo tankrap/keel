@@ -41,9 +41,13 @@ pub enum Relation {
     Imports,
     /// The held file IMPORTS the target: the caller's change may break code someone else is editing.
     ImportedBy,
-    /// Not import-linked — just the same directory/module. The fallback signal when the graph has no
-    /// edge between the two (e.g. a brand-new file, or a language without a resolver sidecar).
-    /// Top-level files (no directory) are excluded: the repo root isn't a meaningful module.
+    /// Not import-linked, but the held file DEFINES a symbol the target also defines — a coupling the
+    /// import graph misses (parallel/duplicate definitions, re-export barrels, or same-namespace files
+    /// that don't import each other). The caller supplies this set (it has the resolver).
+    SharedSymbol,
+    /// Not import- or symbol-linked — just the same directory/module. The fallback signal when the
+    /// graph has no edge between the two (e.g. a brand-new file, or a language without a resolver
+    /// sidecar). Top-level files (no directory) are excluded: the repo root isn't a meaningful module.
     SameDir,
 }
 
@@ -53,6 +57,7 @@ impl Relation {
         match self {
             Relation::Imports => "imports",
             Relation::ImportedBy => "imported-by",
+            Relation::SharedSymbol => "shared-symbol",
             Relation::SameDir => "same-dir",
         }
     }
@@ -301,32 +306,40 @@ impl Coordinator {
     /// same directory. Exact-file collisions are excluded (`reserve`/`peek` already report those as
     /// hard conflicts). This is the "someone is already working on code your change touches — consider
     /// elsewhere" signal that lets a fleet self-spread; the import edges catch collisions the plain
-    /// same-directory heuristic misses (two agents in different folders editing import-linked files).
-    /// The caller supplies the adjacency (it already has the live graph); the coordinator stays a pure
-    /// registry. It is the single ordered authority, so this view is consistent by construction.
+    /// same-directory heuristic misses (two agents in different folders editing import-linked files),
+    /// and `shared_symbol` catches non-import coupling (files that define the same symbol — see
+    /// [`Relation::SharedSymbol`]). The caller supplies every adjacency set (it has the graph and the
+    /// resolver); the coordinator stays a pure registry, the single ordered authority, so this view is
+    /// consistent by construction. Precedence, most-specific first: Imports, ImportedBy, SharedSymbol,
+    /// SameDir.
     pub fn predict(
         &self,
         agent: &str,
         files: &[String],
         imports: &[String],
         imported_by: &[String],
+        shared_symbol: &[String],
     ) -> Vec<PredictedConflict> {
         let mut reg = self.inner.lock().unwrap();
         sweep(&mut reg, self.ttl);
         let want: HashSet<&str> = files.iter().map(String::as_str).collect();
         let imports: HashSet<&str> = imports.iter().map(String::as_str).collect();
         let imported_by: HashSet<&str> = imported_by.iter().map(String::as_str).collect();
+        let shared_symbol: HashSet<&str> = shared_symbol.iter().map(String::as_str).collect();
         let want_dirs: HashSet<&str> = files.iter().map(|f| dir_of(f)).collect();
         let mut out: Vec<PredictedConflict> = reg
             .held
             .iter()
             .filter(|(held, r)| r.agent != agent && !want.contains(held.as_str()))
             .filter_map(|(held, r)| {
-                // strongest specific signal first: a direct import edge beats mere co-location.
+                // strongest specific signal first: a direct import edge beats a shared symbol beats
+                // mere co-location.
                 let relation = if imports.contains(held.as_str()) {
                     Relation::Imports
                 } else if imported_by.contains(held.as_str()) {
                     Relation::ImportedBy
+                } else if shared_symbol.contains(held.as_str()) {
+                    Relation::SharedSymbol
                 } else {
                     let d = dir_of(held);
                     // top-level files (dir == "") don't form a meaningful module: grouping every
@@ -348,6 +361,18 @@ impl Coordinator {
             })
             .collect();
         out.sort_by(|a, b| a.held_file.cmp(&b.held_file));
+        out
+    }
+
+    /// Files currently held by an agent *other* than `agent` (expired swept), sorted and deduplicated.
+    /// The caller uses this to decide which held files to symbol-check for [`Relation::SharedSymbol`]
+    /// prediction, without the coordinator needing a resolver of its own.
+    pub fn held_by_others(&self, agent: &str) -> Vec<String> {
+        let mut reg = self.inner.lock().unwrap();
+        sweep(&mut reg, self.ttl);
+        let mut out: Vec<String> =
+            reg.held.iter().filter(|(_, r)| r.agent != agent).map(|(f, _)| f.clone()).collect();
+        out.sort();
         out
     }
 
@@ -505,18 +530,18 @@ mod tests {
 
         // bob wants a DIFFERENT file in src/auth, with no import edges → same-dir predictions
         // with alice, and nothing about src/ui (different module).
-        let pred = c.predict("bob", &files(&["src/auth/session.rs"]), &[], &[]);
+        let pred = c.predict("bob", &files(&["src/auth/session.rs"]), &[], &[], &[]);
         assert_eq!(pred.len(), 2, "both of alice's src/auth files are near; got {pred:?}");
         assert!(pred.iter().all(|p| p.agent == "alice" && p.relation == Relation::SameDir));
 
         // an exact-file want is a HARD conflict (reserve/peek), excluded from prediction
-        let pred2 = c.predict("bob", &files(&["src/auth/login.rs"]), &[], &[]);
+        let pred2 = c.predict("bob", &files(&["src/auth/login.rs"]), &[], &[], &[]);
         assert!(
             pred2.iter().all(|p| p.held_file != "src/auth/login.rs"),
             "exact file is a hard conflict, not a prediction; got {pred2:?}"
         );
         // own reservations never predicted against self
-        assert!(c.predict("alice", &files(&["src/auth/session.rs"]), &[], &[]).is_empty());
+        assert!(c.predict("alice", &files(&["src/auth/session.rs"]), &[], &[], &[]).is_empty());
     }
 
     #[test]
@@ -533,6 +558,7 @@ mod tests {
             &files(&["src/core/engine.rs"]),
             &files(&["src/lib/util.rs"]),    // engine imports util
             &files(&["src/api/handler.rs"]), // handler imports engine
+            &[],
         );
         let by_file: std::collections::HashMap<_, _> =
             pred.iter().map(|p| (p.held_file.as_str(), p.relation)).collect();
@@ -549,9 +575,55 @@ mod tests {
             &files(&["src/core/engine.rs"]),
             &files(&["src/core/dep.rs"]),
             &[],
+            &[],
         );
         assert_eq!(pred2.len(), 1);
         assert_eq!(pred2[0].relation, Relation::Imports, "import edge beats same-dir; got {pred2:?}");
+    }
+
+    #[test]
+    fn predict_flags_shared_symbol_and_ranks_it_between_imports_and_same_dir() {
+        let c = Coordinator::new();
+        // alice holds a file in another directory that shares a symbol with bob's target (no import
+        // edge), and a same-dir file that ALSO shares a symbol.
+        c.reserve("alice", "a", &files(&["src/other/dup.rs", "src/core/near.rs"]));
+
+        let pred = c.predict(
+            "bob",
+            &files(&["src/core/engine.rs"]),
+            &[], // no imports
+            &[], // no importers
+            &files(&["src/other/dup.rs", "src/core/near.rs"]), // both share a symbol
+        );
+        let by_file: std::collections::HashMap<_, _> =
+            pred.iter().map(|p| (p.held_file.as_str(), p.relation)).collect();
+        // the cross-dir file is caught ONLY by the symbol signal (same-dir would miss it)
+        assert_eq!(by_file.get("src/other/dup.rs"), Some(&Relation::SharedSymbol), "got {pred:?}");
+        // the same-dir file that also shares a symbol reports SharedSymbol (more specific than SameDir)
+        assert_eq!(by_file.get("src/core/near.rs"), Some(&Relation::SharedSymbol), "symbol beats same-dir; got {pred:?}");
+
+        // an import edge still outranks a shared symbol
+        let c2 = Coordinator::new();
+        c2.reserve("alice", "a", &files(&["src/lib/util.rs"]));
+        let pred2 = c2.predict(
+            "bob",
+            &files(&["src/core/engine.rs"]),
+            &files(&["src/lib/util.rs"]),   // imported
+            &[],
+            &files(&["src/lib/util.rs"]),   // also shares a symbol
+        );
+        assert_eq!(pred2[0].relation, Relation::Imports, "import edge beats shared symbol; got {pred2:?}");
+    }
+
+    #[test]
+    fn held_by_others_excludes_self_and_sorts() {
+        let c = Coordinator::new();
+        c.reserve("alice", "t", &files(&["z.ts", "a.ts"]));
+        c.reserve("bob", "t", &files(&["m.ts"]));
+        assert_eq!(c.held_by_others("bob"), files(&["a.ts", "z.ts"]), "others' files, sorted, self excluded");
+        assert_eq!(c.held_by_others("carol"), files(&["a.ts", "m.ts", "z.ts"]), "carol sees everyone's");
+        assert!(c.held_by_others("alice").contains(&"m.ts".to_string()));
+        assert!(!c.held_by_others("alice").contains(&"a.ts".to_string()), "alice's own excluded");
     }
 
     #[test]
@@ -563,11 +635,11 @@ mod tests {
         c.reserve("alice", "cfg", &files(&["webpack.config.ts"]));
         c.reserve("carol", "cfg", &files(&["vite.config.ts"]));
         assert!(
-            c.predict("bob", &files(&["index.ts"]), &[], &[]).is_empty(),
+            c.predict("bob", &files(&["index.ts"]), &[], &[], &[]).is_empty(),
             "unrelated root files must not be same-dir neighbors"
         );
         // but a genuine import edge between top-level files IS still predicted
-        let pred = c.predict("bob", &files(&["index.ts"]), &files(&["webpack.config.ts"]), &[]);
+        let pred = c.predict("bob", &files(&["index.ts"]), &files(&["webpack.config.ts"]), &[], &[]);
         assert_eq!(pred.len(), 1);
         assert_eq!(pred[0].relation, Relation::Imports, "import edge still fires at top level; got {pred:?}");
     }
