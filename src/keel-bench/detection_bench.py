@@ -59,11 +59,17 @@ def _baseline(d, name, text):
 
 
 def _semantic_json(d):
+    """Return (json, healthy). `healthy` is True only when the engine actually ran to completion —
+    exit 0 AND a top-level `ok: true`. A crash/nonzero-exit/unparseable output yields ({}, False) so
+    the caller never mistakes a dead engine's empty result for a legitimately-clean diff."""
     r = sh(["native", "diff", "--semantic", "--json"], cwd=d)
+    if r.returncode != 0:
+        return {}, False
     try:
-        return json.loads(r.stdout)
+        j = json.loads(r.stdout)
     except Exception:
-        return {}
+        return {}, False
+    return j, (j.get("ok") is True)
 
 
 # ── the two anomaly-presence predicates over the semantic-diff JSON ───────────────────────────────
@@ -79,6 +85,14 @@ def _removed_flagged(j):
     op = bool(rm.get("operator_anomalies"))
     lit = any(g.get("anomalies") for g in rm.get("groups", []))
     return op or lit
+
+
+def _anom_texts(scope):
+    """Every flagged anomaly's source line under a scope (the top-level JSON, or its `removed` block)."""
+    texts = [a.get("text", "") for a in scope.get("operator_anomalies", [])]
+    for g in scope.get("groups", []):
+        texts += [a.get("text", "") for a in g.get("anomalies", [])]
+    return texts
 
 
 def _total(j):
@@ -99,7 +113,7 @@ def gen_op_flip_added(rng):
     odd = rng.randrange(n)
     base = "export const lim = 10;\n"
     change = base + _lines_added(rng, lambda k: minr if k == odd else maj, lambda k: 1, n)
-    return base, change, ("added", True)
+    return base, change, ("added", True, f"const r{odd} ")
 
 
 def gen_literal_smuggle(rng):
@@ -108,7 +122,7 @@ def gen_literal_smuggle(rng):
     odd = rng.randrange(n)
     base = "export const lim = 10;\n"
     change = base + _lines_added(rng, lambda k: "<=", lambda k: minr if k == odd else maj, n)
-    return base, change, ("added", True)
+    return base, change, ("added", True, f"const r{odd} ")
 
 
 def gen_op_flip_removed(rng):
@@ -122,7 +136,7 @@ def gen_op_flip_removed(rng):
     guards = "".join(f"if ({a}{k} {minr if k == odd else maj} max) throw Error();\n" for k in range(n))
     base = "export const max = 99;\n" + guards
     change = "export const max = 99;\n"  # every guard deleted
-    return base, change, ("removed", True)
+    return base, change, ("removed", True, f"({a}{odd} ")
 
 
 def gen_clean_uniform(rng):
@@ -130,7 +144,7 @@ def gen_clean_uniform(rng):
     op = rng.choice(COMPARE + LOGICAL)
     base = "export const lim = 10;\n"
     change = base + _lines_added(rng, lambda k: op, lambda k: 7, n)
-    return base, change, ("clean", False)
+    return base, change, ("clean", False, None)
 
 
 def gen_clean_varied_op(rng):
@@ -138,14 +152,14 @@ def gen_clean_varied_op(rng):
     n = len(COMPARE)
     base = "export const lim = 10;\n"
     change = base + _lines_added(rng, lambda k: COMPARE[k % len(COMPARE)], lambda k: 1, n)
-    return base, change, ("clean", False)
+    return base, change, ("clean", False, None)
 
 
 def gen_clean_varied_lit(rng):
     n = rng.randint(6, 9)
     base = "export const lim = 10;\n"
     change = base + _lines_added(rng, lambda k: "<=", lambda k: k, n)  # literal = index, uniform spread
-    return base, change, ("clean", False)
+    return base, change, ("clean", False, None)
 
 
 CLASSES = {
@@ -161,16 +175,21 @@ CLASSES = {
 def run_scenario(gen, rng):
     """Build the repo, apply the change, run the engine, and return whether the OUTCOME was correct
     (bug flagged for a bug class; nothing flagged for a clean class)."""
-    base, change, (side, is_bug) = gen(rng)
+    base, change, (side, is_bug, site) = gen(rng)
     d = _repo()
     try:
         _baseline(d, "mod.ts", base)
         (d / "mod.ts").write_text(change)
-        j = _semantic_json(d)
+        j, healthy = _semantic_json(d)
+        if not healthy:
+            # the engine never ran (crash / nonzero exit / bad JSON) — the outcome is meaningless,
+            # so count it as INCORRECT for every class. Without this a dead engine "passes" the clean
+            # half on _total({})==0 and the FP=0% figure is vacuous.
+            return False, 0
         if side == "added":
-            got = _added_flagged(j)
+            got = _added_flagged(j) and any(site in t for t in _anom_texts(j))
         elif side == "removed":
-            got = _removed_flagged(j)
+            got = _removed_flagged(j) and any(site in t for t in _anom_texts(j.get("removed", {})))
         else:  # clean
             got = _total(j) > 0
         # correct == flagged-a-bug (recall) or stayed-quiet-on-clean (precision)

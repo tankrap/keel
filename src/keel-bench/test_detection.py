@@ -24,6 +24,13 @@ def test_predicates_read_the_json_shape():
     assert not D._added_flagged({"removed": {"operator_anomalies": [{"reason": "x"}]}})
     assert D._total({"anomalies": 2, "removed": {"anomalies": 1}}) == 3
     assert D._total({}) == 0
+    # _anom_texts collects the offending source line from BOTH operator and group anomalies
+    scope = {
+        "operator_anomalies": [{"text": "const r1 = a > lim;"}],
+        "groups": [{"anomalies": [{"text": "const r2 = ok(v, 8);"}]}, {"anomalies": []}],
+    }
+    assert D._anom_texts(scope) == ["const r1 = a > lim;", "const r2 = ok(v, 8);"]
+    assert D._anom_texts({}) == []
     print("  ✓ predicates read the semantic-diff JSON shape")
 
 
@@ -41,8 +48,9 @@ def _added_op_tokens(change, base):
 def test_op_flip_added_injects_exactly_one_minority_operator():
     rng = random.Random(0)
     for _ in range(50):
-        base, change, (side, is_bug) = D.gen_op_flip_added(rng)
+        base, change, (side, is_bug, site) = D.gen_op_flip_added(rng)
         assert (side, is_bug) == ("added", True)
+        assert change.count(site) == 1, f"site marker must pick exactly one line: {site!r}"
         ops = _added_op_tokens(change, base)
         assert len(ops) >= 6
         counts = {o: ops.count(o) for o in set(ops)}
@@ -56,7 +64,8 @@ def test_literal_smuggle_injects_one_minority_literal():
     rng = random.Random(0)
     for _ in range(50):
         base, change, exp = D.gen_literal_smuggle(rng)
-        assert exp == ("added", True)
+        assert exp[:2] == ("added", True)
+        assert change.count(exp[2]) == 1, f"site marker must pick one line: {exp[2]!r}"
         lits = [int(m) for m in re.findall(r"ok\(\w+, (\d+)\)", change)]
         counts = {v: lits.count(v) for v in set(lits)}
         assert len(counts) == 2 and sorted(counts.values())[0] == 1, counts
@@ -67,7 +76,8 @@ def test_op_flip_removed_deletes_all_guards_one_odd():
     rng = random.Random(0)
     for _ in range(50):
         base, change, exp = D.gen_op_flip_removed(rng)
-        assert exp == ("removed", True)
+        assert exp[:2] == ("removed", True)
+        assert base.count(exp[2]) == 1, f"site marker must pick one guard: {exp[2]!r}"
         # every guard line is gone in the change (a whole-guard-block deletion)
         assert "throw Error();" in base and "throw Error();" not in change
         ops = re.findall(r"if \(\w+ (\S+) max\)", base)
@@ -81,7 +91,7 @@ def test_clean_controls_carry_no_injected_bug():
     for gen in (D.gen_clean_uniform, D.gen_clean_varied_op, D.gen_clean_varied_lit):
         for _ in range(30):
             base, change, exp = gen(rng)
-            assert exp == ("clean", False)
+            assert exp[:2] == ("clean", False) and exp[2] is None
             assert change != base and change.startswith(base.splitlines()[0])
     # a varied-op control must use DISTINCT operators (no majority to flag)
     base, change, _ = D.gen_clean_varied_op(random.Random(3))
