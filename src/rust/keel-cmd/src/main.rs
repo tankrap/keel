@@ -352,6 +352,10 @@ fn cmd_commit(args: &[String]) -> io::Result<()> {
         .or_else(|| flag(args, "-m"))
         .ok_or_else(|| io::Error::other("--message is required"))?;
     let author = flag(args, "--author").unwrap_or("local");
+    // Coordination identity for the reserve→land→free loop below. Defaults to "local" to match
+    // `keel brief`'s --agent default; an agent that reserves under a custom --agent should pass the
+    // same one here so landing frees the holds it took.
+    let agent = flag(args, "--agent").unwrap_or("local");
     let (root, store) = root_store(args)?;
     let repo = Repo::open(&store).map_err(to_io)?;
     let ts = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
@@ -399,6 +403,19 @@ fn cmd_commit(args: &[String]) -> io::Result<()> {
     };
     let change = repo.commit_dir(&root, msg, author, ts, session_id).map_err(to_io)?;
     println!("committed {} · {}", short(&change.to_hex()), msg);
+
+    // Close the reserve→land→free loop: the work landed, so tell the warm daemon to drop this agent's
+    // reservations now instead of leaving them held until the TTL (other agents can pick those files
+    // up immediately). Best-effort — no daemon, or an --agent that doesn't match the brief's, just
+    // falls back to TTL expiry, never worse than before. The daemon owns the shared coordinator; the
+    // in-process store path has no shared holds to free.
+    if let Some(freed) =
+        daemon_request(&root, &json!({"op": "release", "agent": agent})).and_then(|r| r.get("released").and_then(Value::as_u64))
+    {
+        if freed > 0 {
+            println!("  freed {freed} reservation(s) held by {agent}");
+        }
+    }
     Ok(())
 }
 
