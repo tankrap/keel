@@ -181,7 +181,12 @@ deleting a key satisfies GDPR/CCPA right-to-erasure without breaking content-add
   top-k, not text similarity); log context→change→verified to improve the selector; **pin rule-lessons as
   pattern-attached invariants** (NEW-1100 — pays off from ONE prior session, not volume-gated). Bar: 0→72%.
 - **Coordination** (Epic NEW-1071) — reservations **piggybacked on the brief** (free when uncontended);
-  ordered authority predicts conflict before it happens. Bar: 1.5–9.7×, wins at every team size.
+  the coordinator predicts conflict before it happens. Bar: 1.5–9.7×, wins at every team size.
+  *Shipped (single-daemon): reservations, import-graph-aware prediction (a held file that imports or is
+  imported by the target is flagged, even across directories), a `keel reservations`/`keel release`
+  visibility surface, durable holds across a daemon restart, and a reserve→land→free loop (a commit
+  frees the holds on the files it changed). The cross-daemon ordered authority is the remaining piece
+  and lives in the hosted layer.*
 - **Live/incremental graph** (NEW-1075) — the hard, defensible core. Reuse existing incremental engines
   (stack-graphs / SCIP / tree-sitter); cache resolution, re-resolve only the changed subgraph; **latency SLO
   is a hard gate** (if the graph lags, "live" evaporates).
