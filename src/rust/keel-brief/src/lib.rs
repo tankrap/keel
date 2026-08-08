@@ -21,7 +21,7 @@ use std::path::{Path, PathBuf};
 
 // Re-export the field types so callers (e.g. the CLI) don't need every subcrate.
 pub use keel_coord::Conflict as CoordConflict;
-pub use keel_coord::{Coordinator, PredictedConflict as CoordPredicted};
+pub use keel_coord::{Coordinator, PredictedConflict as CoordPredicted, Relation};
 pub use keel_resolve::SliceDef as ContextDef;
 
 /// A single change that touched the briefed file.
@@ -612,9 +612,10 @@ mod tests {
     fn brief_predicts_import_linked_conflict_across_files() {
         let work = tmp("pwork");
         let store = tmp("pstore");
-        // a.ts imports b.ts; they are NOT the same directory as far as the same-dir heuristic cares
-        // (both top-level), so this exercises the import-edge signal: brief on a.ts must predict a
-        // soft conflict on b.ts (which a.ts imports) when another agent holds b.ts.
+        // a.ts imports b.ts. Both are top-level, and the same-dir fallback does NOT group top-level
+        // files (dir == "" isn't a module), so the ONLY thing that can flag b.ts is the import edge —
+        // a clean isolation of the graph-aware signal: brief on a.ts must predict a soft conflict on
+        // b.ts (which a.ts imports) with relation `imports` when another agent holds b.ts.
         fs::write(work.join("b.ts"), "export function helper(x: number): number {\n  return x * 2;\n}\n").unwrap();
         fs::write(
             work.join("a.ts"),
@@ -639,7 +640,7 @@ mod tests {
         assert_eq!(b.predicted.len(), 1, "b.ts is import-linked and held → one prediction; got {:?}", b.predicted);
         assert_eq!(b.predicted[0].held_file, "b.ts");
         assert_eq!(b.predicted[0].agent, "other");
-        assert_eq!(b.predicted[0].relation, keel_coord::Relation::Imports, "target imports the held file");
+        assert_eq!(b.predicted[0].relation, Relation::Imports, "target imports the held file");
 
         let _ = fs::remove_dir_all(&work);
         let _ = fs::remove_dir_all(&store);

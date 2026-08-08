@@ -43,6 +43,7 @@ pub enum Relation {
     ImportedBy,
     /// Not import-linked — just the same directory/module. The fallback signal when the graph has no
     /// edge between the two (e.g. a brand-new file, or a language without a resolver sidecar).
+    /// Top-level files (no directory) are excluded: the repo root isn't a meaningful module.
     SameDir,
 }
 
@@ -208,10 +209,17 @@ impl Coordinator {
                     Relation::Imports
                 } else if imported_by.contains(held.as_str()) {
                     Relation::ImportedBy
-                } else if want_dirs.contains(dir_of(held)) {
-                    Relation::SameDir
                 } else {
-                    return None;
+                    let d = dir_of(held);
+                    // top-level files (dir == "") don't form a meaningful module: grouping every
+                    // repo-root file together would flag unrelated configs/entrypoints as neighbors.
+                    // Require a non-empty shared directory — genuinely-related root files still get
+                    // caught by the import edges above.
+                    if !d.is_empty() && want_dirs.contains(d) {
+                        Relation::SameDir
+                    } else {
+                        return None;
+                    }
                 };
                 Some(PredictedConflict {
                     held_file: held.clone(),
@@ -339,6 +347,24 @@ mod tests {
         );
         assert_eq!(pred2.len(), 1);
         assert_eq!(pred2[0].relation, Relation::Imports, "import edge beats same-dir; got {pred2:?}");
+    }
+
+    #[test]
+    fn predict_does_not_group_unrelated_top_level_files() {
+        let c = Coordinator::new();
+        // two other agents hold unrelated repo-root files; the same-dir fallback must NOT group all
+        // top-level files together (dir == "" is not a module), so a plain top-level target with no
+        // import edges predicts nothing.
+        c.reserve("alice", "cfg", &files(&["webpack.config.ts"]));
+        c.reserve("carol", "cfg", &files(&["vite.config.ts"]));
+        assert!(
+            c.predict("bob", &files(&["index.ts"]), &[], &[]).is_empty(),
+            "unrelated root files must not be same-dir neighbors"
+        );
+        // but a genuine import edge between top-level files IS still predicted
+        let pred = c.predict("bob", &files(&["index.ts"]), &files(&["webpack.config.ts"]), &[]);
+        assert_eq!(pred.len(), 1);
+        assert_eq!(pred[0].relation, Relation::Imports, "import edge still fires at top level; got {pred:?}");
     }
 
     #[test]
