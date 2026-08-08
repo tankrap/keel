@@ -11,7 +11,9 @@
 //!
 //! Ops: `{op:"ping"}` · `{op:"brief", task, file, symbol?, budget?, reserve?}` ·
 //! `{op:"status"}` (warm, O(changed) working-tree status via an fs-watch-fed [`LiveStatus`]) ·
-//! `{op:"announce", event}` (broadcast a coordination event to the fleet).
+//! `{op:"announce", event}` (broadcast a coordination event to the fleet) ·
+//! `{op:"reservations"}` (list every active hold in the shared coordinator) ·
+//! `{op:"release", agent, files?}` (free an agent's holds — the named files, or all of them).
 //!
 //! With `--quic [host:port]` the daemon also runs a QUIC coordination server (shared store): every
 //! brief broadcasts an "agent working on file X" presence event and `announce` pushes lessons /
@@ -393,6 +395,34 @@ fn handle(ctx: &Ctx, req: &Value) -> Value {
                 }
                 Err(e) => json!({"ok": false, "error": e.to_string()}),
             }
+        }
+        // Read-only observability: every active hold in the shared coordinator.
+        Some("reservations") => {
+            let svc = lock(&ctx.svc);
+            let held: Vec<Value> = svc
+                .reservations()
+                .into_iter()
+                .map(|h| {
+                    json!({
+                        "file": h.file, "agent": h.agent, "task": h.task,
+                        "age_secs": h.age_secs, "ttl_remaining_secs": h.ttl_remaining_secs,
+                    })
+                })
+                .collect();
+            json!({"ok": true, "reservations": held})
+        }
+        // Release an agent's holds: the named `files` if given, else all of them.
+        Some("release") => {
+            let Some(agent) = req.get("agent").and_then(Value::as_str) else {
+                return json!({"ok": false, "error": "agent is required"});
+            };
+            let files: Vec<String> = req
+                .get("files")
+                .and_then(Value::as_array)
+                .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+                .unwrap_or_default();
+            let freed = lock(&ctx.svc).release(agent, &files);
+            json!({"ok": true, "released": freed})
         }
         other => json!({"ok": false, "error": format!("unknown op: {other:?}")}),
     }

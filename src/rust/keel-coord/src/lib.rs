@@ -69,6 +69,17 @@ pub struct PredictedConflict {
     pub relation: Relation,
 }
 
+/// A read-only view of one active hold, for observability (`keel reservations`): who holds a file,
+/// for what task, how long it's been held, and how long until it would be swept if not renewed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Hold {
+    pub file: String,
+    pub agent: String,
+    pub task: String,
+    pub age_secs: u64,
+    pub ttl_remaining_secs: u64,
+}
+
 /// One held file: the holder, its task, and when the hold was last taken or renewed (for TTL expiry).
 struct Reservation {
     agent: String,
@@ -162,19 +173,51 @@ impl Coordinator {
             .collect()
     }
 
-    /// Release everything held by `agent` (e.g. when its work lands).
-    pub fn release_agent(&self, agent: &str) {
-        self.inner.lock().unwrap().held.retain(|_, r| r.agent != agent);
+    /// Release everything held by `agent` (e.g. when its work lands). Returns how many holds freed.
+    pub fn release_agent(&self, agent: &str) -> usize {
+        let mut reg = self.inner.lock().unwrap();
+        let before = reg.held.len();
+        reg.held.retain(|_, r| r.agent != agent);
+        before - reg.held.len()
     }
 
-    /// Release specific `files` held by `agent`.
-    pub fn release_files(&self, agent: &str, files: &[String]) {
+    /// Release specific `files` held by `agent`. Returns how many holds freed (files not held by
+    /// `agent`, or not held at all, are ignored).
+    pub fn release_files(&self, agent: &str, files: &[String]) -> usize {
         let mut reg = self.inner.lock().unwrap();
+        let mut freed = 0;
         for f in files {
             if reg.held.get(f).is_some_and(|r| r.agent == agent) {
                 reg.held.remove(f);
+                freed += 1;
             }
         }
+        freed
+    }
+
+    /// A snapshot of every currently-held file (expired holds swept first), sorted by file — for
+    /// observability (`keel reservations`). Takes no reservation and refreshes no TTL; the only
+    /// mutation is the lazy sweep of already-expired holds, as on every other registry access.
+    pub fn snapshot(&self) -> Vec<Hold> {
+        let mut reg = self.inner.lock().unwrap();
+        sweep(&mut reg, self.ttl);
+        let now = Instant::now();
+        let mut out: Vec<Hold> = reg
+            .held
+            .iter()
+            .map(|(file, r)| {
+                let age = now.duration_since(r.at);
+                Hold {
+                    file: file.clone(),
+                    agent: r.agent.clone(),
+                    task: r.task.clone(),
+                    age_secs: age.as_secs(),
+                    ttl_remaining_secs: self.ttl.saturating_sub(age).as_secs(),
+                }
+            })
+            .collect();
+        out.sort_by(|a, b| a.file.cmp(&b.file));
+        out
     }
 
     /// Predict soft conflicts for `files`: reservations by *other* agents on files that are
@@ -284,12 +327,38 @@ mod tests {
     fn release_frees_reservations() {
         let c = Coordinator::new();
         c.reserve("alice", "t", &files(&["a.ts", "b.ts"]));
-        c.release_files("alice", &files(&["a.ts"]));
+        assert_eq!(c.release_files("alice", &files(&["a.ts"])), 1, "one file freed");
+        assert_eq!(c.release_files("alice", &files(&["a.ts"])), 0, "already free → nothing freed");
+        assert_eq!(c.release_files("bob", &files(&["b.ts"])), 0, "not bob's → nothing freed");
         // a.ts free → bob takes it; b.ts still alice's → conflict
         let conf = c.reserve("bob", "t2", &files(&["a.ts", "b.ts"]));
         assert_eq!(conf, vec![Conflict { file: "b.ts".into(), agent: "alice".into(), task: "t".into() }]);
-        c.release_agent("alice");
+        assert_eq!(c.release_agent("alice"), 1, "alice's remaining b.ts freed");
         assert!(c.reserve("bob", "t2", &files(&["b.ts"])).is_empty());
+    }
+
+    #[test]
+    fn snapshot_lists_holds_with_ages_and_ttl() {
+        let c = Coordinator::new().with_ttl(Duration::from_secs(600));
+        c.reserve("alice", "auth", &files(&["src/b.ts", "src/a.ts"]));
+        c.reserve("bob", "ui", &files(&["src/c.ts"]));
+        let snap = c.snapshot();
+        // sorted by file, one entry per hold
+        assert_eq!(snap.iter().map(|h| h.file.as_str()).collect::<Vec<_>>(), ["src/a.ts", "src/b.ts", "src/c.ts"]);
+        let a = &snap[0];
+        assert_eq!((a.agent.as_str(), a.task.as_str()), ("alice", "auth"));
+        assert_eq!(snap[2].agent, "bob");
+        // just-taken holds: age ~0, ttl close to the full window (allow scheduler slack)
+        assert!(snap.iter().all(|h| h.age_secs <= 1 && h.ttl_remaining_secs >= 598));
+    }
+
+    #[test]
+    fn snapshot_omits_expired_holds() {
+        let c = Coordinator::new().with_ttl(Duration::from_millis(200));
+        c.reserve("alice", "t", &files(&["a.ts"]));
+        assert_eq!(c.snapshot().len(), 1);
+        std::thread::sleep(Duration::from_millis(350));
+        assert!(c.snapshot().is_empty(), "expired hold swept from the snapshot");
     }
 
     #[test]
