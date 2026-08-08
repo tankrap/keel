@@ -8,3 +8,4 @@ report-django.json
 report-go.json
 report-rust.json
 report-adversarial.json
+detection_result.json
