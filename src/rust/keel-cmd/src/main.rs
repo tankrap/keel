@@ -4020,7 +4020,12 @@ fn render_human(v: &Value) -> String {
     if !pred.is_empty() {
         let _ = writeln!(out, "  ~ nearby (predicted collisions):");
         for p in &pred {
-            let _ = writeln!(out, "    - {} by {} in {}/", field(p, "held_file"), field(p, "agent"), field(p, "dir"));
+            let why = match field(p, "relation").as_str() {
+                "imports" => "you import it",
+                "imported-by" => "imports your target",
+                _ => "same module",
+            };
+            let _ = writeln!(out, "    - {} by {} — {why}", field(p, "held_file"), field(p, "agent"));
         }
     }
     let prov = arr("provenance");
