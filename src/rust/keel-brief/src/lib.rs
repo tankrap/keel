@@ -21,7 +21,7 @@ use std::path::{Path, PathBuf};
 
 // Re-export the field types so callers (e.g. the CLI) don't need every subcrate.
 pub use keel_coord::Conflict as CoordConflict;
-pub use keel_coord::{Coordinator, Hold, PredictedConflict as CoordPredicted, Relation};
+pub use keel_coord::{Coordinator, Hold, HoldRecord, PredictedConflict as CoordPredicted, Relation};
 pub use keel_resolve::SliceDef as ContextDef;
 
 /// A single change that touched the briefed file.
@@ -311,6 +311,18 @@ impl BriefService {
         } else {
             self.coord.release_files(agent, files)
         }
+    }
+
+    /// Export the shared coordinator's holds for persistence (the daemon writes these to disk so
+    /// reservations survive a restart). See [`Coordinator::export`].
+    pub fn export_holds(&self) -> Vec<HoldRecord> {
+        self.coord.export()
+    }
+
+    /// Reinstate persisted holds at startup, dropping any already past the TTL. Returns how many were
+    /// restored. See [`Coordinator::restore`].
+    pub fn restore_holds(&self, records: &[HoldRecord], now_unix: u64) -> usize {
+        self.coord.restore(records, now_unix)
     }
 
     /// Start fs-watching the working tree so [`refresh`](Self::refresh) becomes O(changed)
@@ -656,6 +668,36 @@ mod tests {
         assert!(svc.reservations().is_empty(), "all holds cleared");
         // releasing again frees nothing
         assert_eq!(svc.release("bob", &[]), 0);
+
+        let _ = fs::remove_dir_all(&work);
+        let _ = fs::remove_dir_all(&store);
+    }
+
+    #[test]
+    fn export_holds_round_trips_into_a_fresh_service() {
+        let work = tmp("ework");
+        let store = tmp("estore");
+        fs::write(work.join("a.ts"), "export function f() { return 1; }\n").unwrap();
+
+        let mut svc = match BriefService::open(&work, &store, &sidecar_dir()) {
+            Ok(s) => s.with_agent("alice"),
+            Err(e) => {
+                eprintln!("skipping export test: {e}");
+                return;
+            }
+        };
+        // reserve via a brief, then export the holds (what the daemon persists)
+        svc.brief("edit a", "a.ts", None, 10_000, true).unwrap();
+        let records = svc.export_holds();
+        assert_eq!(records.len(), 1);
+        assert_eq!((records[0].file.as_str(), records[0].agent.as_str()), ("a.ts", "alice"));
+
+        // a fresh service (a restarted daemon) restores them and sees the hold live
+        let fresh = BriefService::open(&work, &store, &sidecar_dir()).unwrap().with_agent("bob");
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+        assert_eq!(fresh.restore_holds(&records, now), 1);
+        assert_eq!(fresh.reservations().len(), 1, "restored hold is live in the new service");
+        assert_eq!(fresh.reservations()[0].agent, "alice");
 
         let _ = fs::remove_dir_all(&work);
         let _ = fs::remove_dir_all(&store);

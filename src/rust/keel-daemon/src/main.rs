@@ -165,6 +165,13 @@ fn main() {
         Err(e) => eprintln!("keeld: fs-watch unavailable ({e}); refresh will walk the tree"),
     }
 
+    // Reload reservations persisted by a previous daemon so a restart doesn't drop everyone's holds
+    // (expired ones are discarded, survivors keep their remaining TTL). Best-effort.
+    let restored = svc.restore_holds(&load_holds(&root), now_secs());
+    if restored > 0 {
+        eprintln!("keeld: restored {restored} reservation(s) from coord.json");
+    }
+
     // Warm working-tree status: seed once, then an fs-watch feeds changed paths so `status` over
     // the socket is O(changed), not a full walk. Non-fatal — a failure just leaves `status`
     // reporting unavailable, and callers fall back to the local walk.
@@ -339,6 +346,49 @@ fn now_secs() -> u64 {
         .unwrap_or(0)
 }
 
+/// Where reservations are persisted (per-repo), so a restart can reload them.
+fn coord_path(root: &Path) -> PathBuf {
+    root.join(".keel").join("coord.json")
+}
+
+/// Persist the coordinator's holds to disk. Best-effort: a failed write just means a restart forgets
+/// them (they'd expire on TTL anyway), so errors are swallowed rather than failing the op.
+fn persist_holds(root: &Path, records: &[keel_brief::HoldRecord]) {
+    let arr: Vec<Value> = records
+        .iter()
+        .map(|h| json!({"file": h.file, "agent": h.agent, "task": h.task, "taken_unix": h.taken_unix}))
+        .collect();
+    let path = coord_path(root);
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    if let Ok(s) = serde_json::to_string(&arr) {
+        let _ = std::fs::write(&path, s);
+    }
+}
+
+/// Read persisted holds — empty if the file is missing, unreadable, or malformed (a corrupt file
+/// must not stop the daemon from starting).
+fn load_holds(root: &Path) -> Vec<keel_brief::HoldRecord> {
+    let Ok(text) = std::fs::read_to_string(coord_path(root)) else {
+        return Vec::new();
+    };
+    let Ok(Value::Array(items)) = serde_json::from_str::<Value>(&text) else {
+        return Vec::new();
+    };
+    items
+        .iter()
+        .filter_map(|it| {
+            Some(keel_brief::HoldRecord {
+                file: it.get("file")?.as_str()?.to_string(),
+                agent: it.get("agent")?.as_str()?.to_string(),
+                task: it.get("task")?.as_str()?.to_string(),
+                taken_unix: it.get("taken_unix")?.as_u64()?,
+            })
+        })
+        .collect()
+}
+
 /// Broadcast a coordination event over QUIC (no-op if the server isn't running / no subscribers).
 fn broadcast(ctx: &Ctx, event: &Value) {
     if let Some(pubr) = &ctx.coord {
@@ -391,6 +441,10 @@ fn handle(ctx: &Ctx, req: &Value) -> Value {
                 Ok(b) => {
                     let mut v = b.to_json();
                     v["ok"] = json!(true);
+                    // a reserving brief mutated the shared holds → persist so a restart keeps them
+                    if reserve {
+                        persist_holds(svc.root(), &svc.export_holds());
+                    }
                     v
                 }
                 Err(e) => json!({"ok": false, "error": e.to_string()}),
@@ -421,7 +475,11 @@ fn handle(ctx: &Ctx, req: &Value) -> Value {
                 .and_then(Value::as_array)
                 .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
                 .unwrap_or_default();
-            let freed = lock(&ctx.svc).release(agent, &files);
+            let svc = lock(&ctx.svc);
+            let freed = svc.release(agent, &files);
+            if freed > 0 {
+                persist_holds(svc.root(), &svc.export_holds()); // reflect the freed holds on disk
+            }
             json!({"ok": true, "released": freed})
         }
         other => json!({"ok": false, "error": format!("unknown op: {other:?}")}),
