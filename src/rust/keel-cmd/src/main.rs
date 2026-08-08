@@ -4166,6 +4166,7 @@ fn render_human(v: &Value) -> String {
             let why = match field(p, "relation").as_str() {
                 "imports" => "you import it",
                 "imported-by" => "imports your target",
+                "shared-symbol" => "shares a symbol",
                 _ => "same module",
             };
             let _ = writeln!(out, "    - {} by {} — {why}", field(p, "held_file"), field(p, "agent"));

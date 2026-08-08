@@ -15,9 +15,10 @@ use keel_coord::{Conflict, PredictedConflict};
 use keel_graph::LiveGraph;
 use keel_resolve::{Resolve, Router, SliceDef};
 use keel_store::{Change, Object, ObjectId, Repo, Session, StoreError, Verification};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::path::{Path, PathBuf};
+use std::time::UNIX_EPOCH;
 
 // Re-export the field types so callers (e.g. the CLI) don't need every subcrate.
 pub use keel_coord::Conflict as CoordConflict;
@@ -128,6 +129,10 @@ impl Brief {
     }
 }
 
+/// A file's memoized distinctive defs: `path → (mtime_secs, size, [(name, kind)])`. Keyed so an
+/// unchanged file is never re-resolved for shared-symbol prediction.
+type SymCache = HashMap<String, (u64, u64, Vec<(String, String)>)>;
+
 pub struct BriefService {
     root: PathBuf,
     repo: Repo,
@@ -135,6 +140,7 @@ pub struct BriefService {
     resolver: Router,
     agent: String,
     coord: Coordinator,
+    sym_cache: SymCache,
 }
 
 impl BriefService {
@@ -166,6 +172,7 @@ impl BriefService {
             resolver,
             agent: "local".to_string(),
             coord: Coordinator::new(),
+            sym_cache: HashMap::new(),
         })
     }
 
@@ -325,6 +332,62 @@ impl BriefService {
         self.coord.restore(records, now_unix)
     }
 
+    /// Held files (by *other* agents) that DEFINE a distinctive symbol `file` also defines, with no
+    /// import edge between them — the [`Relation::SharedSymbol`](keel_coord::Relation) signal. Bounded:
+    /// resolves symbols only for the few files other agents hold, skips those already import-linked
+    /// (a stronger relation wins anyway), and does NO resolver work when nobody else holds anything
+    /// (the common case). Resolver errors on any file degrade to "no overlap", never failing the brief.
+    fn symbol_overlap(&mut self, file: &str, deps: &[String], rdeps: &[String]) -> Vec<String> {
+        let others = self.coord.held_by_others(&self.agent);
+        if others.is_empty() {
+            return Vec::new();
+        }
+        let linked: HashSet<&str> = deps.iter().chain(rdeps).map(String::as_str).collect();
+        let candidates: Vec<String> =
+            others.into_iter().filter(|f| f != file && !linked.contains(f.as_str())).collect();
+        if candidates.is_empty() {
+            return Vec::new();
+        }
+        let target: HashSet<(String, String)> = self.distinctive_symbols(file).into_iter().collect();
+        if target.is_empty() {
+            return Vec::new();
+        }
+        candidates
+            .into_iter()
+            .filter(|cand| self.distinctive_symbols(cand).iter().any(|s| target.contains(s)))
+            .collect()
+    }
+
+    /// The distinctive `(name, kind)` defs `file` declares — a resolver `symbols` lookup filtered by
+    /// [`is_distinctive_symbol`] so overlap fires on real coupling (a duplicated top-level type/fn),
+    /// not on every file with a `constructor`/`__init__`/`render`. Matching keeps the kind so a
+    /// `class Foo` and a `function Foo` don't count as the same symbol. Memoized by (mtime, size): an
+    /// unchanged file is never re-resolved; an unresolvable file (bad parse / no sidecar) yields empty.
+    fn distinctive_symbols(&mut self, file: &str) -> Vec<(String, String)> {
+        let meta = std::fs::metadata(self.root.join(file)).ok();
+        let stamp = meta.map(|m| {
+            let mtime = m.modified().ok().and_then(|t| t.duration_since(UNIX_EPOCH).ok()).map(|d| d.as_secs()).unwrap_or(0);
+            (mtime, m.len())
+        });
+        if let (Some((mt, sz)), Some((cmt, csz, defs))) = (stamp, self.sym_cache.get(file)) {
+            if *cmt == mt && *csz == sz {
+                return defs.clone();
+            }
+        }
+        let defs: Vec<(String, String)> = self
+            .resolver
+            .symbols(&self.root, file)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|s| is_distinctive_symbol(&s.name, &s.kind))
+            .map(|s| (s.name, s.kind))
+            .collect();
+        if let Some((mt, sz)) = stamp {
+            self.sym_cache.insert(file.to_string(), (mt, sz, defs.clone()));
+        }
+        defs
+    }
+
     /// Start fs-watching the working tree so [`refresh`](Self::refresh) becomes O(changed)
     /// instead of walking the whole tree. Best called once right after opening (the warm
     /// daemon does this); if unsupported it just leaves refresh on its full-walk path.
@@ -388,9 +451,12 @@ impl BriefService {
         } else {
             self.coord.peek(&self.agent, &working_set)
         };
-        // import-graph-aware prediction: deps/rdeps (already computed above) let the coordinator flag
-        // held files that are import-linked to the target even across directories, not just co-located.
-        let predicted = self.coord.predict(&self.agent, &working_set, &deps, &rdeps);
+        // prediction: import edges (deps/rdeps, already computed) flag held files import-linked to the
+        // target across directories; symbol overlap flags held files that DEFINE a symbol the target
+        // also defines with no import edge (coupling the graph misses). Both computed by the caller
+        // (which has the graph + resolver); the coordinator just classifies.
+        let shared_symbol = self.symbol_overlap(file, &deps, &rdeps);
+        let predicted = self.coord.predict(&self.agent, &working_set, &deps, &rdeps, &shared_symbol);
 
         // history of the target, newest first; verification prefers the post-hoc side-table
         // (CI result) over the change's committed state. Only the newest few are used below
@@ -519,6 +585,41 @@ impl BriefService {
 
 fn to_io(e: StoreError) -> io::Error {
     io::Error::other(e.to_string())
+}
+
+/// Whether a defined symbol is distinctive enough that two files declaring it signals real coupling
+/// (a duplicated top-level type or function) rather than noise, for
+/// [`Relation::SharedSymbol`](keel_coord::Relation) prediction. Conservative on purpose — a soft
+/// signal that cries wolf erodes trust in the whole coordination view, so this errs toward silence:
+///
+/// - **Only top-level-ish declaration kinds.** Members (`method`/`constructor`/`getter`/`setter`/
+///   `field`/`property`/`variable`) are excluded — they are why the naive version fired on every file
+///   with a `constructor` or an `__init__`/`String()`/`Error()` method.
+/// - **No leading-underscore names** — Python dunders (`__init__`, `__repr__`) and private/convention
+///   names, which collide universally and rarely represent a public coupling.
+/// - **Case-insensitive stoplist** of ubiquitous identifiers, so the capitalized TS forms
+///   (`Config`/`State`/`Props`/`Error`/`Result`/`Status`/…) are filtered, not just their lowercase
+///   locals.
+/// - **≥ 5 characters** (counted in `char`s, not bytes, so non-ASCII identifiers measure correctly).
+fn is_distinctive_symbol(name: &str, kind: &str) -> bool {
+    // ubiquitous names, lowercased; compared case-insensitively.
+    const STOP: &[&str] = &[
+        "index", "default", "setup", "config", "options", "params", "result", "error", "errors",
+        "response", "request", "status", "state", "store", "props", "context", "session", "client",
+        "server", "service", "handler", "manager", "factory", "builder", "controller", "model",
+        "view", "component", "widget", "module", "record", "entry", "event", "message", "value",
+        "values", "items", "types", "utils", "helper", "helpers", "common", "constants", "schema",
+        "router", "route", "routes", "logger", "metadata", "payload", "wrapper", "adapter",
+    ];
+    // members and non-declaration kinds carry the bulk of the noise; keep only file-level declarations.
+    let member = matches!(
+        kind,
+        "method" | "constructor" | "getter" | "setter" | "field" | "property" | "variable" | "parameter" | "accessor"
+    );
+    !member
+        && !name.starts_with('_')
+        && name.chars().count() >= 5
+        && !STOP.contains(&name.to_ascii_lowercase().as_str())
 }
 
 #[cfg(test)]
@@ -739,6 +840,74 @@ mod tests {
 
         let _ = fs::remove_dir_all(&work);
         let _ = fs::remove_dir_all(&store);
+    }
+
+    #[test]
+    fn brief_predicts_shared_symbol_conflict_without_an_import_edge() {
+        let work = tmp("symwork");
+        let store = tmp("symstore");
+        // two files in DIFFERENT directories each define the same distinctive symbol `computeTax`,
+        // with NO import between them. Neither same-dir nor the import graph links them — only the
+        // symbol-overlap signal can flag the coupling.
+        fs::create_dir_all(work.join("src/x")).unwrap();
+        fs::create_dir_all(work.join("src/y")).unwrap();
+        fs::write(work.join("src/x/alpha.ts"), "export function computeTax(n: number): number {\n  return n * 0.2;\n}\n").unwrap();
+        fs::write(work.join("src/y/beta.ts"), "export function computeTax(n: number): number {\n  return n * 0.25;\n}\n").unwrap();
+
+        let coord = Coordinator::new();
+        let mut svc = match BriefService::open(&work, &store, &sidecar_dir()) {
+            Ok(s) => s.with_agent("me").with_coordinator(coord.clone()),
+            Err(e) => {
+                eprintln!("skipping shared-symbol test: {e}");
+                return;
+            }
+        };
+        // another agent holds beta.ts (which shares the `computeTax` definition, no import edge)
+        coord.reserve("other", "edit beta", &["src/y/beta.ts".to_string()]);
+
+        let b = svc.brief("edit alpha", "src/x/alpha.ts", None, 10_000, false).unwrap();
+        assert!(!b.deps.contains(&"src/y/beta.ts".to_string()), "no import edge to beta");
+        assert!(b.coordination.is_empty(), "beta isn't the working-set file → not a hard conflict");
+        assert_eq!(b.predicted.len(), 1, "shared-symbol coupling → one prediction; got {:?}", b.predicted);
+        assert_eq!(b.predicted[0].held_file, "src/y/beta.ts");
+        assert_eq!(b.predicted[0].relation, Relation::SharedSymbol, "coupled by a shared definition, not an import");
+
+        // sanity: a held file sharing NO distinctive symbol (and unlinked, different dir) is NOT flagged
+        fs::create_dir_all(work.join("src/z")).unwrap();
+        fs::write(work.join("src/z/gamma.ts"), "export function renderWidget(): void {}\n").unwrap();
+        svc.refresh().unwrap();
+        coord.reserve("other", "edit gamma", &["src/z/gamma.ts".to_string()]);
+        let b2 = svc.brief("edit alpha", "src/x/alpha.ts", None, 10_000, false).unwrap();
+        assert!(
+            b2.predicted.iter().all(|p| p.held_file != "src/z/gamma.ts"),
+            "gamma shares no symbol with alpha → not predicted; got {:?}",
+            b2.predicted
+        );
+
+        let _ = fs::remove_dir_all(&work);
+        let _ = fs::remove_dir_all(&store);
+    }
+
+    #[test]
+    fn is_distinctive_symbol_filters_noise() {
+        // real top-level declarations pass
+        assert!(is_distinctive_symbol("computeTax", "function"));
+        assert!(is_distinctive_symbol("UserRepository", "class"));
+        assert!(is_distinctive_symbol("PaymentGateway", "interface"));
+        // member kinds are excluded regardless of a distinctive name — this is the fix for the
+        // constructor/method noise, so the SAME name that passes as a function fails as a member
+        assert!(!is_distinctive_symbol("computeTax", "method"), "member kind excluded");
+        assert!(!is_distinctive_symbol("constructor", "constructor"), "constructors excluded");
+        assert!(!is_distinctive_symbol("balance", "field"), "fields excluded even when distinctive");
+        // leading-underscore / Python dunders excluded
+        assert!(!is_distinctive_symbol("__init__", "function"), "dunder excluded");
+        assert!(!is_distinctive_symbol("_private", "function"), "underscore-private excluded");
+        // stoplist is CASE-INSENSITIVE: the capitalized TS type forms are filtered, not just locals
+        assert!(!is_distinctive_symbol("Config", "interface"), "capitalized stopword excluded");
+        assert!(!is_distinctive_symbol("State", "type"));
+        assert!(!is_distinctive_symbol("Error", "class"));
+        // too short (char count)
+        assert!(!is_distinctive_symbol("Tax", "function"), "under 5 chars");
     }
 
     #[test]
