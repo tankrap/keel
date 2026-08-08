@@ -17,7 +17,7 @@ use serde_json::{json, Value};
 use std::io::{self, BufRead, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -404,16 +404,25 @@ fn cmd_commit(args: &[String]) -> io::Result<()> {
     let change = repo.commit_dir(&root, msg, author, ts, session_id).map_err(to_io)?;
     println!("committed {} · {}", short(&change.to_hex()), msg);
 
-    // Close the reserve→land→free loop: the work landed, so tell the warm daemon to drop this agent's
-    // reservations now instead of leaving them held until the TTL (other agents can pick those files
-    // up immediately). Best-effort — no daemon, or an --agent that doesn't match the brief's, just
-    // falls back to TTL expiry, never worse than before. The daemon owns the shared coordinator; the
-    // in-process store path has no shared holds to free.
-    if let Some(freed) =
-        daemon_request(&root, &json!({"op": "release", "agent": agent})).and_then(|r| r.get("released").and_then(Value::as_u64))
-    {
-        if freed > 0 {
-            println!("  freed {freed} reservation(s) held by {agent}");
+    // Close the reserve→land→free loop, SCOPED to the files this commit actually changed. Releasing
+    // the whole agent would (a) free files it reserved but hasn't committed yet, and (b) under the
+    // default shared "local" id, free a *concurrent* agent's live holds — so we free only what landed.
+    // A held file that isn't among these (another agent's, or this agent's still-in-progress work) is
+    // left untouched. Best-effort with a short timeout so a wedged daemon can't hang the CLI after the
+    // commit already succeeded; no daemon just falls back to TTL expiry.
+    let landed: Vec<String> =
+        repo.change_files(change).map(|cs| cs.into_iter().map(|c| c.path).collect()).unwrap_or_default();
+    if !landed.is_empty() {
+        let freed = daemon_request_opt(
+            &root,
+            &json!({"op": "release", "agent": agent, "files": landed}),
+            Some(Duration::from_secs(5)),
+        )
+        .and_then(|r| r.get("released").and_then(Value::as_u64));
+        if let Some(n) = freed {
+            if n > 0 {
+                println!("  freed {n} reservation(s) held by {agent}");
+            }
         }
     }
     Ok(())
@@ -3994,8 +4003,21 @@ fn cmd_log(args: &[String]) -> io::Result<()> {
 // ── daemon client ────────────────────────────────────────────────────────────
 
 fn daemon_request(root: &Path, req: &Value) -> Option<Value> {
+    daemon_request_opt(root, req, None)
+}
+
+/// Like [`daemon_request`] but with an optional read/write timeout, so a caller on a latency-sensitive
+/// or fire-and-forget path (e.g. the post-commit release) can't be hung by a wedged daemon that
+/// accepted the connection but never replies. `None` = block indefinitely (the default for `brief`,
+/// whose graph refresh can legitimately take a while).
+fn daemon_request_opt(root: &Path, req: &Value, timeout: Option<Duration>) -> Option<Value> {
     let sock = keel_store::daemon_socket_path(root);
-    let mut stream = UnixStream::connect(&sock).ok()?;
+    let stream = UnixStream::connect(&sock).ok()?;
+    if let Some(t) = timeout {
+        let _ = stream.set_read_timeout(Some(t));
+        let _ = stream.set_write_timeout(Some(t));
+    }
+    let mut stream = stream;
     stream.write_all(serde_json::to_string(req).ok()?.as_bytes()).ok()?;
     stream.write_all(b"\n").ok()?;
     stream.flush().ok()?;
