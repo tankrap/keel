@@ -21,7 +21,7 @@ use std::path::{Path, PathBuf};
 
 // Re-export the field types so callers (e.g. the CLI) don't need every subcrate.
 pub use keel_coord::Conflict as CoordConflict;
-pub use keel_coord::{Coordinator, PredictedConflict as CoordPredicted, Relation};
+pub use keel_coord::{Coordinator, Hold, PredictedConflict as CoordPredicted, Relation};
 pub use keel_resolve::SliceDef as ContextDef;
 
 /// A single change that touched the briefed file.
@@ -296,6 +296,21 @@ impl BriefService {
     /// the TTL, makes the agent-id-uniqueness assumption load-bearing.
     fn release_on_land(&self) {
         self.coord.release_agent(&self.agent);
+    }
+
+    /// A read-only snapshot of every active hold in the shared coordinator (for `keel reservations`).
+    pub fn reservations(&self) -> Vec<Hold> {
+        self.coord.snapshot()
+    }
+
+    /// Release holds for `agent`: the named `files` if any, else every hold `agent` has. Returns the
+    /// number of holds freed. Backs `keel release` (e.g. to clear a crashed agent's stale holds).
+    pub fn release(&self, agent: &str, files: &[String]) -> usize {
+        if files.is_empty() {
+            self.coord.release_agent(agent)
+        } else {
+            self.coord.release_files(agent, files)
+        }
     }
 
     /// Start fs-watching the working tree so [`refresh`](Self::refresh) becomes O(changed)
@@ -603,6 +618,44 @@ mod tests {
         assert_eq!(coord.peek("bystander", &["y.ts".to_string()]).len(), 0, "y.ts freed on land");
         // but only the landing agent's holds — "other" still holds x.ts
         assert_eq!(coord.peek("bystander", &["x.ts".to_string()]).len(), 1, "other's hold untouched");
+
+        let _ = fs::remove_dir_all(&work);
+        let _ = fs::remove_dir_all(&store);
+    }
+
+    #[test]
+    fn reservations_and_release_reflect_holds() {
+        let work = tmp("rwork");
+        let store = tmp("rstore");
+        fs::write(work.join("a.ts"), "export function f() { return 1; }\n").unwrap();
+        fs::write(work.join("b.ts"), "export function g() { return 2; }\n").unwrap();
+
+        let coord = Coordinator::new();
+        let svc = match BriefService::open(&work, &store, &sidecar_dir()) {
+            Ok(s) => s.with_agent("me").with_coordinator(coord.clone()),
+            Err(e) => {
+                eprintln!("skipping reservations test: {e}");
+                return;
+            }
+        };
+        assert!(svc.reservations().is_empty(), "nothing held yet");
+
+        coord.reserve("alice", "auth", &["a.ts".to_string()]);
+        coord.reserve("bob", "ui", &["b.ts".to_string()]);
+        let snap = svc.reservations();
+        assert_eq!(snap.len(), 2);
+        assert_eq!(snap[0].file, "a.ts"); // snapshot is sorted by file
+        assert_eq!(snap[0].agent, "alice");
+        assert_eq!(snap[1].agent, "bob");
+
+        // release a specific file: only that hold goes
+        assert_eq!(svc.release("alice", &["a.ts".to_string()]), 1);
+        assert_eq!(svc.reservations().len(), 1, "only b.ts remains");
+        // release-all for an agent
+        assert_eq!(svc.release("bob", &[]), 1);
+        assert!(svc.reservations().is_empty(), "all holds cleared");
+        // releasing again frees nothing
+        assert_eq!(svc.release("bob", &[]), 0);
 
         let _ = fs::remove_dir_all(&work);
         let _ = fs::remove_dir_all(&store);

@@ -40,6 +40,8 @@ fn main() {
         Some("serve") => run(cmd_serve(&args[1..])),
         Some("net-serve") => run(cmd_net_serve(&args[1..])),
         Some("net-events") => run(cmd_net_events(&args[1..])),
+        Some("reservations") => run(cmd_reservations(&args[1..])),
+        Some("release") => run(cmd_release(&args[1..])),
         Some("verify") => run(cmd_verify(&args[1..])),
         Some("pin") => run(cmd_pin(&args[1..])),
         Some("pins") => run(cmd_pins(&args[1..])),
@@ -141,6 +143,8 @@ fn print_usage() {
          \x20   → forwarded to git verbatim; mutating commands re-sync the keel mirror.\n\n\
          KEEL VALUE-ADD (the fused graph + git mirror):\n\
          \x20 keel brief  --file <path> [--symbol <name>] [--task <t>] [--json] [--reserve]\n\
+         \x20 keel reservations [--json]          who holds what right now (coordination; needs a daemon)\n\
+         \x20 keel release --agent <a> [--file <p> ...]   free an agent's holds (all, or the named files)\n\
          \x20 keel pin <symbol> --lesson <text>   ·   keel pins\n\
          \x20 keel learn --lesson <text> [--task <text>]   record what a change taught (flywheel)\n\
          \x20 keel sessions [--file <path>]       ·   keel session <change>\n\
@@ -265,6 +269,72 @@ fn record_last_brief(root: &Path, value: &Value) {
 fn last_brief_blob(repo: &Repo, root: &Path) -> Option<ObjectId> {
     let bytes = std::fs::read(root.join(".keel/last_brief.json")).ok()?;
     repo.store().put(&Object::Blob(bytes)).ok()
+}
+
+/// `keel reservations [--json]` — list every active hold in the shared coordinator (who is working
+/// on what right now). Coordination state lives ONLY in the warm daemon (each in-process brief uses a
+/// throwaway coordinator), so with no daemon there is nothing to list — say so plainly.
+fn cmd_reservations(args: &[String]) -> io::Result<()> {
+    let json = has(args, "--json");
+    let (root, _store) = root_store(args)?;
+    let Some(resp) = daemon_request(&root, &json!({ "op": "reservations" })) else {
+        if json {
+            print!("{}", render_json(&json!({"ok": false, "error": "no daemon", "reservations": []})));
+        } else {
+            eprintln!("no keeld running for this repo — coordination state is only live in the daemon.");
+            eprintln!("  start one with `keel serve`, then agents' briefs coordinate through it.");
+        }
+        return Ok(());
+    };
+    if resp.get("ok").and_then(Value::as_bool) != Some(true) {
+        let msg = resp.get("error").and_then(Value::as_str).unwrap_or("daemon error");
+        return Err(io::Error::other(msg.to_string()));
+    }
+    if json {
+        print!("{}", render_json(&resp));
+        return Ok(());
+    }
+    let held = resp.get("reservations").and_then(Value::as_array).cloned().unwrap_or_default();
+    if held.is_empty() {
+        println!("reservations · none held");
+        return Ok(());
+    }
+    println!("reservations · {} held", held.len());
+    for h in &held {
+        let f = h.get("file").and_then(Value::as_str).unwrap_or("?");
+        let a = h.get("agent").and_then(Value::as_str).unwrap_or("?");
+        let t = h.get("task").and_then(Value::as_str).unwrap_or("");
+        let age = h.get("age_secs").and_then(Value::as_u64).unwrap_or(0);
+        let ttl = h.get("ttl_remaining_secs").and_then(Value::as_u64).unwrap_or(0);
+        println!("  {f}  ·  {a}  ({t})   held {}, {} left", fmt_dur(age), fmt_dur(ttl));
+    }
+    Ok(())
+}
+
+/// `keel release --agent <a> [--file <p> ...]` — free an agent's holds (the named files, or all of
+/// them if none given), e.g. to clear a crashed agent's stale reservations before its TTL expires.
+fn cmd_release(args: &[String]) -> io::Result<()> {
+    let json = has(args, "--json");
+    let agent = flag(args, "--agent").ok_or_else(|| io::Error::other("--agent is required"))?;
+    let files = flags(args, "--file");
+    let (root, _store) = root_store(args)?;
+    let Some(resp) = daemon_request(&root, &json!({ "op": "release", "agent": agent, "files": files }))
+    else {
+        eprintln!("no keeld running for this repo — nothing to release (coordination state is daemon-local).");
+        return Ok(());
+    };
+    if resp.get("ok").and_then(Value::as_bool) != Some(true) {
+        let msg = resp.get("error").and_then(Value::as_str).unwrap_or("daemon error");
+        return Err(io::Error::other(msg.to_string()));
+    }
+    if json {
+        print!("{}", render_json(&resp));
+        return Ok(());
+    }
+    let freed = resp.get("released").and_then(Value::as_u64).unwrap_or(0);
+    let scope = if files.is_empty() { "all holds".to_string() } else { format!("{} named file(s)", files.len()) };
+    println!("released {freed} hold(s) for {agent} ({scope})");
+    Ok(())
 }
 
 fn cmd_commit(args: &[String]) -> io::Result<()> {
@@ -3941,6 +4011,18 @@ fn flag<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
 }
 fn has(args: &[String], name: &str) -> bool {
     args.iter().any(|a| a == name)
+}
+/// All values passed to a repeated flag, e.g. `--file a --file b` → `["a", "b"]`.
+fn flags(args: &[String], name: &str) -> Vec<String> {
+    args.iter().enumerate().filter(|(_, a)| a.as_str() == name).filter_map(|(i, _)| args.get(i + 1).cloned()).collect()
+}
+/// A compact human duration: `8s`, `1m5s`.
+fn fmt_dur(secs: u64) -> String {
+    if secs >= 60 {
+        format!("{}m{}s", secs / 60, secs % 60)
+    } else {
+        format!("{secs}s")
+    }
 }
 fn short(hex: &str) -> &str {
     &hex[..8.min(hex.len())]
