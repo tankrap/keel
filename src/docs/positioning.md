@@ -38,7 +38,7 @@ keel runs a daemon, and it is not only a cache. It keeps the index and the depen
 
 ## Coordination before conflict, not after
 
-git coordinates after the fact: two agents edit the same file, the merge conflicts, a human resolves it. Because the daemon knows what is in flight, keel can coordinate before the fact instead: an agent asks for work, the daemon knows what is owned, predicts the conflict, reserves the region, and the agent proceeds safely. *(Building: reservations and conflict prediction exist as a component. This is direction, not a matured capability.)*
+git coordinates after the fact: two agents edit the same file, the merge conflicts, a human resolves it. Because the daemon knows what is in flight, keel can coordinate before the fact instead: an agent asks for work, the daemon knows what is owned, predicts the conflict, reserves the region, and the agent proceeds safely. *(Shipped, single-daemon: reservations piggybacked on the brief — free when uncontended; import-graph-aware conflict prediction, so a held file that imports (or is imported by) the target is flagged even across directories; a visibility surface (`keel reservations` / `keel release`); durable reservations that survive a daemon restart; and a reserve→land→free loop that frees a hold when its work commits. Building: the ordered authority that extends this consistently across many daemons — that piece needs the hosted layer.)*
 
 ## The flywheel
 
@@ -75,7 +75,7 @@ The core of it: keel is not trying to replace git's interoperability. It is repl
 | one-fetch context assembly: code, graph, authorship, past sessions, conventions | shipped |
 | warm daemon: status, graph, context, events, transport | shipped |
 | the flywheel: learn, retrieve, measured correctness lift | shipped and benchmarked |
-| coordinate-before-conflict: reservations, conflict prediction | building |
+| coordinate-before-conflict: reservations, import-aware prediction, visibility, durability, land-release | shipped single-daemon; cross-daemon ordered authority building (hull) |
 | semantic diff and semantic operations | roadmapped |
 | reviews as first-class objects, with cross-review queries (`keel review` / `keel reviews`) | shipped |
 | session-based review packages, independent-model review, semantic review | vision (hull) |
