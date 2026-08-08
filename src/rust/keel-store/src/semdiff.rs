@@ -180,9 +180,12 @@ fn is_op_char(c: char) -> bool {
 }
 
 /// Whether an operator token is *flip-prone* — a comparison (`<`,`<=`,`==`,…) or logical (`&&`,`||`,`!`)
-/// operator, where a one-character slip silently inverts the meaning (`<=`→`<` off-by-one, `&&`→`||`
-/// guard inversion, a dropped `!`). These are the high-signal, low-noise flips: parallel bound checks
-/// or guards rarely differ by design, so a lone outlier is worth a look.
+/// operator, where a one-character *substitution* silently inverts the meaning (`<=`→`<` off-by-one,
+/// `&&`→`||` guard inversion). These are the high-signal, low-noise flips: parallel bound checks or
+/// guards rarely differ by design, so a lone substituted outlier is worth a look. (Note: this catches a
+/// *substituted* operator, not a *dropped* one — a line missing its operator has a different op-shape,
+/// so it never joins the sibling group to be flagged. Removing a whole guard is caught the other way,
+/// as a removed-line anomaly.)
 ///
 /// Deliberately *excluded*: arithmetic (`+ - * / %`), bitwise (`& | ^ ~ << >>`), and compound
 /// assignment. Those legitimately vary line-to-line in parallel-looking code (offsets, deltas,

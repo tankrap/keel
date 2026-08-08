@@ -16,11 +16,20 @@ function-definition symbols. That's ~60 lines — powerful, but shallow, and
 
 | level | mechanism | best for | fixes / catches |
 |---|---|---|---|
-| **0 — shipped** | lexical mask + frequency grouping | pure mechanical bulk (renames, scale edits, formatting); operator-shape anomalies (sign flip) | — |
-| **1 — prototyped ✓** | literal-anomaly split + representative instance + richer symbols | mixed mechanical+substantive PRs; codemods with a smuggled constant | hidden-constant bugs (numbers were masked away); benign over-flagging; class/method/arrow/const symbols |
-| **2** | AST (tree-sitter) + scope/binding | safe consistent rename vs variable-capture; accurate symbol/hunk boundaries; multi-language | lexical false anomalies; per-symbol diffs |
+| **0 — shipped** | lexical mask + frequency grouping | pure mechanical bulk (renames, scale edits, formatting) | — |
+| **1 — shipped** | literal-anomaly split + representative instance + richer symbols | mixed mechanical+substantive PRs; codemods with a smuggled constant | hidden-constant bugs (numbers were masked away); benign over-flagging; class/method/arrow/const symbols |
+| **1b — shipped** | operator-agnostic mask over the same groups | a flipped comparison/logical operator (`<=`→`<`, `&&`→`||`) one site substitutes where its siblings agree — precision-tuned (arithmetic/bitwise excluded) | the inverted-condition / off-by-one *operator* slip |
+| **2 — shipped** | AST via language resolver sidecars (TS compiler; tree-sitter Python/Go) | accurate symbol/hunk boundaries the indentation heuristic misses (arrow-const methods, decorated defs, Go methods); multi-language | lexical mis-attribution; opt-in `--ast`, degrades to the heuristic |
 | **3** | dataflow / type-aware | logic bugs where *what flows where* changed: tax-on-wrong-base, swapped args, inverted conditions, bounds off-by-one | the "substantive but subtle" class, structurally |
 | **4** | cross-file symbol + dependency graph, fleet-memoized | ripple/impact ("sig change breaks N callers"), stale-cache/invalidation, cross-module TOCTOU | whole-repo context |
+
+> **Status (updated 2026-08).** Levels 0, 1, 1b, and 2 are shipped in Rust in
+> `keel-store/src/semdiff.rs` (masking, grouping, literal + operator anomalies) and
+> `keel-cmd` (AST attribution via `keel-resolve` sidecars). The engine now runs
+> symmetrically over **both** the added and removed sides of a diff, so a guard
+> *deleted* at one site among similar deletions surfaces as a dropped-guard anomaly
+> — all of it in the default `keel walkthrough`, not just behind `--semantic`.
+> Levels 3–4 still need the hosted, memoized graph (hull).
 
 **Key insight — each level buys a different change-type, and depth tracks
 defensibility.** Level 0 is a commodity (copy the masking). Levels 3–4 need a
@@ -43,8 +52,10 @@ exact change-types Level 0 gets wrong:
   mode we measured). Compression is preserved.
 
 These two fixes target precisely the failures the review evals surfaced (the
-masked-constant miss and the mechanical-block false positive). Next: port into
-the Rust `cmd_review` (NEW-1017), then climb to AST/dataflow (NEW-1018…1020).
+masked-constant miss and the mechanical-block false positive). *(Done: ported into
+Rust as `keel-store/src/semdiff.rs`, extended with operator anomalies (1b) and the
+removed side, and the AST rung (2) landed via the `keel-resolve` sidecars. Dataflow
+(3–4) is next, and needs the hosted graph.)*
 
 ## 2. Git interoperability (adoption path)
 
