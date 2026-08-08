@@ -15,9 +15,10 @@ use keel_coord::{Conflict, PredictedConflict};
 use keel_graph::LiveGraph;
 use keel_resolve::{Resolve, Router, SliceDef};
 use keel_store::{Change, Object, ObjectId, Repo, Session, StoreError, Verification};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::path::{Path, PathBuf};
+use std::time::UNIX_EPOCH;
 
 // Re-export the field types so callers (e.g. the CLI) don't need every subcrate.
 pub use keel_coord::Conflict as CoordConflict;
@@ -128,6 +129,10 @@ impl Brief {
     }
 }
 
+/// A file's memoized distinctive defs: `path → (mtime_secs, size, [(name, kind)])`. Keyed so an
+/// unchanged file is never re-resolved for shared-symbol prediction.
+type SymCache = HashMap<String, (u64, u64, Vec<(String, String)>)>;
+
 pub struct BriefService {
     root: PathBuf,
     repo: Repo,
@@ -135,6 +140,7 @@ pub struct BriefService {
     resolver: Router,
     agent: String,
     coord: Coordinator,
+    sym_cache: SymCache,
 }
 
 impl BriefService {
@@ -166,6 +172,7 @@ impl BriefService {
             resolver,
             agent: "local".to_string(),
             coord: Coordinator::new(),
+            sym_cache: HashMap::new(),
         })
     }
 
@@ -341,7 +348,7 @@ impl BriefService {
         if candidates.is_empty() {
             return Vec::new();
         }
-        let target = self.distinctive_symbols(file);
+        let target: HashSet<(String, String)> = self.distinctive_symbols(file).into_iter().collect();
         if target.is_empty() {
             return Vec::new();
         }
@@ -351,17 +358,34 @@ impl BriefService {
             .collect()
     }
 
-    /// The distinctive symbol names `file` defines — a resolver `symbols` lookup filtered by
-    /// [`is_distinctive_symbol`] so overlap fires on real coupling, not on every file that defines a
-    /// `main`/`render`/`id`. An unresolvable file (bad parse, no sidecar) yields an empty set.
-    fn distinctive_symbols(&mut self, file: &str) -> HashSet<String> {
-        self.resolver
+    /// The distinctive `(name, kind)` defs `file` declares — a resolver `symbols` lookup filtered by
+    /// [`is_distinctive_symbol`] so overlap fires on real coupling (a duplicated top-level type/fn),
+    /// not on every file with a `constructor`/`__init__`/`render`. Matching keeps the kind so a
+    /// `class Foo` and a `function Foo` don't count as the same symbol. Memoized by (mtime, size): an
+    /// unchanged file is never re-resolved; an unresolvable file (bad parse / no sidecar) yields empty.
+    fn distinctive_symbols(&mut self, file: &str) -> Vec<(String, String)> {
+        let meta = std::fs::metadata(self.root.join(file)).ok();
+        let stamp = meta.map(|m| {
+            let mtime = m.modified().ok().and_then(|t| t.duration_since(UNIX_EPOCH).ok()).map(|d| d.as_secs()).unwrap_or(0);
+            (mtime, m.len())
+        });
+        if let (Some((mt, sz)), Some((cmt, csz, defs))) = (stamp, self.sym_cache.get(file)) {
+            if *cmt == mt && *csz == sz {
+                return defs.clone();
+            }
+        }
+        let defs: Vec<(String, String)> = self
+            .resolver
             .symbols(&self.root, file)
             .unwrap_or_default()
             .into_iter()
             .filter(|s| is_distinctive_symbol(&s.name, &s.kind))
-            .map(|s| s.name)
-            .collect()
+            .map(|s| (s.name, s.kind))
+            .collect();
+        if let Some((mt, sz)) = stamp {
+            self.sym_cache.insert(file.to_string(), (mt, sz, defs.clone()));
+        }
+        defs
     }
 
     /// Start fs-watching the working tree so [`refresh`](Self::refresh) becomes O(changed)
@@ -563,18 +587,39 @@ fn to_io(e: StoreError) -> io::Error {
     io::Error::other(e.to_string())
 }
 
-/// Whether a defined symbol name is distinctive enough that two files sharing it signals real
-/// coupling (for [`Relation::SharedSymbol`](keel_coord::Relation) prediction) rather than noise.
-/// Conservative on purpose — a soft signal that cries wolf is worse than one that occasionally stays
-/// quiet: require length ≥ 4, exclude a small stoplist of ubiquitous names, and skip struct/record
-/// `field`s (their names — `id`, `name`, `path` — collide across unrelated types constantly).
+/// Whether a defined symbol is distinctive enough that two files declaring it signals real coupling
+/// (a duplicated top-level type or function) rather than noise, for
+/// [`Relation::SharedSymbol`](keel_coord::Relation) prediction. Conservative on purpose — a soft
+/// signal that cries wolf erodes trust in the whole coordination view, so this errs toward silence:
+///
+/// - **Only top-level-ish declaration kinds.** Members (`method`/`constructor`/`getter`/`setter`/
+///   `field`/`property`/`variable`) are excluded — they are why the naive version fired on every file
+///   with a `constructor` or an `__init__`/`String()`/`Error()` method.
+/// - **No leading-underscore names** — Python dunders (`__init__`, `__repr__`) and private/convention
+///   names, which collide universally and rarely represent a public coupling.
+/// - **Case-insensitive stoplist** of ubiquitous identifiers, so the capitalized TS forms
+///   (`Config`/`State`/`Props`/`Error`/`Result`/`Status`/…) are filtered, not just their lowercase
+///   locals.
+/// - **≥ 5 characters** (counted in `char`s, not bytes, so non-ASCII identifiers measure correctly).
 fn is_distinctive_symbol(name: &str, kind: &str) -> bool {
+    // ubiquitous names, lowercased; compared case-insensitively.
     const STOP: &[&str] = &[
-        "main", "index", "default", "init", "setup", "test", "tests", "build", "start", "stop",
-        "handler", "render", "update", "create", "delete", "list", "parse", "format", "value",
-        "data", "name", "props", "state", "config", "options", "result", "error", "response",
+        "index", "default", "setup", "config", "options", "params", "result", "error", "errors",
+        "response", "request", "status", "state", "store", "props", "context", "session", "client",
+        "server", "service", "handler", "manager", "factory", "builder", "controller", "model",
+        "view", "component", "widget", "module", "record", "entry", "event", "message", "value",
+        "values", "items", "types", "utils", "helper", "helpers", "common", "constants", "schema",
+        "router", "route", "routes", "logger", "metadata", "payload", "wrapper", "adapter",
     ];
-    kind != "field" && name.len() >= 4 && !STOP.contains(&name)
+    // members and non-declaration kinds carry the bulk of the noise; keep only file-level declarations.
+    let member = matches!(
+        kind,
+        "method" | "constructor" | "getter" | "setter" | "field" | "property" | "variable" | "parameter" | "accessor"
+    );
+    !member
+        && !name.starts_with('_')
+        && name.chars().count() >= 5
+        && !STOP.contains(&name.to_ascii_lowercase().as_str())
 }
 
 #[cfg(test)]
@@ -845,12 +890,24 @@ mod tests {
 
     #[test]
     fn is_distinctive_symbol_filters_noise() {
+        // real top-level declarations pass
         assert!(is_distinctive_symbol("computeTax", "function"));
         assert!(is_distinctive_symbol("UserRepository", "class"));
-        assert!(!is_distinctive_symbol("id", "field"), "too short");
-        assert!(!is_distinctive_symbol("name", "field"), "field kind is noisy");
-        assert!(!is_distinctive_symbol("handler", "function"), "stoplisted");
-        assert!(!is_distinctive_symbol("run", "function"), "too short");
+        assert!(is_distinctive_symbol("PaymentGateway", "interface"));
+        // member kinds are excluded regardless of a distinctive name — this is the fix for the
+        // constructor/method noise, so the SAME name that passes as a function fails as a member
+        assert!(!is_distinctive_symbol("computeTax", "method"), "member kind excluded");
+        assert!(!is_distinctive_symbol("constructor", "constructor"), "constructors excluded");
+        assert!(!is_distinctive_symbol("balance", "field"), "fields excluded even when distinctive");
+        // leading-underscore / Python dunders excluded
+        assert!(!is_distinctive_symbol("__init__", "function"), "dunder excluded");
+        assert!(!is_distinctive_symbol("_private", "function"), "underscore-private excluded");
+        // stoplist is CASE-INSENSITIVE: the capitalized TS type forms are filtered, not just locals
+        assert!(!is_distinctive_symbol("Config", "interface"), "capitalized stopword excluded");
+        assert!(!is_distinctive_symbol("State", "type"));
+        assert!(!is_distinctive_symbol("Error", "class"));
+        // too short (char count)
+        assert!(!is_distinctive_symbol("Tax", "function"), "under 5 chars");
     }
 
     #[test]
