@@ -3214,10 +3214,10 @@ struct ChangeLines {
 
 /// The added and removed lines of a committed change (vs its first parent), skipping binary files.
 /// Shared by the semantic walkthrough, review, and history audit. With `ast_dir` set (`--ast`), each
-/// supported file's NEW content is written to a flat, safe-named temp file and parsed by the language
-/// sidecar (via the [`Router`]) for AST-accurate symbol ranges on the *added* side; everything else
-/// (and the whole *removed* side, whose symbols would need the old blob) falls back to the parser-free
-/// indentation heuristic.
+/// supported file's NEW and OLD content is written to a flat, safe-named temp file and parsed by the
+/// language sidecar (via the [`Router`]) — the new blob names the added lines' symbols, the old blob the
+/// removed lines' (so a dropped guard is attributed as precisely as an added one). Unsupported languages
+/// and any sidecar error fall back to the parser-free indentation heuristic, per side.
 fn change_semantic_lines(
     repo: &Repo,
     id: ObjectId,
@@ -3228,8 +3228,9 @@ fn change_semantic_lines(
     let parent = c.parents.first().copied();
 
     // `--ast`: materialize supported blobs into a scratch dir and route each to its language sidecar.
-    let want_ast = ast_dir.is_some()
-        && files.iter().any(|f| f.kind != ChangeKind::Deleted && ast_supported(&f.path));
+    // Any supported file (incl. a whole-file deletion) warrants a scratch dir now — the removed side
+    // parses the OLD blob, so a deleted `.ts` still gets AST-accurate symbols for its removed lines.
+    let want_ast = ast_dir.is_some() && files.iter().any(|f| ast_supported(&f.path));
     let scratch = if want_ast { make_scratch_dir() } else { None };
     let mut router = match (&scratch, ast_dir.as_deref()) {
         (Some(_), Some(d)) => Some(Router::new(d)),
@@ -3254,26 +3255,34 @@ fn change_semantic_lines(
             continue;
         }
         nfiles += 1;
-        // AST symbols for a committed supported blob: write it to a FLAT temp file (a generated
-        // `sN.<ext>`, so a crafted tree path can never escape the scratch dir) and route it by ext.
-        let syms = match (scratch.as_ref(), router.as_mut()) {
-            (Some(dir), Some(r)) if ast_supported(&f.path) && !new.is_empty() => {
-                // Preserve a declaration-file suffix so the sidecar excludes it exactly as the
-                // working-tree path does (consistency), instead of AST-parsing it as plain `.ts`.
-                let ext = [".d.ts", ".d.mts", ".d.cts"]
-                    .iter()
-                    .find(|s| f.path.ends_with(**s))
-                    .map(|s| s.trim_start_matches('.'))
-                    .unwrap_or_else(|| f.path.rsplit('.').next().unwrap_or("ts"));
-                let name = format!("s{nfiles}.{ext}");
-                std::fs::write(dir.0.join(&name), &new).ok().and_then(|_| r.symbols(&dir.0, &name).ok())
-            }
-            _ => None,
-        };
+        // AST symbols for a committed supported blob: write each side to a FLAT temp file (a generated
+        // `sN.<side>.<ext>`, so a crafted tree path can never escape the scratch dir) and route by ext.
+        // Both sides parsed from their own blob — `new` names the added lines' symbols, `old` the
+        // removed lines' (so a dropped guard is attributed to its function as precisely as an added one).
+        let (mut syms, mut old_syms) = (None, None);
+        if let (Some(dir), Some(r), true) = (scratch.as_ref(), router.as_mut(), ast_supported(&f.path)) {
+            // Preserve a declaration-file suffix so the sidecar excludes it exactly as the working-tree
+            // path does (consistency), instead of AST-parsing it as plain `.ts`. Lowercased so an
+            // uppercase source extension (`Comp.TS`) becomes a temp name the sidecar's own
+            // (case-sensitive) language detection accepts — else it would reject the file entirely.
+            let ext = [".d.ts", ".d.mts", ".d.cts"]
+                .iter()
+                .find(|s| f.path.ends_with(**s))
+                .map(|s| s.trim_start_matches('.'))
+                .unwrap_or_else(|| f.path.rsplit('.').next().unwrap_or("ts"))
+                .to_ascii_lowercase();
+            let mut ast_of = |bytes: &[u8], side: &str| -> Option<Vec<SymbolRange>> {
+                if bytes.is_empty() {
+                    return None; // an absent side (added/deleted file) has no symbols to parse
+                }
+                let name = format!("s{nfiles}.{side}.{ext}");
+                std::fs::write(dir.0.join(&name), bytes).ok().and_then(|_| r.symbols(&dir.0, &name).ok())
+            };
+            syms = ast_of(&new, "new");
+            old_syms = ast_of(&old, "old");
+        }
         added.extend(added_lines_from(&f.path, &old, &new, syms.as_deref()));
-        // Removed side uses the heuristic (old-blob AST is a follow-up), so a deleted guard still names
-        // its enclosing symbol best-effort.
-        removed.extend(removed_lines_from(&f.path, &old, &new, None));
+        removed.extend(removed_lines_from(&f.path, &old, &new, old_syms.as_deref()));
     }
     Ok(ChangeLines { added, removed, files: nfiles, binary })
 }
