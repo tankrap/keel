@@ -6,8 +6,11 @@
 //! rather than both editing and merge-conflicting later. Uncontended reservations are
 //! free — a hashmap insert on the fetch the agent already makes.
 //!
-//! This first cut is an in-process registry behind a mutex (the single-daemon model). The
-//! ordered-authority / subgraph-overlap prediction is a later layer.
+//! This first cut is an in-process registry behind a mutex (the single-daemon model). Prediction is
+//! import-graph-aware — a held file that the target imports (or that imports the target) is a soft
+//! conflict even across directories — with same-directory kept as the fallback signal for files the
+//! graph has no edge for (a brand-new file, or a language without a resolver). The ordered-authority
+//! layer (distributed consistency) is still later work.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
@@ -29,15 +32,40 @@ pub struct Conflict {
     pub task: String,
 }
 
-/// A *predicted* (soft) conflict: another agent holds a file in the same directory as one the
-/// caller intends to touch — not the exact file, but close enough to likely collide. Surfaced
-/// so a fleet spreads across modules instead of piling into the same area.
+/// Why a held file is a *predicted* (soft) conflict with the caller's target — a held file that is
+/// import-linked to the target (or, failing that, in the same directory) is close enough to likely
+/// collide even though it isn't the exact file the caller reserves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Relation {
+    /// The held file is imported BY the target: the caller depends on code someone else is editing.
+    Imports,
+    /// The held file IMPORTS the target: the caller's change may break code someone else is editing.
+    ImportedBy,
+    /// Not import-linked — just the same directory/module. The fallback signal when the graph has no
+    /// edge between the two (e.g. a brand-new file, or a language without a resolver sidecar).
+    SameDir,
+}
+
+impl Relation {
+    /// A stable lowercase tag for JSON / display.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Relation::Imports => "imports",
+            Relation::ImportedBy => "imported-by",
+            Relation::SameDir => "same-dir",
+        }
+    }
+}
+
+/// A *predicted* (soft) conflict: another agent holds a file that is import-linked to (or in the same
+/// directory as) one the caller intends to touch — not the exact file, but close enough to likely
+/// collide. Surfaced so a fleet spreads across modules instead of piling into the same area.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PredictedConflict {
     pub held_file: String,
     pub agent: String,
     pub task: String,
-    pub dir: String,
+    pub relation: Relation,
 }
 
 /// One held file: the holder, its task, and when the hold was last taken or renewed (for TTL expiry).
@@ -148,26 +176,49 @@ impl Coordinator {
         }
     }
 
-    /// Predict soft conflicts for `files`: reservations by *other* agents that share a
-    /// directory with any requested file (excluding exact-file collisions, which `reserve`
-    /// and `peek` already report as hard conflicts). This is the "someone is already working
-    /// in this module — consider elsewhere" signal that lets a fleet self-spread. The
-    /// coordinator is the single ordered authority, so this view is consistent by construction.
-    pub fn predict(&self, agent: &str, files: &[String]) -> Vec<PredictedConflict> {
+    /// Predict soft conflicts for `files`: reservations by *other* agents on files that are
+    /// import-linked to a requested file — one the target imports (`imports` = graph deps) or one
+    /// that imports the target (`imported_by` = graph rdeps) — or, failing an import edge, one in the
+    /// same directory. Exact-file collisions are excluded (`reserve`/`peek` already report those as
+    /// hard conflicts). This is the "someone is already working on code your change touches — consider
+    /// elsewhere" signal that lets a fleet self-spread; the import edges catch collisions the plain
+    /// same-directory heuristic misses (two agents in different folders editing import-linked files).
+    /// The caller supplies the adjacency (it already has the live graph); the coordinator stays a pure
+    /// registry. It is the single ordered authority, so this view is consistent by construction.
+    pub fn predict(
+        &self,
+        agent: &str,
+        files: &[String],
+        imports: &[String],
+        imported_by: &[String],
+    ) -> Vec<PredictedConflict> {
         let mut reg = self.inner.lock().unwrap();
         sweep(&mut reg, self.ttl);
         let want: HashSet<&str> = files.iter().map(String::as_str).collect();
+        let imports: HashSet<&str> = imports.iter().map(String::as_str).collect();
+        let imported_by: HashSet<&str> = imported_by.iter().map(String::as_str).collect();
         let want_dirs: HashSet<&str> = files.iter().map(|f| dir_of(f)).collect();
         let mut out: Vec<PredictedConflict> = reg
             .held
             .iter()
             .filter(|(held, r)| r.agent != agent && !want.contains(held.as_str()))
-            .filter(|(held, _)| want_dirs.contains(dir_of(held)))
-            .map(|(held, r)| PredictedConflict {
-                held_file: held.clone(),
-                agent: r.agent.clone(),
-                task: r.task.clone(),
-                dir: dir_of(held).to_string(),
+            .filter_map(|(held, r)| {
+                // strongest specific signal first: a direct import edge beats mere co-location.
+                let relation = if imports.contains(held.as_str()) {
+                    Relation::Imports
+                } else if imported_by.contains(held.as_str()) {
+                    Relation::ImportedBy
+                } else if want_dirs.contains(dir_of(held)) {
+                    Relation::SameDir
+                } else {
+                    return None;
+                };
+                Some(PredictedConflict {
+                    held_file: held.clone(),
+                    agent: r.agent.clone(),
+                    task: r.task.clone(),
+                    relation,
+                })
             })
             .collect();
         out.sort_by(|a, b| a.held_file.cmp(&b.held_file));
@@ -239,20 +290,55 @@ mod tests {
         c.reserve("alice", "auth", &files(&["src/auth/login.rs", "src/auth/token.rs"]));
         c.reserve("carol", "ui", &files(&["src/ui/page.rs"]));
 
-        // bob wants a DIFFERENT file in src/auth → predicted (soft) conflict with alice,
-        // and nothing about src/ui (different module).
-        let pred = c.predict("bob", &files(&["src/auth/session.rs"]));
+        // bob wants a DIFFERENT file in src/auth, with no import edges → same-dir predictions
+        // with alice, and nothing about src/ui (different module).
+        let pred = c.predict("bob", &files(&["src/auth/session.rs"]), &[], &[]);
         assert_eq!(pred.len(), 2, "both of alice's src/auth files are near; got {pred:?}");
-        assert!(pred.iter().all(|p| p.agent == "alice" && p.dir == "src/auth"));
+        assert!(pred.iter().all(|p| p.agent == "alice" && p.relation == Relation::SameDir));
 
         // an exact-file want is a HARD conflict (reserve/peek), excluded from prediction
-        let pred2 = c.predict("bob", &files(&["src/auth/login.rs"]));
+        let pred2 = c.predict("bob", &files(&["src/auth/login.rs"]), &[], &[]);
         assert!(
             pred2.iter().all(|p| p.held_file != "src/auth/login.rs"),
             "exact file is a hard conflict, not a prediction; got {pred2:?}"
         );
         // own reservations never predicted against self
-        assert!(c.predict("alice", &files(&["src/auth/session.rs"])).is_empty());
+        assert!(c.predict("alice", &files(&["src/auth/session.rs"]), &[], &[]).is_empty());
+    }
+
+    #[test]
+    fn predict_flags_import_linked_files_across_directories() {
+        let c = Coordinator::new();
+        // alice holds a file bob's target IMPORTS, and one that IMPORTS bob's target — both in
+        // OTHER directories, so the same-directory heuristic would miss them entirely.
+        c.reserve("alice", "lib", &files(&["src/lib/util.rs", "src/api/handler.rs"]));
+
+        // bob will edit src/core/engine.rs, which imports src/lib/util.rs and is imported by
+        // src/api/handler.rs.
+        let pred = c.predict(
+            "bob",
+            &files(&["src/core/engine.rs"]),
+            &files(&["src/lib/util.rs"]),    // engine imports util
+            &files(&["src/api/handler.rs"]), // handler imports engine
+        );
+        let by_file: std::collections::HashMap<_, _> =
+            pred.iter().map(|p| (p.held_file.as_str(), p.relation)).collect();
+        assert_eq!(by_file.get("src/lib/util.rs"), Some(&Relation::Imports), "target imports it: {pred:?}");
+        assert_eq!(by_file.get("src/api/handler.rs"), Some(&Relation::ImportedBy), "it imports target: {pred:?}");
+        assert_eq!(pred.len(), 2, "no same-dir here (engine.rs is alone in src/core); got {pred:?}");
+
+        // a direct import edge outranks mere co-location: a held file that is BOTH in the target's
+        // directory AND imported by the target reports as Imports, not SameDir.
+        let c2 = Coordinator::new();
+        c2.reserve("alice", "t", &files(&["src/core/dep.rs"]));
+        let pred2 = c2.predict(
+            "bob",
+            &files(&["src/core/engine.rs"]),
+            &files(&["src/core/dep.rs"]),
+            &[],
+        );
+        assert_eq!(pred2.len(), 1);
+        assert_eq!(pred2[0].relation, Relation::Imports, "import edge beats same-dir; got {pred2:?}");
     }
 
     #[test]

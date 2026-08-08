@@ -71,7 +71,8 @@ pub struct Brief {
     /// files in the working set currently held by *other* agents (coordination). Empty
     /// when uncontended; non-empty means back off / pick other work.
     pub coordination: Vec<Conflict>,
-    /// *predicted* soft conflicts — other agents working in the same directory as the target
+    /// *predicted* soft conflicts — other agents holding files import-linked to (or in the same
+    /// directory as) the target
     /// (likely to collide even if not the exact file). "Someone's in this module, spread out."
     pub predicted: Vec<PredictedConflict>,
     /// relevant prior sessions (with the lessons they recorded), from the graph
@@ -113,7 +114,7 @@ impl Brief {
                 .map(|c| json!({"file": c.file, "agent": c.agent, "task": c.task}))
                 .collect::<Vec<_>>(),
             "predicted": self.predicted.iter()
-                .map(|p| json!({"held_file": p.held_file, "agent": p.agent, "task": p.task, "dir": p.dir}))
+                .map(|p| json!({"held_file": p.held_file, "agent": p.agent, "task": p.task, "relation": p.relation.as_str()}))
                 .collect::<Vec<_>>(),
             "sessions": self.sessions.iter()
                 .map(|s| json!({"change": s.change, "task": s.task, "lesson": s.lesson, "verified": s.verified, "has_context": s.has_context}))
@@ -360,7 +361,9 @@ impl BriefService {
         } else {
             self.coord.peek(&self.agent, &working_set)
         };
-        let predicted = self.coord.predict(&self.agent, &working_set);
+        // import-graph-aware prediction: deps/rdeps (already computed above) let the coordinator flag
+        // held files that are import-linked to the target even across directories, not just co-located.
+        let predicted = self.coord.predict(&self.agent, &working_set, &deps, &rdeps);
 
         // history of the target, newest first; verification prefers the post-hoc side-table
         // (CI result) over the change's committed state. Only the newest few are used below
@@ -600,6 +603,43 @@ mod tests {
         assert_eq!(coord.peek("bystander", &["y.ts".to_string()]).len(), 0, "y.ts freed on land");
         // but only the landing agent's holds — "other" still holds x.ts
         assert_eq!(coord.peek("bystander", &["x.ts".to_string()]).len(), 1, "other's hold untouched");
+
+        let _ = fs::remove_dir_all(&work);
+        let _ = fs::remove_dir_all(&store);
+    }
+
+    #[test]
+    fn brief_predicts_import_linked_conflict_across_files() {
+        let work = tmp("pwork");
+        let store = tmp("pstore");
+        // a.ts imports b.ts; they are NOT the same directory as far as the same-dir heuristic cares
+        // (both top-level), so this exercises the import-edge signal: brief on a.ts must predict a
+        // soft conflict on b.ts (which a.ts imports) when another agent holds b.ts.
+        fs::write(work.join("b.ts"), "export function helper(x: number): number {\n  return x * 2;\n}\n").unwrap();
+        fs::write(
+            work.join("a.ts"),
+            "import { helper } from './b.js';\nexport function doA(): number {\n  return helper(21);\n}\n",
+        )
+        .unwrap();
+
+        let coord = Coordinator::new();
+        let mut svc = match BriefService::open(&work, &store, &sidecar_dir()) {
+            Ok(s) => s.with_agent("me").with_coordinator(coord.clone()),
+            Err(e) => {
+                eprintln!("skipping predict test: {e}");
+                return;
+            }
+        };
+        // another agent holds b.ts, which a.ts imports (a graph dep, not an exact-file want)
+        coord.reserve("other", "edit helper", &["b.ts".to_string()]);
+
+        let b = svc.brief("edit doA", "a.ts", None, 10_000, false).unwrap();
+        assert!(b.deps.contains(&"b.ts".to_string()), "a.ts imports b.ts; got {:?}", b.deps);
+        assert!(b.coordination.is_empty(), "b.ts isn't the working-set file → not a hard conflict");
+        assert_eq!(b.predicted.len(), 1, "b.ts is import-linked and held → one prediction; got {:?}", b.predicted);
+        assert_eq!(b.predicted[0].held_file, "b.ts");
+        assert_eq!(b.predicted[0].agent, "other");
+        assert_eq!(b.predicted[0].relation, keel_coord::Relation::Imports, "target imports the held file");
 
         let _ = fs::remove_dir_all(&work);
         let _ = fs::remove_dir_all(&store);
