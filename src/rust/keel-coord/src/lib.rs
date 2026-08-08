@@ -196,7 +196,8 @@ impl Coordinator {
     }
 
     /// A snapshot of every currently-held file (expired holds swept first), sorted by file — for
-    /// observability (`keel reservations`). Read-only: takes no reservation and refreshes no TTL.
+    /// observability (`keel reservations`). Takes no reservation and refreshes no TTL; the only
+    /// mutation is the lazy sweep of already-expired holds, as on every other registry access.
     pub fn snapshot(&self) -> Vec<Hold> {
         let mut reg = self.inner.lock().unwrap();
         sweep(&mut reg, self.ttl);

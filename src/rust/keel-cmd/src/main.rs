@@ -317,10 +317,20 @@ fn cmd_release(args: &[String]) -> io::Result<()> {
     let json = has(args, "--json");
     let agent = flag(args, "--agent").ok_or_else(|| io::Error::other("--agent is required"))?;
     let files = flags(args, "--file");
+    // Guard the footgun: releasing with NO --file frees ALL of the agent's holds, so a valueless
+    // `--file` (typo, forgotten value) must be an error — not silently collapse to release-all.
+    let file_occurrences = args.iter().filter(|a| a.as_str() == "--file").count();
+    if file_occurrences != files.len() {
+        return Err(io::Error::other("--file needs a value, e.g. --file src/a.ts"));
+    }
     let (root, _store) = root_store(args)?;
     let Some(resp) = daemon_request(&root, &json!({ "op": "release", "agent": agent, "files": files }))
     else {
-        eprintln!("no keeld running for this repo — nothing to release (coordination state is daemon-local).");
+        if json {
+            print!("{}", render_json(&json!({"ok": false, "error": "no daemon", "released": 0})));
+        } else {
+            eprintln!("no keeld running for this repo — nothing to release (coordination state is daemon-local).");
+        }
         return Ok(());
     };
     if resp.get("ok").and_then(Value::as_bool) != Some(true) {
@@ -4012,16 +4022,28 @@ fn flag<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
 fn has(args: &[String], name: &str) -> bool {
     args.iter().any(|a| a == name)
 }
-/// All values passed to a repeated flag, e.g. `--file a --file b` → `["a", "b"]`.
+/// All values passed to a repeated flag, e.g. `--file a --file b` → `["a", "b"]`. A `--flag` with no
+/// value (last token, or followed by another `-`-flag) contributes nothing — so the *count* of values
+/// can be less than the count of flag occurrences, which the caller can check to reject a valueless
+/// flag rather than silently treating it as absent.
 fn flags(args: &[String], name: &str) -> Vec<String> {
-    args.iter().enumerate().filter(|(_, a)| a.as_str() == name).filter_map(|(i, _)| args.get(i + 1).cloned()).collect()
+    args.iter()
+        .enumerate()
+        .filter(|(_, a)| a.as_str() == name)
+        .filter_map(|(i, _)| args.get(i + 1))
+        .filter(|v| !v.starts_with('-'))
+        .cloned()
+        .collect()
 }
-/// A compact human duration: `8s`, `1m5s`.
+/// A compact human duration: `8s`, `1m5s`, `2h3m`.
 fn fmt_dur(secs: u64) -> String {
-    if secs >= 60 {
-        format!("{}m{}s", secs / 60, secs % 60)
+    let (h, m, s) = (secs / 3600, (secs % 3600) / 60, secs % 60);
+    if h > 0 {
+        format!("{h}h{m}m")
+    } else if m > 0 {
+        format!("{m}m{s}s")
     } else {
-        format!("{secs}s")
+        format!("{s}s")
     }
 }
 fn short(hex: &str) -> &str {
@@ -4133,6 +4155,30 @@ fn render_human(v: &Value) -> String {
 mod tests {
     use super::*;
     use keel_brief::{Brief, ContextDef, CoordConflict, Provenance, RelevantSession};
+
+    fn s(v: &[&str]) -> Vec<String> {
+        v.iter().map(|x| x.to_string()).collect()
+    }
+
+    #[test]
+    fn flags_collects_values_and_drops_valueless_occurrences() {
+        assert_eq!(flags(&s(&["--file", "a.ts", "--file", "b.ts"]), "--file"), s(&["a.ts", "b.ts"]));
+        // a trailing valueless --file contributes nothing, so len < occurrence count → caller can reject
+        let a = s(&["--agent", "x", "--file"]);
+        assert!(flags(&a, "--file").is_empty());
+        assert_eq!(a.iter().filter(|t| t.as_str() == "--file").count(), 1, "one --file but zero values → malformed");
+        // --file followed by another flag doesn't swallow the flag as a filename
+        assert!(flags(&s(&["--file", "--agent", "x"]), "--file").is_empty());
+    }
+
+    #[test]
+    fn fmt_dur_formats_seconds_minutes_hours() {
+        assert_eq!(fmt_dur(0), "0s");
+        assert_eq!(fmt_dur(8), "8s");
+        assert_eq!(fmt_dur(60), "1m0s");
+        assert_eq!(fmt_dur(125), "2m5s");
+        assert_eq!(fmt_dur(7325), "2h2m");
+    }
 
     #[test]
     fn removed_lines_from_captures_deletions_attributed_to_the_old_file() {
