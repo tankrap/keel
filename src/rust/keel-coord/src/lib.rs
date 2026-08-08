@@ -14,7 +14,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// How long a reservation lives without a heartbeat before it's considered abandoned and swept. The
 /// brief service calls [`Coordinator::heartbeat`] on every fetch, so an actively-working agent (which
@@ -80,11 +80,33 @@ pub struct Hold {
     pub ttl_remaining_secs: u64,
 }
 
-/// One held file: the holder, its task, and when the hold was last taken or renewed (for TTL expiry).
+/// A serializable form of one hold, for persisting reservations across a daemon restart. `taken_unix`
+/// is wall-clock seconds since the epoch when the hold was last taken/renewed — [`Instant`] is
+/// monotonic-from-an-arbitrary-origin and meaningless across processes, so age/TTL are reconstructed
+/// from this on reload. The caller (the daemon) owns the file I/O; the coordinator stays dependency-free.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HoldRecord {
+    pub file: String,
+    pub agent: String,
+    pub task: String,
+    pub taken_unix: u64,
+}
+
+/// One held file: the holder, its task, and when the hold was last taken or renewed. `at` is
+/// wall-clock (not a monotonic `Instant`) so a hold's remaining TTL survives a daemon restart or a
+/// machine reboot exactly — persistence just records `at` as unix seconds and restores it verbatim,
+/// with no age reconstruction to underflow. The tradeoff is sensitivity to large wall-clock jumps
+/// (NTP steps), which is bounded by the TTL and far rarer than a restart.
 struct Reservation {
     agent: String,
     task: String,
-    at: Instant,
+    at: SystemTime,
+}
+
+/// Age of a hold, tolerant of a wall clock that has stepped backwards (a negative delta reads as 0,
+/// i.e. "just taken", so a backward NTP correction never expires a live hold early).
+fn age(now: SystemTime, at: SystemTime) -> Duration {
+    now.duration_since(at).unwrap_or(Duration::ZERO)
 }
 
 #[derive(Default)]
@@ -135,7 +157,7 @@ impl Coordinator {
                 _ => {
                     reg.held.insert(
                         f.clone(),
-                        Reservation { agent: agent.to_string(), task: task.to_string(), at: Instant::now() },
+                        Reservation { agent: agent.to_string(), task: task.to_string(), at: SystemTime::now() },
                     );
                 }
             }
@@ -150,7 +172,7 @@ impl Coordinator {
     pub fn heartbeat(&self, agent: &str) {
         let mut reg = self.inner.lock().unwrap();
         sweep(&mut reg, self.ttl);
-        let now = Instant::now();
+        let now = SystemTime::now();
         for r in reg.held.values_mut() {
             if r.agent == agent {
                 r.at = now;
@@ -201,23 +223,76 @@ impl Coordinator {
     pub fn snapshot(&self) -> Vec<Hold> {
         let mut reg = self.inner.lock().unwrap();
         sweep(&mut reg, self.ttl);
-        let now = Instant::now();
+        let now = SystemTime::now();
         let mut out: Vec<Hold> = reg
             .held
             .iter()
             .map(|(file, r)| {
-                let age = now.duration_since(r.at);
+                let held = age(now, r.at);
                 Hold {
                     file: file.clone(),
                     agent: r.agent.clone(),
                     task: r.task.clone(),
-                    age_secs: age.as_secs(),
-                    ttl_remaining_secs: self.ttl.saturating_sub(age).as_secs(),
+                    age_secs: held.as_secs(),
+                    ttl_remaining_secs: self.ttl.saturating_sub(held).as_secs(),
                 }
             })
             .collect();
         out.sort_by(|a, b| a.file.cmp(&b.file));
         out
+    }
+
+    /// Export every live hold (expired swept first) as serializable [`HoldRecord`]s, sorted by file —
+    /// so the daemon can persist reservations and reload them across a restart. `taken_unix` is the
+    /// hold's wall-clock time; a hold whose clock is somehow before the epoch exports as `taken_unix: 0`.
+    pub fn export(&self) -> Vec<HoldRecord> {
+        let mut reg = self.inner.lock().unwrap();
+        sweep(&mut reg, self.ttl);
+        let mut out: Vec<HoldRecord> = reg
+            .held
+            .iter()
+            .map(|(file, r)| HoldRecord {
+                file: file.clone(),
+                agent: r.agent.clone(),
+                task: r.task.clone(),
+                taken_unix: r.at.duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0),
+            })
+            .collect();
+        out.sort_by(|a, b| a.file.cmp(&b.file));
+        out
+    }
+
+    /// Restore holds from persisted [`HoldRecord`]s at daemon startup. `now_unix` is the current
+    /// wall-clock second (passed in so the crate needs no clock source of its own, and tests are
+    /// deterministic). A record already older than the TTL is dropped; a survivor is reinstated with
+    /// its recorded timestamp verbatim, so its *remaining* TTL is exact and independent of process
+    /// uptime — a hold taken 8 min ago under a 10-min TTL still has ~2 min left, not a fresh 10. A
+    /// future-dated `taken_unix` (a backwards wall-clock step after it was written) is clamped to
+    /// `now_unix` so it can't outlive one TTL. Existing in-memory holds are never clobbered. Returns
+    /// how many holds were reinstated.
+    pub fn restore(&self, records: &[HoldRecord], now_unix: u64) -> usize {
+        let mut reg = self.inner.lock().unwrap();
+        let ttl_secs = self.ttl.as_secs();
+        let mut restored = 0;
+        for rec in records {
+            let taken = rec.taken_unix.min(now_unix); // clamp a future stamp to the present
+            if now_unix - taken >= ttl_secs {
+                continue; // already expired — don't resurrect it
+            }
+            if reg.held.contains_key(&rec.file) {
+                continue; // never overwrite a live hold
+            }
+            reg.held.insert(
+                rec.file.clone(),
+                Reservation {
+                    agent: rec.agent.clone(),
+                    task: rec.task.clone(),
+                    at: UNIX_EPOCH + Duration::from_secs(taken),
+                },
+            );
+            restored += 1;
+        }
+        restored
     }
 
     /// Predict soft conflicts for `files`: reservations by *other* agents on files that are
@@ -286,8 +361,8 @@ impl Coordinator {
 /// Drop reservations not renewed within `ttl` — an agent that crashed or wandered off shouldn't hold
 /// files forever. Called on every registry access, so expiry is lazy (no background thread needed).
 fn sweep(reg: &mut Registry, ttl: Duration) {
-    let now = Instant::now();
-    reg.held.retain(|_, r| now.duration_since(r.at) < ttl);
+    let now = SystemTime::now();
+    reg.held.retain(|_, r| age(now, r.at) < ttl);
 }
 
 /// The directory portion of a repo-relative path (everything before the last `/`), or `""`
@@ -359,6 +434,67 @@ mod tests {
         assert_eq!(c.snapshot().len(), 1);
         std::thread::sleep(Duration::from_millis(350));
         assert!(c.snapshot().is_empty(), "expired hold swept from the snapshot");
+    }
+
+    fn now_unix() -> u64 {
+        SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs()
+    }
+
+    #[test]
+    fn export_then_restore_round_trips_holds() {
+        let c = Coordinator::new();
+        c.reserve("alice", "auth", &files(&["src/a.ts"]));
+        c.reserve("bob", "ui", &files(&["src/b.ts"]));
+        let records = c.export();
+        assert_eq!(records.iter().map(|r| r.file.as_str()).collect::<Vec<_>>(), ["src/a.ts", "src/b.ts"]);
+        assert_eq!((records[0].agent.as_str(), records[0].task.as_str()), ("alice", "auth"));
+        assert!(records.iter().all(|r| r.taken_unix > 0), "wall-clock stamped");
+
+        // a fresh coordinator (simulating a daemon restart) reinstates them
+        let c2 = Coordinator::new();
+        assert_eq!(c2.restore(&records, now_unix()), 2);
+        // the restored holds are real: bob conflicts with a new agent, and they still appear
+        assert_eq!(c2.peek("carol", &files(&["src/a.ts", "src/b.ts"])).len(), 2);
+        assert_eq!(c2.snapshot().len(), 2);
+    }
+
+    #[test]
+    fn restore_drops_expired_and_preserves_remaining_age() {
+        let c = Coordinator::new().with_ttl(Duration::from_secs(600));
+        let now = now_unix();
+        let recs = vec![
+            HoldRecord { file: "fresh.ts".into(), agent: "a".into(), task: "t".into(), taken_unix: now - 60 },
+            HoldRecord { file: "stale.ts".into(), agent: "a".into(), task: "t".into(), taken_unix: now - 3600 },
+        ];
+        assert_eq!(c.restore(&recs, now), 1, "only the fresh hold survives a 10-min TTL");
+        let snap = c.snapshot();
+        assert_eq!(snap.len(), 1);
+        assert_eq!(snap[0].file, "fresh.ts");
+        // age was reconstructed (~60s in), so it has ~540s left, NOT a fresh 600
+        assert!(snap[0].age_secs >= 55 && snap[0].ttl_remaining_secs <= 545, "kept original age; got {snap:?}");
+    }
+
+    #[test]
+    fn restore_never_clobbers_a_live_hold() {
+        let c = Coordinator::new();
+        c.reserve("live", "now", &files(&["x.ts"]));
+        let recs = vec![HoldRecord { file: "x.ts".into(), agent: "old".into(), task: "t".into(), taken_unix: now_unix() }];
+        assert_eq!(c.restore(&recs, now_unix()), 0, "the live hold wins");
+        assert_eq!(c.snapshot()[0].agent, "live");
+    }
+
+    #[test]
+    fn restore_clamps_a_future_dated_record_to_the_present() {
+        // a hold whose taken_unix is in the future (a backward wall-clock step after it was written)
+        // must be clamped to now — reinstated once, near-full TTL, NOT immortal across restarts.
+        let c = Coordinator::new().with_ttl(Duration::from_secs(600));
+        let now = now_unix();
+        let recs = vec![HoldRecord { file: "f.ts".into(), agent: "a".into(), task: "t".into(), taken_unix: now + 10_000 }];
+        assert_eq!(c.restore(&recs, now), 1);
+        let snap = c.snapshot();
+        assert_eq!(snap.len(), 1);
+        // clamped to now → age ~0, near-full remaining, and bounded by the TTL (not the +10000 future)
+        assert!(snap[0].age_secs <= 1 && snap[0].ttl_remaining_secs <= 600, "clamped, not immortal; got {snap:?}");
     }
 
     #[test]
