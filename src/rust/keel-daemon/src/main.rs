@@ -362,8 +362,12 @@ fn persist_holds(root: &Path, records: &[keel_brief::HoldRecord]) {
     if let Some(dir) = path.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
-    if let Ok(s) = serde_json::to_string(&arr) {
-        let _ = std::fs::write(&path, s);
+    let Ok(s) = serde_json::to_string(&arr) else { return };
+    // Atomic replace: write a sibling temp then rename, so a crash mid-write can't leave a torn file
+    // that fails to parse and drops ALL holds on the next restart.
+    let tmp = path.with_extension("json.tmp");
+    if std::fs::write(&tmp, &s).is_ok() {
+        let _ = std::fs::rename(&tmp, &path);
     }
 }
 
@@ -428,27 +432,37 @@ fn handle(ctx: &Ctx, req: &Value) -> Value {
             // Fleet presence: broadcast that this agent is about to work on `file`, so other
             // agents/dashboards see who's working where in real time (coordination, not just data).
             broadcast(ctx, &json!({"kind": "brief", "agent": agent, "file": file, "task": task, "ts": now_secs()}));
-            let mut svc = lock(&ctx.svc);
-            let svc = &mut *svc;
-            // per-request agent id — the shared coordinator evaluates reservations/predictions
-            // against THIS agent, so many agents coordinate through the one warm daemon.
-            svc.set_agent(&agent);
-            // keep the graph live: incremental refresh (only changed files) before answering
-            if let Err(e) = svc.refresh() {
-                return json!({"ok": false, "error": format!("refresh: {e}")});
-            }
-            match svc.brief(task, file, symbol, budget, reserve) {
-                Ok(b) => {
-                    let mut v = b.to_json();
-                    v["ok"] = json!(true);
-                    // a reserving brief mutated the shared holds → persist so a restart keeps them
-                    if reserve {
-                        persist_holds(svc.root(), &svc.export_holds());
-                    }
-                    v
+            // Capture the response and (if holds changed) what to persist, then write AFTER releasing
+            // the service lock so a slow disk doesn't serialize every other agent's requests.
+            let (resp, persist) = {
+                let mut svc = lock(&ctx.svc);
+                let svc = &mut *svc;
+                // per-request agent id — the shared coordinator evaluates reservations/predictions
+                // against THIS agent, so many agents coordinate through the one warm daemon.
+                svc.set_agent(&agent);
+                // keep the graph live: incremental refresh (only changed files) before answering
+                if let Err(e) = svc.refresh() {
+                    return json!({"ok": false, "error": format!("refresh: {e}")});
                 }
-                Err(e) => json!({"ok": false, "error": e.to_string()}),
+                match svc.brief(task, file, symbol, budget, reserve) {
+                    Ok(b) => {
+                        let mut v = b.to_json();
+                        v["ok"] = json!(true);
+                        // EVERY brief heartbeats this agent's holds (refreshing their timestamps), so
+                        // persist whenever the agent holds anything — not just on --reserve. Otherwise a
+                        // reserve-once-then-plain-brief workflow would leave coord.json's timestamps
+                        // frozen at the first reserve and a later restart would wrongly age the hold out.
+                        let records = svc.export_holds();
+                        let persist = (reserve || !records.is_empty()).then(|| (svc.root().to_path_buf(), records));
+                        (v, persist)
+                    }
+                    Err(e) => (json!({"ok": false, "error": e.to_string()}), None),
+                }
+            };
+            if let Some((root, records)) = persist {
+                persist_holds(&root, &records);
             }
+            resp
         }
         // Read-only observability: every active hold in the shared coordinator.
         Some("reservations") => {
@@ -475,10 +489,15 @@ fn handle(ctx: &Ctx, req: &Value) -> Value {
                 .and_then(Value::as_array)
                 .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
                 .unwrap_or_default();
-            let svc = lock(&ctx.svc);
-            let freed = svc.release(agent, &files);
-            if freed > 0 {
-                persist_holds(svc.root(), &svc.export_holds()); // reflect the freed holds on disk
+            let (freed, persist) = {
+                let svc = lock(&ctx.svc);
+                let freed = svc.release(agent, &files);
+                // reflect the freed holds on disk (outside the lock); only if something changed
+                let persist = (freed > 0).then(|| (svc.root().to_path_buf(), svc.export_holds()));
+                (freed, persist)
+            };
+            if let Some((root, records)) = persist {
+                persist_holds(&root, &records);
             }
             json!({"ok": true, "released": freed})
         }
@@ -488,4 +507,55 @@ fn handle(ctx: &Ctx, req: &Value) -> Value {
 
 fn flag<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
     args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).map(String::as_str)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tmpdir(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("keeld-{}-{}", tag, std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    fn rec(file: &str, agent: &str, task: &str, taken_unix: u64) -> keel_brief::HoldRecord {
+        keel_brief::HoldRecord { file: file.into(), agent: agent.into(), task: task.into(), taken_unix }
+    }
+
+    #[test]
+    fn persist_then_load_round_trips_holds() {
+        let root = tmpdir("persist");
+        let recs = vec![rec("a.ts", "al", "t1", 100), rec("dir/b.ts", "bo", "t2", 200)];
+        persist_holds(&root, &recs);
+        assert_eq!(load_holds(&root), recs);
+        // a rewrite fully replaces the previous set (atomic rename leaves no stale temp)
+        persist_holds(&root, &recs[..1]);
+        assert_eq!(load_holds(&root), recs[..1]);
+        assert!(!coord_path(&root).with_extension("json.tmp").exists(), "temp file cleaned up");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn persist_round_trips_weird_strings() {
+        let root = tmpdir("weird");
+        let recs = vec![rec("d/\"q\" and\nnewline.ts", "agent 🌊", "fix \"it\"", 42)];
+        persist_holds(&root, &recs);
+        assert_eq!(load_holds(&root), recs, "unicode/quotes/newlines survive json round-trip");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn load_holds_tolerates_missing_and_corrupt() {
+        let root = tmpdir("corrupt");
+        assert!(load_holds(&root).is_empty(), "missing file → empty");
+        let path = coord_path(&root);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "{ not json").unwrap();
+        assert!(load_holds(&root).is_empty(), "garbage → empty, no panic");
+        std::fs::write(&path, "[{\"file\":\"a.ts\"}]").unwrap();
+        assert!(load_holds(&root).is_empty(), "items missing required fields are skipped");
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }
